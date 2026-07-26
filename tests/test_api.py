@@ -68,3 +68,45 @@ def test_writeback_idempotency():
 def test_writeback_rejects_bad_key():
     r = client.post("/api/writeback", headers={"X-API-Key": "wrong"}, json={})
     assert r.status_code == 401
+
+
+
+def test_orders_and_management_pages_api():
+    orders = client.get('/api/orders')
+    assert orders.status_code == 200
+    assert orders.json()['total'] >= 5
+    assert 'open_task_count' in orders.json()['items'][0]
+    management = client.get('/api/management')
+    assert management.status_code == 200
+    assert len(management.json()['workload']) >= 3
+
+
+def test_intake_review_confirm_flow():
+    analyzed = client.post('/api/intake/analyze', json={
+        'source_channel': 'email',
+        'sender_role': 'customer',
+        'order_id': 'ORD-1001',
+        'raw_content': 'PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。'
+    })
+    assert analyzed.status_code == 200
+    review_id = analyzed.json()['review_id']
+    reviews = client.get('/api/reviews?status=PENDING').json()
+    assert any(x['review_id'] == review_id for x in reviews['items'])
+    confirmed = client.post(f'/api/reviews/{review_id}/confirm', json={'operator_id': 'USER-1'})
+    assert confirmed.status_code == 200
+    assert confirmed.json()['status'] == 'CONFIRMED'
+    order = client.get('/api/orders/ORD-1001').json()['order']
+    assert order['packaging_method'] == '彩盒'
+
+
+def test_task_transfer_escalate_and_settings():
+    moved = client.post('/api/tasks/TASK-TODAY-001/transfer', json={'owner_user_id': 'USER-2'})
+    assert moved.status_code == 200
+    escalated = client.post('/api/tasks/TASK-TODAY-001/escalate', json={'reason': '测试升级'})
+    assert escalated.status_code == 200
+    board = client.get('/api/dashboard').json()
+    task = next(x for x in board['items'] if x['task_id'] == 'TASK-TODAY-001')
+    assert task['risk_level'] == 'critical'
+    saved = client.put('/api/settings', json={'settings': {'accent': 'green', 'compact': True, 'show_demo': False, 'notifications': {}}})
+    assert saved.status_code == 200
+    assert client.get('/api/settings').json()['settings']['accent'] == 'green'
