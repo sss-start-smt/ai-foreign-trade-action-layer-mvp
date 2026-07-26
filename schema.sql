@@ -109,3 +109,27 @@ CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_waiting ON tasks(waiting_on, promised_reply_at);
 CREATE INDEX IF NOT EXISTS idx_risks_order ON risk_signals(order_id);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON event_logs(entity_type, entity_id);
+
+
+CREATE TABLE IF NOT EXISTS candidate_reviews (
+    review_id TEXT PRIMARY KEY,
+    source_message_id TEXT,
+    order_id TEXT,
+    workflow_source TEXT NOT NULL DEFAULT 'LOCAL_RULE_DEMO',
+    candidate_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    reviewer_id TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    FOREIGN KEY(source_message_id) REFERENCES source_messages(message_id),
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id TEXT PRIMARY KEY,
+    settings_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviews_status ON candidate_reviews(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_reviews_order ON candidate_reviews(order_id);
