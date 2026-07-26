@@ -2,54 +2,212 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI外贸跟单行动工作台</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#f7f9fc" />
+  <title>AI外贸跟单行动层｜今日行动工作台</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <div class="eyebrow">AI FOREIGN TRADE ACTION LAYER</div>
-      <h1>今日行动工作台</h1>
-      <p>风险不是提醒终点。系统将事实转为处理、等待、确认、安排、转交或升级。</p>
-    </div>
-    <div class="header-actions">
-      <button class="ghost" id="resetBtn">重置演示数据</button>
-      <span class="health" id="health">连接中</span>
-    </div>
-  </header>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="AI外贸跟单行动层">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span class="brand-text">AI外贸跟单行动层</span>
+      </a>
 
-  <main>
-    <section class="demo-strip">
-      <div>
-        <strong>完整闭环演示</strong>
-        <span>按顺序点击，观察订单、任务和今日排序如何变化。</span>
-      </div>
-      <div class="demo-actions">
-        <button id="step1">① 应用客户消息确认结果</button>
-        <button id="step2" disabled>② 记录已联系工厂</button>
-        <button id="step3">③ 应用工厂回复确认结果</button>
-      </div>
-    </section>
+      <nav class="side-nav" aria-label="主导航">
+        <button class="nav-item active" data-page="today">
+          <span class="nav-icon" data-icon="bolt"></span><span>今日行动</span>
+        </button>
+        <button class="nav-item" data-page="tasks">
+          <span class="nav-icon" data-icon="clipboard"></span><span>全部任务</span>
+        </button>
+        <button class="nav-item" data-page="orders">
+          <span class="nav-icon" data-icon="box"></span><span>订单中心</span>
+        </button>
+        <button class="nav-item" data-page="intake">
+          <span class="nav-icon" data-icon="message"></span><span>消息接入</span>
+        </button>
+        <button class="nav-item" data-page="confirm">
+          <span class="nav-icon" data-icon="check-square"></span><span>AI确认</span>
+        </button>
+        <button class="nav-item" data-page="manage">
+          <span class="nav-icon" data-icon="chart"></span><span>管理看板</span>
+        </button>
+        <button class="nav-item" data-page="settings">
+          <span class="nav-icon" data-icon="settings"></span><span>设置</span>
+        </button>
+      </nav>
 
-    <section class="kpis" id="kpis"></section>
-
-    <section class="toolbar">
-      <div class="tabs" id="tabs"></div>
-      <button class="ghost" id="refreshBtn">刷新排序</button>
-    </section>
-
-    <section class="workspace">
-      <div class="cards" id="cards"></div>
-      <aside class="sidepanel empty" id="sidepanel">
-        <div class="empty-state">
-          <div class="empty-icon">↗</div>
-          <h3>选择一条行动</h3>
-          <p>查看订单、证据、风险、等待对象和下一处理时间。</p>
+      <div class="sidebar-foot">
+        <div class="connection-pill">
+          <span class="pulse-dot"></span>
+          <span id="health">连接中</span>
         </div>
-      </aside>
+        <button class="collapse-button" id="collapseBtn">
+          <span class="nav-icon" data-icon="chevrons-left"></span><span>收起菜单</span>
+        </button>
+      </div>
+    </aside>
+
+    <section class="app-main">
+      <header class="top-header">
+        <div class="page-heading">
+          <h1>今日行动工作台</h1>
+          <p>把分散消息转成可执行、可等待、可追溯的下一步行动</p>
+        </div>
+
+        <div class="top-actions">
+          <label class="global-search">
+            <span class="search-icon" data-icon="search"></span>
+            <input id="searchInput" type="search" placeholder="搜索订单、客户、任务或内容…" autocomplete="off" />
+            <kbd>⌘ K</kbd>
+          </label>
+          <button class="icon-button" id="refreshBtn" aria-label="刷新排序" title="刷新排序">
+            <span data-icon="refresh"></span>
+          </button>
+          <button class="icon-button notification" aria-label="通知">
+            <span data-icon="bell"></span><b>6</b>
+          </button>
+          <button class="profile-button">
+            <span class="avatar">李</span>
+            <span class="profile-copy"><strong>李梅</strong><small>跟单专员</small></span>
+            <span data-icon="chevron-down"></span>
+          </button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="demo-flow" id="demoFlow">
+          <div class="demo-title">
+            <span class="demo-icon" data-icon="sparkles"></span>
+            <div>
+              <strong>完整闭环演示</strong>
+              <small>客户变化确认 → 联系工厂 → 工厂回复后动态重排</small>
+            </div>
+          </div>
+          <div class="demo-steps">
+            <button class="demo-step primary" id="step1"><b>1</b> 应用客户消息</button>
+            <button class="demo-step" id="step2" disabled><b>2</b> 记录已联系</button>
+            <button class="demo-step" id="step3"><b>3</b> 应用工厂回复</button>
+            <button class="text-button" id="resetBtn"><span data-icon="rotate-ccw"></span>重置</button>
+          </div>
+        </section>
+
+        <section class="summary-grid" id="kpis" aria-label="今日行动概览"></section>
+
+        <section class="work-area">
+          <div class="task-column">
+            <div class="panel task-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>我的行动清单 <span id="taskCount">(0)</span></h2>
+                  <p>系统按业务时限、风险与等待窗口生成行动顺序</p>
+                </div>
+                <div class="list-tools">
+                  <button class="outline-button" id="filterToggle">
+                    <span data-icon="filter"></span>筛选
+                  </button>
+                  <select id="sortSelect" class="sort-select" aria-label="排序方式">
+                    <option value="priority">按紧急程度</option>
+                    <option value="time">按处理时间</option>
+                    <option value="risk">按风险等级</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="filter-row">
+                <div class="tabs" id="tabs"></div>
+                <div class="filter-drawer" id="filterDrawer">
+                  <label>风险
+                    <select id="riskFilter">
+                      <option value="ALL">全部风险</option>
+                      <option value="critical">关键</option>
+                      <option value="high">高</option>
+                      <option value="medium">中</option>
+                      <option value="low">低</option>
+                      <option value="none">无</option>
+                    </select>
+                  </label>
+                  <label>对象
+                    <select id="targetFilter">
+                      <option value="ALL">全部对象</option>
+                      <option value="factory">工厂</option>
+                      <option value="customer">客户</option>
+                      <option value="manager">主管</option>
+                      <option value="bank">银行</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <div class="task-list" id="cards"></div>
+
+              <div class="list-footer">
+                <span id="listSummary">显示 0 条</span>
+                <div class="pagination">
+                  <button disabled><span data-icon="chevron-left"></span></button>
+                  <button class="active">1</button>
+                  <button>2</button>
+                  <button>3</button>
+                  <button disabled><span data-icon="chevron-right"></span></button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <aside class="detail-panel empty" id="sidepanel">
+            <div class="empty-detail">
+              <div class="empty-orbit">
+                <span data-icon="mouse-pointer"></span>
+              </div>
+              <h3>选择一条行动</h3>
+              <p>查看订单信息、原文证据、风险原因和下一步操作。</p>
+            </div>
+          </aside>
+        </section>
+      </main>
     </section>
-  </main>
+  </div>
+
+  <nav class="mobile-nav" aria-label="移动端导航">
+    <button class="active"><span data-icon="bolt"></span><small>今日行动</small></button>
+    <button><span data-icon="box"></span><small>订单</small></button>
+    <button><span data-icon="message"></span><small>接入</small></button>
+    <button><span data-icon="check-square"></span><small>AI确认</small></button>
+    <button><span data-icon="user"></span><small>我的</small></button>
+  </nav>
+
+  <dialog class="wait-dialog" id="waitDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <div>
+          <span class="dialog-icon" data-icon="clock"></span>
+          <div><h3>设置等待窗口</h3><p>在承诺时间前抑制重复催办</p></div>
+        </div>
+        <button value="cancel" class="dialog-close" aria-label="关闭">×</button>
+      </div>
+      <label class="form-field">
+        <span>等待对象</span>
+        <select id="waitTarget">
+          <option value="factory">工厂</option>
+          <option value="customer">客户</option>
+          <option value="bank">银行</option>
+          <option value="logistics">物流服务商</option>
+        </select>
+      </label>
+      <label class="form-field">
+        <span>承诺回复时间</span>
+        <input id="waitTime" type="datetime-local" required />
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" class="outline-button">取消</button>
+        <button value="default" id="confirmWait" class="primary-button">确认设置</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="toast" id="toast"></div>
   <script src="/static/app.js"></script>
