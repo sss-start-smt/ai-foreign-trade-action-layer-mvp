@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI外贸跟单行动工作台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">AI FOREIGN TRADE ACTION LAYER</div>
+      <h1>今日行动工作台</h1>
+      <p>风险不是提醒终点。系统将事实转为处理、等待、确认、安排、转交或升级。</p>
+    </div>
+    <div class="header-actions">
+      <button class="ghost" id="resetBtn">重置演示数据</button>
+      <span class="health" id="health">连接中</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="demo-strip">
+      <div>
+        <strong>完整闭环演示</strong>
+        <span>按顺序点击，观察订单、任务和今日排序如何变化。</span>
+      </div>
+      <div class="demo-actions">
+        <button id="step1">① 应用客户消息确认结果</button>
+        <button id="step2" disabled>② 记录已联系工厂</button>
+        <button id="step3">③ 应用工厂回复确认结果</button>
+      </div>
+    </section>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="toolbar">
+      <div class="tabs" id="tabs"></div>
+      <button class="ghost" id="refreshBtn">刷新排序</button>
+    </section>
+
+    <section class="workspace">
+      <div class="cards" id="cards"></div>
+      <aside class="sidepanel empty" id="sidepanel">
+        <div class="empty-state">
+          <div class="empty-icon">↗</div>
+          <h3>选择一条行动</h3>
+          <p>查看订单、证据、风险、等待对象和下一处理时间。</p>
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
