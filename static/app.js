@@ -4,7 +4,32 @@ const S={DO_NOW:'立即处理',DO_TODAY:'今天处理',WAITING_EXTERNAL:'等待�
 const routes={today:['今日行动工作台','把分散消息转成可执行、可等待、可追溯的下一步行动'],tasks:['全部任务 / 等待中心','集中查看任务、等待窗口、负责人和超期状态'],orders:['订单中心','从订单视角查看节点、交期、风险和未完成事项'],intake:['消息接入','接入客户、工厂与内部消息，生成待确认候选'],confirm:['AI候选确认','人工审核字段变化、风险与行动候选后再写回'],manage:['管理看板','查看团队负荷、等待对象、超期原因和主管介入'],settings:['设置','管理界面偏好和通知策略']};
 let routeState={route:'today',query:{}};let cache={};let selectedReview=null;let search='';let settings={accent:'blue',compact:false,show_demo:true,notifications:{urgent:true,waiting_overdue:true,writeback:true,daily_summary:false}};
 function svg(n){return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${I[n]||''}</svg>`}document.querySelectorAll('[data-icon]').forEach(e=>e.insertAdjacentHTML('afterbegin',svg(e.dataset.icon)));
-const api=async(u,o={})=>{const r=await fetch(u,{headers:{'Content-Type':'application/json',...(o.headers||{})},...o});if(!r.ok){let t=await r.text(),m=t;try{let j=JSON.parse(t),d=j.detail;m=typeof d==='string'?d:(d?.message||JSON.stringify(d))}catch(_){ }throw new Error(m)}return r.json()};const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));const toast=m=>{let e=document.querySelector('#toast');e.textContent=m;e.classList.add('show');clearTimeout(window.tt);window.tt=setTimeout(()=>e.classList.remove('show'),2400)};const dt=v=>{if(!v)return null;let d=new Date(String(v).replace('Z','+00:00'));return isNaN(d)?null:d};const fdt=v=>{let d=dt(v);if(!d)return'—';let n=new Date(),p=d.toDateString()==n.toDateString()?'今天':`${d.getMonth()+1}月${d.getDate()}日`;return `${p} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`};const fd=v=>{let d=dt(v);return d?`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`:'—'};const pct=v=>v==null?'—':`${Math.round(Number(v)*100)}%`;const nowLocal=(h=3)=>{let d=new Date(Date.now()+h*3600000),p=n=>String(n).padStart(2,'0'),off=-d.getTimezoneOffset(),sg=off>=0?'+':'-';return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:00${sg}${p(Math.floor(Math.abs(off)/60))}:${p(Math.abs(off)%60)}`};
+const api=async(u,o={})=>{
+  const {timeoutMs=210000,...fetchOptions}=o;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const r=await fetch(u,{
+      headers:{'Content-Type':'application/json',...(fetchOptions.headers||{})},
+      ...fetchOptions,
+      signal:controller.signal
+    });
+    if(!r.ok){
+      let t=await r.text(),m=t;
+      try{
+        let j=JSON.parse(t),d=j.detail;
+        m=typeof d==='string'?d:(d?.message||JSON.stringify(d));
+      }catch(_){}
+      throw new Error(m);
+    }
+    return r.json();
+  }catch(e){
+    if(e?.name==='AbortError')throw new Error('请求超时：Coze工作流超过等待时间，请查看/api/coze/status中的recent_runs');
+    throw e;
+  }finally{
+    clearTimeout(timer);
+  }
+};const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));const toast=m=>{let e=document.querySelector('#toast');e.textContent=m;e.classList.add('show');clearTimeout(window.tt);window.tt=setTimeout(()=>e.classList.remove('show'),2400)};const dt=v=>{if(!v)return null;let d=new Date(String(v).replace('Z','+00:00'));return isNaN(d)?null:d};const fdt=v=>{let d=dt(v);if(!d)return'—';let n=new Date(),p=d.toDateString()==n.toDateString()?'今天':`${d.getMonth()+1}月${d.getDate()}日`;return `${p} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`};const fd=v=>{let d=dt(v);return d?`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`:'—'};const pct=v=>v==null?'—':`${Math.round(Number(v)*100)}%`;const nowLocal=(h=3)=>{let d=new Date(Date.now()+h*3600000),p=n=>String(n).padStart(2,'0'),off=-d.getTimezoneOffset(),sg=off>=0?'+':'-';return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:00${sg}${p(Math.floor(Math.abs(off)/60))}:${p(Math.abs(off)%60)}`};
 function parseHash(){let raw=location.hash.replace(/^#/,'')||'today', [path,q='']=raw.split('?'), parts=path.split('/');return{route:parts[0]||'today',id:parts[1]||null,query:Object.fromEntries(new URLSearchParams(q))}}function go(r){location.hash=r}function applySettings(){document.body.classList.toggle('compact',!!settings.compact);document.body.classList.remove('accent-green','accent-orange');if(settings.accent==='green')document.body.classList.add('accent-green');if(settings.accent==='orange')document.body.classList.add('accent-orange')}
 async function init(){try{let [h,s,rv]=await Promise.all([api('/health'),api('/api/settings'),api('/api/reviews?status=PENDING')]);document.querySelector('#health').textContent=`${h.coze?.ready?'Coze已连接':'服务已连接'} · v${h.version}`;settings=s.settings;applySettings();document.querySelector('#reviewBadge').textContent=rv.pending}catch(e){document.querySelector('#health').textContent='连接失败'}bindShell();await renderRoute()}function bindShell(){document.querySelectorAll('[data-route]').forEach(b=>b.onclick=()=>{go(b.dataset.route);document.querySelector('#sidebar').classList.remove('open')});window.addEventListener('hashchange',renderRoute);document.querySelector('#mobileMenu').onclick=()=>document.querySelector('#sidebar').classList.toggle('open');document.querySelector('#refreshBtn').onclick=()=>{cache={};renderRoute();toast('页面数据已刷新')};document.querySelector('.notification').onclick=()=>toast('当前有6条演示通知；通知中心将在商业化阶段接入');document.querySelector('.profile-button').onclick=()=>go('settings');document.querySelector('#drawerMask').onclick=closeDrawer;document.querySelector('#globalSearch').oninput=e=>{search=e.target.value;renderRoute(false)};document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();document.querySelector('#globalSearch').focus()}})}
 function setActive(r){document.querySelectorAll('[data-route]').forEach(b=>b.classList.toggle('active',b.dataset.route===r));let meta=routes[r]||routes.today;document.querySelector('#pageTitle').textContent=meta[0];document.querySelector('#pageSubtitle').textContent=meta[1];document.querySelector('#globalSearch').placeholder=r==='orders'?'搜索订单、客户或产品…':r==='tasks'||r==='today'?'搜索订单、客户或任务…':'搜索当前页面…'}async function renderRoute(resetSearch=true){routeState=parseHash();if(resetSearch){search='';document.querySelector('#globalSearch').value=''}setActive(routeState.route);let root=document.querySelector('#pageRoot');root.innerHTML='<div class="page-loading"><span></span>正在加载页面…</div>';try{let map={today:pageToday,tasks:pageTasks,orders:routeState.id?pageOrderDetail:pageOrders,intake:pageIntake,confirm:pageConfirm,manage:pageManage,settings:pageSettings};await (map[routeState.route]||pageToday)(root)}catch(e){root.innerHTML=`<div class="panel empty"><div class="empty-icon">!</div><h3>页面加载失败</h3><p>${esc(e.message)}</p><button class="btn primary" onclick="location.reload()">重新加载</button></div>`}}
@@ -86,6 +111,12 @@ async function pageIntake(root){
       complaint:'PO-1002已经严重延误，如果今天还没有明确答复，我们将取消订单。'
     };
     root.querySelector('[name=raw_content]').value=samples[b.dataset.sample];
+    if(b.dataset.sample==='factory'){
+      root.querySelector('[name=sender_role]').value='factory';
+      root.querySelector('[name=source_channel]').value='wechat';
+    }else{
+      root.querySelector('[name=sender_role]').value='customer';
+    }
   });
 
   root.querySelector('#intakeForm').onsubmit=async e=>{
@@ -110,19 +141,20 @@ async function pageIntake(root){
     statusBox.innerHTML=`<b>正在识别：</b>网站后端正在调用Coze ${workflowName}。首次唤醒Render或工作流执行可能需要几十秒，请不要重复点击。`;
 
     try{
-      const coze=await api('/api/coze/status');
+      const coze=await api('/api/coze/status',{timeoutMs:30000});
       if(!coze.ready){
         const reasons=[];
-        if(!coze.token_configured) reasons.push('Render未识别到COZE_API_TOKEN');
+        if(!coze.token_configured)reasons.push('Render未识别到COZE_API_TOKEN');
         Object.entries(coze.workflows||{}).forEach(([key,value])=>{
-          if(!value.configured) reasons.push(`${key.toUpperCase()}工作流ID未配置`);
+          if(!value.configured)reasons.push(`${key.toUpperCase()}工作流ID未配置`);
         });
         throw new Error(reasons.join('；')||'Coze接入尚未就绪，请检查Render环境变量');
       }
 
       const r=await api('/api/intake/analyze',{
         method:'POST',
-        body:JSON.stringify(f)
+        body:JSON.stringify(f),
+        timeoutMs:210000
       });
 
       statusBox.innerHTML=`<b>识别成功：</b>${esc(r.workflow_source||workflowName)} 已生成待确认候选，正在进入AI确认页面。`;
@@ -130,7 +162,7 @@ async function pageIntake(root){
       setTimeout(()=>go(`confirm?review=${r.review_id}`),350);
     }catch(err){
       let message=err?.message||String(err);
-      statusBox.innerHTML=`<b>调用失败：</b>${esc(message)}<br><small>请打开 /health 和 /api/coze/status 检查配置；错误会同时记录在 recent_runs 中。</small>`;
+      statusBox.innerHTML=`<b>调用失败：</b>${esc(message)}<br><small>请打开 /api/coze/status，查看 recent_runs 中最新的 ${workflowName} 记录。</small>`;
       toast(`Coze识别失败：${message}`);
       console.error('Coze intake failed',err);
     }finally{
@@ -146,9 +178,151 @@ async function pageIntake(root){
   };
   root.querySelector('#importCoze').onclick=importCozeModal;
 }
-async function pageConfirm(root){let d=await api('/api/reviews'),items=d.items.filter(x=>!search||[x.order_no,x.customer_name,x.raw_content,x.workflow_source].join(' ').toLowerCase().includes(search.toLowerCase()));selectedReview=routeState.query.review||selectedReview||items.find(x=>x.status==='PENDING')?.review_id||items[0]?.review_id;root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>AI候选确认</h2><p>审核字段、风险和行动候选；未确认内容不进入正式数据</p></div><div class="button-row"><button class="btn" data-go="intake">接入新消息</button><button class="btn" id="importReview">导入Coze JSON</button></div></div><div class="review-layout"><section class="panel"><div class="panel-head"><div><h3>候选队列</h3><p>${d.pending} 条待确认</p></div></div><div class="review-list" id="reviewList">${items.map(reviewCard).join('')||'<div class="empty"><h3>暂无候选</h3></div>'}</div></section><section class="panel" id="reviewDetail"><div class="empty"><div class="empty-icon">✓</div><h3>选择一条候选</h3></div></section></div></div>`;bindGo(root);root.querySelector('#importReview').onclick=importCozeModal;root.querySelectorAll('.review-card').forEach(c=>c.onclick=()=>{selectedReview=c.dataset.id;showReview(root,c.dataset.id)});if(selectedReview)showReview(root,selectedReview)}function reviewCard(x){return `<article class="review-card ${selectedReview===x.review_id?'active':''}" data-id="${x.review_id}"><div class="top"><small>${esc(x.workflow_source)}</small><span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status==='PENDING'?'待确认':x.status==='CONFIRMED'?'已确认':'已驳回'}</span></div><h3>${esc(x.order_no||'未关联订单')} · ${esc(x.customer_name||'待匹配')}</h3><p>${esc(x.raw_content||x.candidate.message_type||'导入的工作流结果')}</p></article>`}
-async function showReview(root,id){let x=await api(`/api/reviews/${id}`),c=x.candidate,detail=root.querySelector('#reviewDetail');root.querySelectorAll('.review-card').forEach(e=>e.classList.toggle('active',e.dataset.id===id));detail.innerHTML=`<div class="panel-head"><div><h2>${esc(x.order_no||'待关联订单')}</h2><p>${esc(x.workflow_source)} · ${fdt(x.created_at)}</p></div><span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status}</span></div><div class="panel-body"><div class="boundary-note">AI只生成候选。你可以修改值后确认；点击确认后，网站会真实调用Coze FT03，只有接口确认写回后才更新状态并触发FT04重排。</div><section class="candidate-section"><h3>原始消息</h3><div class="quote">${esc(x.raw_content||'该候选由JSON直接导入')}</div></section><section class="candidate-section"><h3>订单关联</h3><div class="candidate-row"><b>匹配状态</b><span>${esc(c.order_match?.status||'unknown')}</span><span>${esc(c.order_match?.matched_order_no||x.order_no||'—')}</span></div></section><section class="candidate-section"><h3>字段候选</h3><div id="candidateFields">${(c.fields||[]).map((f,i)=>`<div class="candidate-row"><div><b>${esc(fieldName(f.field_name))}</b><div class="source-quote">证据：${esc(f.source_quote||'—')}</div></div><input data-index="${i}" value="${esc(f.normalized_value??'')}"/><span>${Math.round((f.confidence||0)*100)}%置信</span></div>`).join('')||'<p>没有字段候选</p>'}</div></section><section class="candidate-section"><h3>风险提示</h3>${(c.risk_signals||[]).map(r=>`<div class="quote">${risk(r.risk_level||'medium')} ${esc(riskType(r.type))}<br><small>${esc(r.evidence||'')}</small></div>`).join('')||'<p>没有风险候选</p>'}</section><section class="candidate-section"><h3>行动候选</h3>${(c.action_candidates||[]).map(a=>`<div class="quote"><b>${esc(a.title||a.action_type)}</b><br>${esc(a.recommended_action||'')}</div>`).join('')||'<p>没有行动候选</p>'}</section>${x.status==='PENDING'?`<div class="button-row"><button class="btn primary" id="confirmReview">确认并调用FT03写回</button><button class="btn danger" id="rejectReview">驳回候选</button><button class="btn" id="copyReview">复制候选JSON</button></div>`:`<div class="button-row"><button class="btn" data-go="orders/${x.order_id}">查看关联订单</button><button class="btn" data-go="today">查看今日行动</button></div>`}</div>`;bindGo(detail);if(x.status==='PENDING'){detail.querySelector('#confirmReview').onclick=async()=>{let edited=structuredClone(c);detail.querySelectorAll('#candidateFields input').forEach(inp=>{let f=edited.fields[Number(inp.dataset.index)],v=inp.value;if(f.field_name==='current_progress')v=Number(v);f.normalized_value=v});let r=await api(`/api/reviews/${id}/confirm`,{method:'POST',body:JSON.stringify({candidate:edited,operator_id:'USER-1'})});cache={};toast(r.ft03?'FT03写回成功，FT04已重新排序':'候选已确认，订单和行动已更新');document.querySelector('#reviewBadge').textContent=Math.max(0,Number(document.querySelector('#reviewBadge').textContent)-1);go(`orders/${r.order_id}`)};detail.querySelector('#rejectReview').onclick=async()=>{await api(`/api/reviews/${id}/reject`,{method:'POST',body:'{}'});toast('候选已驳回');selectedReview=null;renderRoute(false)};detail.querySelector('#copyReview').onclick=()=>navigator.clipboard.writeText(JSON.stringify(c,null,2)).then(()=>toast('候选JSON已复制'))}}
-function fieldName(x){return{order_no:'订单号',packaging_method:'包装方式',requested_delivery_date:'客户交期',latest_supplier_commitment:'工厂承诺',current_progress:'当前进度',current_node:'当前节点'}[x]||x}function riskType(x){return{delivery_impact_unknown:'交期影响待确认',customer_complaint:'客户投诉风险',commitment_uncertain:'工厂承诺不明确',document_conflict:'文件冲突'}[x]||x}
+async function pageConfirm(root){
+  let d=await api('/api/reviews'),
+      items=d.items.filter(x=>!search||[x.order_no,x.customer_name,x.raw_content,x.workflow_source].join(' ').toLowerCase().includes(search.toLowerCase()));
+  selectedReview=routeState.query.review||selectedReview||items.find(x=>x.status==='PENDING')?.review_id||items[0]?.review_id;
+  root.innerHTML=`<div class="page-stack">
+    <div class="page-toolbar">
+      <div><h2>AI候选确认</h2><p>审核字段、风险和行动候选；未确认内容不进入正式数据</p></div>
+      <div class="button-row"><button class="btn" data-go="intake">接入新消息</button><button class="btn" id="importReview">导入Coze JSON</button></div>
+    </div>
+    <div class="review-layout">
+      <section class="panel">
+        <div class="panel-head"><div><h3>候选队列</h3><p>${d.pending} 条待确认</p></div></div>
+        <div class="review-list" id="reviewList">${items.map(reviewCard).join('')||'<div class="empty"><h3>暂无候选</h3></div>'}</div>
+      </section>
+      <section class="panel" id="reviewDetail"><div class="empty"><div class="empty-icon">✓</div><h3>选择一条候选</h3></div></section>
+    </div>
+  </div>`;
+  bindGo(root);
+  root.querySelector('#importReview').onclick=importCozeModal;
+  root.querySelectorAll('.review-card').forEach(c=>c.onclick=()=>{
+    selectedReview=c.dataset.id;
+    showReview(root,c.dataset.id);
+  });
+  if(selectedReview)showReview(root,selectedReview);
+}
+
+function reviewCard(x){
+  return `<article class="review-card ${selectedReview===x.review_id?'active':''}" data-id="${x.review_id}">
+    <div class="top"><small>${esc(x.workflow_source)}</small><span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status==='PENDING'?'待确认':x.status==='CONFIRMED'?'已确认':'已驳回'}</span></div>
+    <h3>${esc(x.order_no||'未关联订单')} · ${esc(x.customer_name||'待匹配')}</h3>
+    <p>${esc(x.raw_content||x.candidate.message_type||'导入的工作流结果')}</p>
+  </article>`;
+}
+
+async function showReview(root,id){
+  let x=await api(`/api/reviews/${id}`),c=x.candidate,detail=root.querySelector('#reviewDetail');
+  root.querySelectorAll('.review-card').forEach(e=>e.classList.toggle('active',e.dataset.id===id));
+  detail.innerHTML=`<div class="panel-head">
+      <div><h2>${esc(x.order_no||'待关联订单')}</h2><p>${esc(x.workflow_source)} · ${fdt(x.created_at)}</p></div>
+      <span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status}</span>
+    </div>
+    <div class="panel-body">
+      <div class="boundary-note">AI只生成候选。你可以修改值后确认；点击确认后，网站会真实调用Coze FT03，只有接口确认写回后才更新状态并触发FT04重排。</div>
+      <section class="candidate-section"><h3>原始消息</h3><div class="quote">${esc(x.raw_content||'该候选由JSON直接导入')}</div></section>
+      <section class="candidate-section"><h3>订单关联</h3><div class="candidate-row"><b>匹配状态</b><span>${esc(c.order_match?.status||'unknown')}</span><span>${esc(c.order_match?.matched_order_no||x.order_no||'—')}</span></div></section>
+      <section class="candidate-section"><h3>字段候选</h3><div id="candidateFields">${(c.fields||[]).map((f,i)=>`<div class="candidate-row"><div><b>${esc(fieldName(f.field_name))}</b><div class="source-quote">证据：${esc(f.source_quote||'—')}</div></div><input data-index="${i}" value="${esc(f.normalized_value??'')}"/><span>${Math.round((f.confidence||0)*100)}%置信</span></div>`).join('')||'<p>没有字段候选</p>'}</div></section>
+      <section class="candidate-section"><h3>风险提示</h3>${(c.risk_signals||[]).map(r=>`<div class="quote">${risk(r.risk_level||'medium')} ${esc(riskType(r.type))}<br><small>${esc(r.evidence||'')}</small></div>`).join('')||'<p>没有风险候选</p>'}</section>
+      <section class="candidate-section"><h3>行动候选</h3>${(c.action_candidates||[]).map(a=>`<div class="quote"><b>${esc(a.title||a.action_type)}</b><br>${esc(a.recommended_action||'')}</div>`).join('')||'<p>没有行动候选</p>'}</section>
+      ${x.status==='PENDING'?`
+        <div id="confirmStatus" class="boundary-note" style="display:none"></div>
+        <div class="button-row">
+          <button class="btn primary" id="confirmReview"><span>确认并调用FT03写回</span></button>
+          <button class="btn danger" id="rejectReview">驳回候选</button>
+          <button class="btn" id="copyReview">复制候选JSON</button>
+        </div>`:
+        `<div class="button-row"><button class="btn" data-go="orders/${x.order_id}">查看关联订单</button><button class="btn" data-go="today">查看今日行动</button></div>`}
+    </div>`;
+  bindGo(detail);
+
+  if(x.status==='PENDING'){
+    detail.querySelector('#confirmReview').onclick=async()=>{
+      const btn=detail.querySelector('#confirmReview');
+      const btnText=btn.querySelector('span');
+      const statusBox=detail.querySelector('#confirmStatus');
+      let edited=JSON.parse(JSON.stringify(c));
+      detail.querySelectorAll('#candidateFields input').forEach(inp=>{
+        let f=edited.fields[Number(inp.dataset.index)],v=inp.value;
+        if(f.field_name==='current_progress'||f.field_name==='current_progress_percentage')v=Number(v);
+        f.normalized_value=v;
+      });
+
+      btn.disabled=true;
+      detail.querySelector('#rejectReview').disabled=true;
+      statusBox.style.display='block';
+      statusBox.innerHTML='<b>正在写回：</b>网站正在调用FT03；FT03会回调网站写入数据库，成功后再触发FT04重排。该过程可能需要几十秒，请不要重复点击。';
+      btnText.textContent='正在调用FT03并等待写回…';
+
+      try{
+        const coze=await api('/api/coze/status',{timeoutMs:30000});
+        if(!coze.ready||!coze.workflows?.ft03?.configured){
+          throw new Error('FT03尚未就绪，请检查COZE_API_TOKEN和COZE_FT03_WORKFLOW_ID');
+        }
+        const r=await api(`/api/reviews/${id}/confirm`,{
+          method:'POST',
+          body:JSON.stringify({candidate:edited,operator_id:'USER-1'}),
+          timeoutMs:240000
+        });
+        cache={};
+        const persistence=r.ft03?.persistence_status||r.status;
+        statusBox.innerHTML=`<b>写回成功：</b>FT03结果为 ${esc(persistence)}；${r.ft04?'FT04已完成重新排序。':'FT04未返回结果，请稍后查看今日行动。'}`;
+        toast(r.ft03?'FT03写回成功，FT04已重新排序':'候选已确认，订单和行动已更新');
+        const badge=document.querySelector('#reviewBadge');
+        badge.textContent=Math.max(0,Number(badge.textContent)-1);
+        setTimeout(()=>go(`orders/${r.order_id}`),650);
+      }catch(err){
+        const message=err?.message||String(err);
+        statusBox.innerHTML=`<b>FT03调用失败：</b>${esc(message)}<br><small>候选仍保持“待确认”，不会伪造写回成功。请查看 /api/coze/status 的 recent_runs。</small>`;
+        toast(`FT03写回失败：${message}`);
+        console.error('FT03 confirmation failed',err);
+      }finally{
+        btn.disabled=false;
+        detail.querySelector('#rejectReview').disabled=false;
+        btnText.textContent='确认并调用FT03写回';
+      }
+    };
+
+    detail.querySelector('#rejectReview').onclick=async()=>{
+      try{
+        await api(`/api/reviews/${id}/reject`,{method:'POST',body:'{}'});
+        toast('候选已驳回');
+        selectedReview=null;
+        renderRoute(false);
+      }catch(err){
+        toast(`驳回失败：${err.message}`);
+      }
+    };
+
+    detail.querySelector('#copyReview').onclick=()=>{
+      navigator.clipboard.writeText(JSON.stringify(c,null,2))
+        .then(()=>toast('候选JSON已复制'))
+        .catch(()=>toast('浏览器未允许复制，请手动复制'));
+    };
+  }
+}
+
+function fieldName(x){
+  return {
+    order_no:'订单号',
+    packaging_method:'包装方式',
+    requested_delivery_date:'客户交期',
+    latest_supplier_commitment:'工厂承诺',
+    current_progress:'当前进度',
+    current_progress_percentage:'当前进度',
+    current_node:'当前节点'
+  }[x]||x;
+}
+function riskType(x){
+  return {
+    delivery_impact_unknown:'交期影响待确认',
+    customer_complaint:'客户投诉风险',
+    commitment_uncertain:'工厂承诺不明确',
+    document_conflict:'文件冲突',
+    missing_answer:'关键问题未回答'
+  }[x]||x;
+}
 async function pageManage(root){let d=await api('/api/management'),max=Math.max(...d.workload.map(x=>x.total),1),wait=Object.entries(d.waiting_distribution),riskEntries=Object.entries(d.risk_distribution);root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>团队工作负荷</h2><p>用于看见责任、等待与超期原因，不把所有问题归责给跟单员</p></div><button class="btn" data-go="tasks?state=ESCALATE">查看需介入事项</button></div>${summaryCards([{l:'团队任务',v:d.summary.total,i:'clipboard',bg:'#eaf2ff',c:'#2868f0',g:'#eef4ff'},{l:'立即处理',v:d.summary.do_now,i:'bolt',bg:'#ffeaec',c:'#ee5360',g:'#fff1f2'},{l:'等待外部',v:d.summary.waiting,i:'clock',bg:'#fff1dc',c:'#f39a32',g:'#fff7eb'},{l:'需主管介入',v:d.summary.escalate,i:'arrowup',bg:'#f1efff',c:'#7868e6',g:'#f7f5ff'}])}<div class="three-col"><section class="panel"><div class="panel-head"><h3>人员负荷</h3></div><div class="panel-body bar-list">${d.workload.map(x=>`<div class="bar-row"><span>${esc(x.name)}</span><div class="bar-track"><i style="width:${x.total/max*100}%"></i></div><b>${x.total}</b></div>`).join('')}</div></section><section class="panel"><div class="panel-head"><h3>等待对象分布</h3></div><div class="panel-body bar-list">${wait.map(([k,v])=>`<div class="bar-row"><span>${esc(T[k]||k)}</span><div class="bar-track"><i style="width:${v/Math.max(...wait.map(x=>x[1]),1)*100}%;background:var(--orange)"></i></div><b>${v}</b></div>`).join('')||'<p>暂无等待事项</p>'}</div></section><section class="panel"><div class="panel-head"><h3>风险结构</h3></div><div class="panel-body"><div class="chart-wrap"><div class="donut"></div><div class="chart-center"><b>${riskEntries.reduce((a,x)=>a+x[1],0)}</b><br><small>风险任务</small></div></div></div></section></div><section class="panel"><div class="panel-head"><div><h2>需要主管介入</h2><p>只展示重大风险、无负责人或严重逾期事项</p></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>任务</th><th>订单</th><th>风险</th><th>负责人</th><th>原因</th><th>操作</th></tr></thead><tbody>${d.escalations.map(x=>`<tr><td>${esc(x.title)}</td><td><button class="link-button" data-order="${x.related_order_id}">${esc(x.order?.order_no||x.related_order_id)}</button></td><td>${risk(x.risk_level)}</td><td>${esc(O[x.owner_user_id]||'未分配')}</td><td>${esc((x.priority_reasons||[]).join('；'))}</td><td><button class="btn small" data-task="${x.task_id}">处理</button></td></tr>`).join('')||'<tr><td colspan="6">暂无主管介入事项</td></tr>'}</tbody></table></div></section></div>`;bindGo(root);root.querySelectorAll('[data-order]').forEach(b=>b.onclick=()=>go(`orders/${b.dataset.order}`));root.querySelectorAll('[data-task]').forEach(b=>b.onclick=()=>openTask(b.dataset.task))}
 async function pageSettings(root){let d=await api('/api/settings');settings=d.settings;applySettings();root.innerHTML=`<div class="settings-layout"><section class="panel settings-nav"><button class="active" data-section="appearance">界面偏好</button><button data-section="notifications">通知策略</button><button data-section="audit">数据与审计</button><button data-section="about">关于项目</button></section><section class="panel"><div class="panel-head"><div><h2>设置</h2><p>偏好保存到当前MVP数据库</p></div></div><div class="setting-section" id="appearance"><h3>主题强调色</h3><p>蓝色更专业，绿色更温和，橘色更强调行动。</p><div class="theme-options"><button class="theme-option ${settings.accent==='blue'?'active':''}" data-accent="blue"><div class="theme-swatch" style="background:linear-gradient(135deg,#2868f0,#55a5ff)"></div>蓝色</button><button class="theme-option ${settings.accent==='green'?'active':''}" data-accent="green"><div class="theme-swatch" style="background:linear-gradient(135deg,#239b63,#71c594)"></div>绿色</button><button class="theme-option ${settings.accent==='orange'?'active':''}" data-accent="orange"><div class="theme-swatch" style="background:linear-gradient(135deg,#e88926,#f5b45f)"></div>橘色</button></div></div><div class="setting-section"><h3>界面密度</h3><div class="setting-row"><label>紧凑模式<small>减少表格和卡片间距，适合小屏电脑。</small></label><label class="switch"><input id="compactSetting" type="checkbox" ${settings.compact?'checked':''}/><i></i></label></div><div class="setting-row"><label>显示完整闭环演示<small>在今日行动顶部显示三步演示入口。</small></label><label class="switch"><input id="demoSetting" type="checkbox" ${settings.show_demo?'checked':''}/><i></i></label></div></div><div class="setting-section" id="notifications"><h3>通知策略</h3>${[['urgent','关键风险即时提醒'],['waiting_overdue','承诺回复超时提醒'],['writeback','写回成功或失败通知'],['daily_summary','每日行动摘要']].map(([k,n])=>`<div class="setting-row"><label>${n}</label><label class="switch"><input data-notify="${k}" type="checkbox" ${settings.notifications?.[k]?'checked':''}/><i></i></label></div>`).join('')}</div><div class="setting-section" id="audit"><h3>数据与审计</h3><p>FT03写回接口：<code>/api/writeback</code>；幂等、确认快照和事件日志已启用。网页不会显示未经接口验证的“写回成功”。</p><div class="button-row"><button class="btn" id="checkHealth">检查服务状态</button><button class="btn" data-go="confirm">查看候选确认记录</button></div></div><div class="setting-section" id="about"><h3>关于项目</h3><p>当前定位是ERP或Excel之上的AI跟单行动层。客户消息由FT01识别，工厂回复由FT02理解，人工确认后由FT03写回，任务变化由FT04排序；令牌仅保存在Render环境变量。</p></div><div class="setting-section"><div class="button-row"><button class="btn primary" id="saveSettings">保存设置</button><button class="btn" id="resetSettings">恢复默认</button></div></div></section></div>`;root.querySelectorAll('[data-accent]').forEach(b=>b.onclick=()=>{settings.accent=b.dataset.accent;root.querySelectorAll('[data-accent]').forEach(x=>x.classList.toggle('active',x===b));applySettings()});root.querySelector('#saveSettings').onclick=async()=>{settings.compact=root.querySelector('#compactSetting').checked;settings.show_demo=root.querySelector('#demoSetting').checked;settings.notifications={};root.querySelectorAll('[data-notify]').forEach(x=>settings.notifications[x.dataset.notify]=x.checked);await api('/api/settings',{method:'PUT',body:JSON.stringify({settings})});applySettings();toast('设置已保存')};root.querySelector('#resetSettings').onclick=()=>{settings={accent:'blue',compact:false,show_demo:true,notifications:{urgent:true,waiting_overdue:true,writeback:true,daily_summary:false}};applySettings();renderRoute(false)};root.querySelectorAll('.settings-nav [data-section]').forEach(b=>b.onclick=()=>{root.querySelectorAll('.settings-nav button').forEach(x=>x.classList.toggle('active',x===b));root.querySelector('#'+b.dataset.section)?.scrollIntoView({behavior:'smooth',block:'start'})});root.querySelector('#checkHealth').onclick=async()=>{let h=await api('/health');toast(`服务正常 · v${h.version}`)};bindGo(root)}
 function bindGo(root){root.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go))}async function openTask(id){let d=await getDashboard(),x=d.items.find(t=>t.task_id===id);if(!x)return;let detail=x.related_order_id?await api(`/api/orders/${x.related_order_id}`):{order:x.order,tasks:[],risks:[],messages:[],commitments:[],events:[]},o=detail.order||x.order||{};openDrawer(`<div class="drawer-head"><h2>行动详情</h2><button class="drawer-close">×</button></div><div class="drawer-section"><h3>${esc(x.title)}</h3><div class="kv"><span>订单</span><button class="link-button" id="drawerOrder">${esc(o.order_no||x.related_order_id||'—')}</button></div><div class="kv"><span>客户</span><b>${esc(o.customer_name||'—')}</b></div><div class="kv"><span>当前状态</span>${status(x.action_state)}</div><div class="kv"><span>推荐动作</span><b>${esc(x.recommended_action)}</b></div><div class="kv"><span>负责人</span><span>${esc(O[x.owner_user_id]||x.owner_user_id||'未分配')}</span></div><div class="kv"><span>等待对象</span><span>${esc(T[x.waiting_on]||x.waiting_on||'—')}</span></div><div class="kv"><span>下一处理</span><b>${fdt(x.next_action_at||x.business_deadline)}</b></div></div><div class="drawer-section"><h3>事实证据</h3>${(x.evidence||[]).map(e=>`<div class="quote">${esc(e)}</div>`).join('')||'<p>暂无证据</p>'}</div><div class="drawer-section"><h3>风险与历史</h3>${detail.risks.map(r=>`<div class="quote">${risk(r.risk_level)} ${esc(r.evidence||r.risk_type)}</div>`).join('')||'<p>暂无风险记录</p>'}</div><div class="drawer-section"><div class="button-row"><button class="btn primary" id="contactTask">记录已联系</button><button class="btn" id="waitTask">设置等待</button><button class="btn" id="transferTask">转交</button><button class="btn danger" id="escalateTask">升级主管</button><button class="btn green" id="completeTask">标记完成</button></div></div>`);document.querySelector('.drawer-close').onclick=closeDrawer;let ob=document.querySelector('#drawerOrder');if(ob)ob.onclick=()=>{closeDrawer();go(`orders/${x.related_order_id}`)};document.querySelector('#contactTask').onclick=async()=>{await api(`/api/tasks/${id}/contacted`,{method:'POST',body:JSON.stringify({waiting_on:x.target||'factory',promised_reply_at:nowLocal(3)})});cache={};toast('已记录联系并设置3小时等待窗口');closeDrawer();renderRoute(false)};document.querySelector('#waitTask').onclick=()=>waitModal(id,x.target||'factory');document.querySelector('#transferTask').onclick=()=>transferModal(id);document.querySelector('#escalateTask').onclick=async()=>{await api(`/api/tasks/${id}/escalate`,{method:'POST',body:JSON.stringify({reason:'从行动详情请求主管介入'})});cache={};toast('任务已升级主管');closeDrawer();renderRoute(false)};document.querySelector('#completeTask').onclick=async()=>{await api(`/api/tasks/${id}/complete`,{method:'POST'});cache={};toast('任务已完成');closeDrawer();renderRoute(false)}}async function getDashboard(){return cache.dashboard||(cache.dashboard=await api('/api/dashboard'))}function openDrawer(html){document.querySelector('#drawerBody').innerHTML=html;document.querySelector('#drawer').classList.add('open');document.querySelector('#drawerMask').classList.add('open')}function closeDrawer(){document.querySelector('#drawer').classList.remove('open');document.querySelector('#drawerMask').classList.remove('open')}function openModal(title,sub,body,actions){let m=document.querySelector('#modal');m.querySelector('#modalTitle').textContent=title;m.querySelector('#modalSubtitle').textContent=sub||'';m.querySelector('#modalBody').innerHTML=body;m.querySelector('#modalActions').innerHTML=actions||'';m.showModal();return m}function waitModal(id,target){let local=new Date(Date.now()+3*3600000),p=n=>String(n).padStart(2,'0'),val=`${local.getFullYear()}-${p(local.getMonth()+1)}-${p(local.getDate())}T${p(local.getHours())}:${p(local.getMinutes())}`,m=openModal('设置等待窗口','承诺回复时间前不重复催办',`<div class="form-stack"><label class="form-label">等待对象<select id="waitTarget"><option value="factory">工厂</option><option value="customer">客户</option><option value="bank">银行</option><option value="logistics">物流服务商</option></select></label><label class="form-label">承诺回复时间<input id="waitTime" type="datetime-local" value="${val}"/></label></div>`,`<button class="btn" value="cancel">取消</button><button class="btn primary" id="saveWait" type="button">确认设置</button>`);m.querySelector('#waitTarget').value=target;m.querySelector('#saveWait').onclick=async()=>{let raw=m.querySelector('#waitTime').value,d=new Date(raw);await api(`/api/tasks/${id}/contacted`,{method:'POST',body:JSON.stringify({waiting_on:m.querySelector('#waitTarget').value,promised_reply_at:d.toISOString()})});m.close();cache={};closeDrawer();toast('等待窗口已设置');renderRoute(false)}}function transferModal(id){let m=openModal('转交任务','转交后保留原始证据与审计记录',`<label class="form-label">新负责人<select id="newOwner"><option value="USER-1">李梅</option><option value="USER-2">张晓</option><option value="USER-3">陈静</option><option value="MANAGER-1">王主管</option></select></label>`,`<button class="btn" value="cancel">取消</button><button class="btn primary" id="saveTransfer" type="button">确认转交</button>`);m.querySelector('#saveTransfer').onclick=async()=>{await api(`/api/tasks/${id}/transfer`,{method:'POST',body:JSON.stringify({owner_user_id:m.querySelector('#newOwner').value})});m.close();cache={};closeDrawer();toast('任务已转交');renderRoute(false)}}function newTaskModal(orderId,no){let m=openModal(`为 ${no} 新增任务`,'任务会立即进入行动排序',`<div class="form-stack"><label class="form-label">任务标题<input id="taskTitle" placeholder="例如：确认工厂明确完工日期"/></label><div class="form-row"><label class="form-label">处理对象<select id="taskTarget"><option value="factory">工厂</option><option value="customer">客户</option><option value="manager">主管</option></select></label><label class="form-label">风险等级<select id="taskRisk"><option value="medium">中</option><option value="high">高</option><option value="low">低</option><option value="critical">关键</option></select></label></div></div>`,`<button class="btn" value="cancel">取消</button><button class="btn primary" id="createTask" type="button">创建任务</button>`);m.querySelector('#createTask').onclick=async()=>{let title=m.querySelector('#taskTitle').value.trim();if(!title)return toast('请填写任务标题');await api(`/api/orders/${orderId}/tasks`,{method:'POST',body:JSON.stringify({title,recommended_action:title,target:m.querySelector('#taskTarget').value,risk_level:m.querySelector('#taskRisk').value,next_action_at:nowLocal(4)})});m.close();cache={};toast('任务已创建');renderRoute(false)}}function importCozeModal(){let m=openModal('导入Coze结果','支持FT01或FT02最终result_json',`<div class="form-stack"><label class="form-label">关联订单（可选）<input id="importOrder" placeholder="ORD-1001"/></label><label class="form-label">result_json<textarea id="importJson" style="min-height:230px" placeholder='{"schema_version":"4.2",...}'></textarea></label></div>`,`<button class="btn" value="cancel">取消</button><button class="btn primary" id="doImport" type="button">导入候选队列</button>`);m.querySelector('#doImport').onclick=async()=>{let raw=m.querySelector('#importJson').value.trim();if(!raw)return toast('请粘贴result_json');let r=await api('/api/reviews/import',{method:'POST',body:JSON.stringify({result_json:raw,order_id:m.querySelector('#importOrder').value||null,workflow_source:'COZE_IMPORT'})});m.close();toast('Coze结果已导入AI确认');go(`confirm?review=${r.review_id}`)}}

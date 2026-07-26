@@ -29,7 +29,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "demo-key")
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动层 MVP", version="4.0.0")
+app = FastAPI(title="AI外贸跟单行动层 MVP", version="4.3.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
@@ -493,38 +493,78 @@ def order_and_task_context(order_id: str | None, raw: str = "") -> tuple[dict[st
         return order, task
 
 
-def build_ft01_parameters(body: dict[str, Any], order: dict[str, Any] | None, task: dict[str, Any] | None) -> dict[str, Any]:
+
+def normalize_source_channel(value: Any) -> str:
+    """Map website labels to the channel values used by the workflows."""
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "mail": "email",
+        "email": "email",
+        "wechat": "wechat",
+        "weixin": "wechat",
+        "erp": "erp_export",
+        "erp_export": "erp_export",
+        "internal": "manual_input",
+        "manual": "manual_input",
+        "manual_input": "manual_input",
+    }
+    return aliases.get(raw, "manual_input")
+
+
+def build_ft01_parameters(
+    body: dict[str, Any],
+    order: dict[str, Any] | None,
+    task: dict[str, Any] | None,
+) -> dict[str, Any]:
+    raw_content = str(body.get("raw_content") or "").strip()
+    input_type = str(body.get("input_type") or "text").strip().lower()
+    if input_type not in {"text", "image", "pdf"}:
+        input_type = "text"
     return {
-        "input_type": str(body.get("input_type") or "text"),
+        "input_type": input_type,
         "existing_order_context": json.dumps(order or {}, ensure_ascii=False),
         "timezone": str(body.get("timezone") or "Asia/Shanghai"),
         "existing_task_context": json.dumps(task or {}, ensure_ascii=False),
-        "source_channel": str(body.get("source_channel") or "email"),
-        "sender_role_hint": str(body.get("sender_role") or body.get("sender_role_hint") or "customer"),
-        "document_type_hint": str(body.get("document_type_hint") or ""),
-        "file_url": str(body.get("file_url") or ""),
-        "raw_content": str(body.get("raw_content") or ""),
+        "source_channel": normalize_source_channel(body.get("source_channel")),
+        "sender_role_hint": str(
+            body.get("sender_role") or body.get("sender_role_hint") or "customer"
+        ).strip().lower(),
+        "document_type_hint": str(body.get("document_type_hint") or "").strip(),
+        "file_url": str(body.get("file_url") or "").strip(),
+        "raw_content": raw_content,
         "source_time": str(body.get("source_time") or iso()),
     }
 
 
-def build_ft02_parameters(body: dict[str, Any], order: dict[str, Any] | None, task: dict[str, Any] | None) -> dict[str, Any]:
+def build_ft02_parameters(
+    body: dict[str, Any],
+    order: dict[str, Any] | None,
+    task: dict[str, Any] | None,
+) -> dict[str, Any]:
     task_context = dict(task or {})
-    task_context.setdefault("questions", [
-        "当前准确完成比例是多少？",
-        "具体完工日期是什么？",
-        "补救方案是什么？",
-    ])
+    task_context.setdefault(
+        "questions",
+        [
+            "当前准确完成比例是多少？",
+            "具体完工日期是什么？",
+            "补救方案是什么？",
+        ],
+    )
+    order_context = dict(order or {})
+    # FT02的order_context是必填String。即使订单未识别，也传合法JSON对象，
+    # 避免发送空字符串触发开始节点API参数校验。
+    order_context.setdefault("order_id", body.get("order_id"))
     return {
         "task_context": json.dumps(task_context, ensure_ascii=False),
-        "message_content": str(body.get("raw_content") or body.get("message_content") or ""),
-        "source_channel": str(body.get("source_channel") or "wechat"),
-        "sender_role": str(body.get("sender_role") or "factory"),
+        "message_content": str(
+            body.get("raw_content") or body.get("message_content") or ""
+        ).strip(),
+        "source_channel": normalize_source_channel(body.get("source_channel")),
+        "sender_role": str(body.get("sender_role") or "factory").strip().lower(),
         "source_time": str(body.get("source_time") or iso()),
         "timezone": str(body.get("timezone") or "Asia/Shanghai"),
-        "order_context": json.dumps(order or {}, ensure_ascii=False),
+        "order_context": json.dumps(order_context, ensure_ascii=False),
     }
-
 
 def create_or_update_action_task(conn: sqlite3.Connection, review: dict[str, Any], candidate: dict[str, Any], order_id: str) -> str | None:
     action = (candidate.get("action_candidates") or [None])[0]
@@ -1075,7 +1115,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "4.0.0", "db": str(DB_PATH), "coze": coze_status()}
+    return {"status": "ok", "version": "4.3.0", "db": str(DB_PATH), "coze": coze_status()}
 
 
 @app.post("/api/reset")

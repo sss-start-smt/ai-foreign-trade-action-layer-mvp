@@ -125,6 +125,54 @@ def _parse_result_data(data: Any) -> tuple[dict[str, Any], Any]:
     return result, parsed_data
 
 
+
+def _clean_workflow_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Remove empty optional values before sending them to Coze."""
+    cleaned: dict[str, Any] = {}
+    for key, value in parameters.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def _parameter_modes() -> list[str]:
+    mode = os.getenv("COZE_PARAMETERS_MODE", "auto").strip().lower()
+    if mode == "object":
+        return ["object"]
+    if mode == "string":
+        return ["string"]
+    return ["object", "string"]
+
+
+def _coze_payload(workflow_id_value: str, parameters: dict[str, Any], mode: str) -> dict[str, Any]:
+    return {
+        "workflow_id": workflow_id_value,
+        "parameters": (
+            parameters
+            if mode == "object"
+            else json.dumps(parameters, ensure_ascii=False, separators=(",", ":"))
+        ),
+    }
+
+
+def _invalid_parameter_response(status_code: int, envelope: dict[str, Any]) -> bool:
+    try:
+        code = int(envelope.get("code", -1))
+    except (TypeError, ValueError):
+        code = -1
+    msg = str(envelope.get("msg") or envelope.get("message") or "").lower()
+    return (
+        status_code in {400, 422}
+        or code == 4000
+        or "invalid request parameter" in msg
+        or "invalid parameters" in msg
+        or "请求参数" in msg
+    )
+
+
 def run_workflow(
     workflow_key: str,
     parameters: dict[str, Any],
@@ -132,132 +180,205 @@ def run_workflow(
     timeout_seconds: float | None = None,
     record: Callable[[dict[str, Any]], None] | None = None,
 ) -> WorkflowRun:
-    """Run one published Coze workflow through the domestic Coze API.
+    """Run one published Coze workflow.
 
-    The official API accepts the start-node parameters in ``parameters``. The
-    HTTP example serializes this map as a JSON string, which is what this
-    client sends for compatibility with coze.cn.
+    Auto mode first sends start-node parameters as a JSON object. When Coze
+    explicitly rejects that input shape, it retries once using the legacy
+    serialized JSON-string format.
     """
     key = workflow_key.lower()
     if key not in DEFAULT_WORKFLOW_IDS:
         raise CozeWorkflowError(f"未知工作流：{workflow_key}", workflow_key=key)
+
     token = os.getenv("COZE_API_TOKEN", "").strip()
     if not token:
         raise CozeWorkflowError("Render尚未配置COZE_API_TOKEN", workflow_key=key)
+
     wid = workflow_id(key)
     if not wid:
         raise CozeWorkflowError(f"未配置{WORKFLOW_ENV_KEYS[key]}", workflow_key=key)
 
+    cleaned_parameters = _clean_workflow_parameters(parameters)
     api_base = os.getenv("COZE_API_BASE", DEFAULT_API_BASE).rstrip("/")
     timeout = timeout_seconds or float(os.getenv("COZE_WORKFLOW_TIMEOUT_SECONDS", "180"))
-    payload: dict[str, Any] = {
-        "workflow_id": wid,
-        "parameters": json.dumps(parameters, ensure_ascii=False, separators=(",", ":")),
-    }
+
     bot_id = os.getenv(f"COZE_{key.upper()}_BOT_ID", os.getenv("COZE_BOT_ID", "")).strip()
     app_id = os.getenv(f"COZE_{key.upper()}_APP_ID", os.getenv("COZE_APP_ID", "")).strip()
     if bot_id and app_id:
         raise CozeWorkflowError("bot_id与app_id不能同时配置", workflow_key=key)
-    if bot_id:
-        payload["bot_id"] = bot_id
-    if app_id:
-        payload["app_id"] = app_id
 
     run_id = f"CZR-{uuid.uuid4().hex[:12].upper()}"
     started = time.perf_counter()
-    log_base = {
-        "run_id": run_id,
-        "workflow_key": key,
-        "workflow_id": wid,
-        "input_json": json.dumps(parameters, ensure_ascii=False),
-        "created_at": now_iso(),
-    }
+    modes = _parameter_modes()
+    attempted_modes: list[str] = []
+    last_status: int | None = None
+    last_envelope: dict[str, Any] = {}
+    last_debug_url: str | None = None
+
     try:
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
-            response = client.post(
-                f"{api_base}/v1/workflow/run",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-        duration_ms = round((time.perf_counter() - started) * 1000)
-        try:
-            envelope = response.json()
-        except ValueError as exc:
-            raise CozeWorkflowError(
-                f"Coze返回非JSON内容：HTTP {response.status_code}",
-                status_code=response.status_code,
-                workflow_key=key,
-            ) from exc
-        if response.status_code >= 400:
-            raise CozeWorkflowError(
-                f"Coze HTTP调用失败：{response.status_code} {envelope}",
-                status_code=response.status_code,
-                workflow_key=key,
-            )
-        code = int(envelope.get("code", -1))
-        debug_url = envelope.get("debug_url")
-        if code != 0:
-            raise CozeWorkflowError(
-                f"Coze工作流执行失败：{envelope.get('msg') or 'unknown error'}",
-                code=code,
-                debug_url=debug_url,
-                workflow_key=key,
-            )
-        result, raw_data = _parse_result_data(envelope.get("data"))
-        if not result:
-            raise CozeWorkflowError("Coze工作流未返回result_json", code=code, debug_url=debug_url, workflow_key=key)
-        if record:
-            record({
-                **log_base,
-                "status": "SUCCESS",
-                "output_json": json.dumps(result, ensure_ascii=False),
-                "coze_code": code,
-                "coze_msg": envelope.get("msg"),
-                "debug_url": debug_url,
-                "duration_ms": duration_ms,
-            })
-        return WorkflowRun(
-            run_id=run_id,
+            for index, mode in enumerate(modes):
+                attempted_modes.append(mode)
+                payload = _coze_payload(wid, cleaned_parameters, mode)
+                if bot_id:
+                    payload["bot_id"] = bot_id
+                if app_id:
+                    payload["app_id"] = app_id
+
+                response = client.post(
+                    f"{api_base}/v1/workflow/run",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                last_status = response.status_code
+                try:
+                    envelope = response.json()
+                except ValueError as exc:
+                    raise CozeWorkflowError(
+                        f"Coze返回非JSON内容：HTTP {response.status_code}",
+                        status_code=response.status_code,
+                        workflow_key=key,
+                    ) from exc
+
+                last_envelope = envelope
+                last_debug_url = envelope.get("debug_url")
+
+                if (
+                    index + 1 < len(modes)
+                    and _invalid_parameter_response(response.status_code, envelope)
+                ):
+                    continue
+
+                if response.status_code >= 400:
+                    raise CozeWorkflowError(
+                        f"Coze HTTP调用失败：{response.status_code} {envelope}",
+                        status_code=response.status_code,
+                        debug_url=last_debug_url,
+                        workflow_key=key,
+                    )
+
+                try:
+                    code = int(envelope.get("code", -1))
+                except (TypeError, ValueError):
+                    code = -1
+
+                if code != 0:
+                    keys = ",".join(cleaned_parameters.keys())
+                    raise CozeWorkflowError(
+                        (
+                            f"Coze工作流执行失败：{envelope.get('msg') or 'unknown error'}；"
+                            f"parameters模式={mode}；参数键={keys}"
+                        ),
+                        code=code,
+                        debug_url=last_debug_url,
+                        workflow_key=key,
+                    )
+
+                duration_ms = round((time.perf_counter() - started) * 1000)
+                result, raw_data = _parse_result_data(envelope.get("data"))
+                if not result:
+                    raise CozeWorkflowError(
+                        "Coze工作流未返回result_json",
+                        code=code,
+                        debug_url=last_debug_url,
+                        workflow_key=key,
+                    )
+
+                if record:
+                    record({
+                        "run_id": run_id,
+                        "workflow_key": key,
+                        "workflow_id": wid,
+                        "status": "SUCCESS",
+                        "input_json": json.dumps(
+                            {"parameters_mode": mode, "parameters": cleaned_parameters},
+                            ensure_ascii=False,
+                        ),
+                        "output_json": json.dumps(result, ensure_ascii=False),
+                        "coze_code": code,
+                        "coze_msg": envelope.get("msg"),
+                        "debug_url": last_debug_url,
+                        "duration_ms": duration_ms,
+                        "created_at": now_iso(),
+                    })
+
+                return WorkflowRun(
+                    run_id=run_id,
+                    workflow_key=key,
+                    workflow_id=wid,
+                    parameters=cleaned_parameters,
+                    result=result,
+                    raw_data=raw_data,
+                    debug_url=last_debug_url,
+                    duration_ms=duration_ms,
+                    envelope=envelope,
+                )
+
+        raise CozeWorkflowError(
+            f"Coze调用未返回结果；已尝试：{','.join(attempted_modes)}",
+            status_code=last_status,
+            debug_url=last_debug_url,
             workflow_key=key,
-            workflow_id=wid,
-            parameters=parameters,
-            result=result,
-            raw_data=raw_data,
-            debug_url=debug_url,
-            duration_ms=duration_ms,
-            envelope=envelope,
         )
+
     except CozeWorkflowError as exc:
         duration_ms = round((time.perf_counter() - started) * 1000)
         if record:
             record({
-                **log_base,
+                "run_id": run_id,
+                "workflow_key": key,
+                "workflow_id": wid,
                 "status": "FAILED",
-                "output_json": json.dumps({"error": str(exc)}, ensure_ascii=False),
+                "input_json": json.dumps(
+                    {
+                        "attempted_parameter_modes": attempted_modes,
+                        "parameters": cleaned_parameters,
+                    },
+                    ensure_ascii=False,
+                ),
+                "output_json": json.dumps(
+                    {
+                        "error": str(exc),
+                        "last_status": last_status,
+                        "last_envelope": last_envelope,
+                    },
+                    ensure_ascii=False,
+                ),
                 "coze_code": exc.code,
                 "coze_msg": str(exc),
-                "debug_url": exc.debug_url,
+                "debug_url": exc.debug_url or last_debug_url,
                 "duration_ms": duration_ms,
+                "created_at": now_iso(),
             })
         raise
+
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
         duration_ms = round((time.perf_counter() - started) * 1000)
         error = CozeWorkflowError(f"连接Coze失败或超时：{exc}", workflow_key=key)
         if record:
             record({
-                **log_base,
+                "run_id": run_id,
+                "workflow_key": key,
+                "workflow_id": wid,
                 "status": "FAILED",
+                "input_json": json.dumps(
+                    {
+                        "attempted_parameter_modes": attempted_modes,
+                        "parameters": cleaned_parameters,
+                    },
+                    ensure_ascii=False,
+                ),
                 "output_json": json.dumps({"error": str(error)}, ensure_ascii=False),
                 "coze_code": None,
                 "coze_msg": str(error),
                 "debug_url": None,
                 "duration_ms": duration_ms,
+                "created_at": now_iso(),
             })
         raise error from exc
-
 
 def action_candidate(action: dict[str, Any]) -> dict[str, Any]:
     action_type = str(action.get("action_type") or "check_order")

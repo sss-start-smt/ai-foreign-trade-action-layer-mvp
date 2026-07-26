@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -110,3 +111,40 @@ def test_task_transfer_escalate_and_settings():
     saved = client.put('/api/settings', json={'settings': {'accent': 'green', 'compact': True, 'show_demo': False, 'notifications': {}}})
     assert saved.status_code == 200
     assert client.get('/api/settings').json()['settings']['accent'] == 'green'
+
+
+def test_workflow_parameter_builders_are_valid():
+    import main
+
+    order = {
+        "order_id": "ORD-1001",
+        "order_no": "PO-1001",
+        "customer_name": "Northwind Trading",
+    }
+    ft01 = main.build_ft01_parameters(
+        {
+            "raw_content": "PO-1001包装改为彩盒",
+            "source_channel": "internal",
+            "sender_role": "customer",
+        },
+        order,
+        None,
+    )
+    assert ft01["source_channel"] == "manual_input"
+    assert ft01["input_type"] == "text"
+    assert json.loads(ft01["existing_order_context"])["order_id"] == "ORD-1001"
+
+    ft02 = main.build_ft02_parameters(
+        {
+            "raw_content": "差不多七成，应该下周三完成",
+            "source_channel": "email",
+            "sender_role": "factory",
+            "order_id": "ORD-1001",
+        },
+        order,
+        None,
+    )
+    assert ft02["source_channel"] == "email"
+    assert ft02["sender_role"] == "factory"
+    assert json.loads(ft02["order_context"])["order_id"] == "ORD-1001"
+    assert json.loads(ft02["task_context"])["questions"]
