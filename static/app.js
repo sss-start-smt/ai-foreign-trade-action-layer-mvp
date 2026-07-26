@@ -15,7 +15,137 @@ function taskCard(x){let o=x.order||{};return `<article class="task-card" data-i
 async function pageTasks(root){let d=await api('/api/tasks'),items=d.items.filter(matchSearch),state=routeState.query.state||'ALL';if(state!=='ALL')items=items.filter(x=>x.action_state===state);root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>全部任务</h2><p>支持处理、等待、转交、升级和完成状态的统一管理</p></div><div class="button-row"><button class="btn primary" data-go="intake">接入新消息</button></div></div>${summaryCards([{l:'全部任务',v:d.summary.total,i:'clipboard',bg:'#eaf2ff',c:'#2868f0',g:'#eef4ff'},{l:'等待外部',v:d.summary.waiting,i:'clock',bg:'#fff1dc',c:'#f39a32',g:'#fff7eb'},{l:'待人工确认',v:d.summary.needs_confirmation,i:'check-square',bg:'#f1efff',c:'#7868e6',g:'#f7f5ff'},{l:'需主管介入',v:d.summary.escalate,i:'arrowup',bg:'#ffeaec',c:'#ee5360',g:'#fff1f2'}])}<section class="panel"><div class="filter-bar"><div class="tabs">${[['ALL','全部'],['DO_NOW','立即处理'],['DO_TODAY','今天处理'],['WAITING_EXTERNAL','等待外部'],['NEEDS_CONFIRMATION','待确认'],['SCHEDULED','已安排'],['DONE','已完成']].map(([k,n])=>`<button class="tab ${state===k?'active':''}" data-state="${k}">${n}</button>`).join('')}</div><div class="filters"><select class="select" id="ownerFilter"><option value="ALL">全部负责人</option><option value="USER-1">李梅</option><option value="USER-2">张晓</option><option value="USER-3">陈静</option><option value="MANAGER-1">王主管</option></select><select class="select" id="riskFilter"><option value="ALL">全部风险</option><option value="critical">关键</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>任务</th><th>订单 / 客户</th><th>推荐动作</th><th>等待对象</th><th>下次处理</th><th>风险</th><th>负责人</th><th>状态</th><th>操作</th></tr></thead><tbody id="taskRows"></tbody></table></div></section></div>`;bindGo(root);let owner='ALL',rf='ALL';const draw=()=>{let list=items.filter(x=>(owner==='ALL'||x.owner_user_id===owner)&&(rf==='ALL'||x.risk_level===rf));root.querySelector('#taskRows').innerHTML=list.map(x=>`<tr data-id="${x.task_id}"><td><b>${esc(x.title)}</b><br><small>${esc(x.task_id)}</small></td><td><button class="link-button order-jump" data-order="${x.related_order_id}">${esc(x.order?.order_no||x.related_order_id)}</button><br><small>${esc(x.order?.customer_name||'—')}</small></td><td>${esc(x.recommended_action)}</td><td>${esc(T[x.waiting_on]||x.waiting_on||'—')}</td><td>${fdt(x.next_action_at||x.business_deadline)}</td><td>${risk(x.risk_level)}</td><td>${esc(O[x.owner_user_id]||x.owner_user_id||'未分配')}</td><td>${status(x.action_state)}</td><td><button class="btn small task-open">处理</button></td></tr>`).join('')||'<tr><td colspan="9"><div class="empty">没有匹配任务</div></td></tr>';root.querySelectorAll('.task-open').forEach(b=>b.onclick=e=>openTask(e.target.closest('tr').dataset.id));root.querySelectorAll('.order-jump').forEach(b=>b.onclick=e=>{e.stopPropagation();go(`orders/${b.dataset.order}`)})};draw();root.querySelectorAll('[data-state]').forEach(b=>b.onclick=()=>go(`tasks?state=${b.dataset.state}`));root.querySelector('#ownerFilter').onchange=e=>{owner=e.target.value;draw()};root.querySelector('#riskFilter').onchange=e=>{rf=e.target.value;draw()}}
 async function pageOrders(root){let d=await api('/api/orders'),base=d.items.filter(x=>!search||[x.order_no,x.customer_name,x.product_name,x.current_node].join(' ').toLowerCase().includes(search.toLowerCase())),orderFilter='ALL',view='card';root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>订单中心</h2><p>订单记录仍由ERP或业务表维护，本页聚合行动、承诺与风险</p></div><button class="btn primary" data-go="intake">从消息更新订单</button></div>${summaryCards([{l:'活跃订单',v:d.summary.active,i:'box',bg:'#eaf2ff',c:'#2868f0',g:'#eef4ff'},{l:'高风险订单',v:d.summary.risk_orders,i:'arrowup',bg:'#ffeaec',c:'#ee5360',g:'#fff1f2'},{l:'未完成事项',v:d.summary.pending_tasks,i:'clipboard',bg:'#fff1dc',c:'#f39a32',g:'#fff7eb'},{l:'已有工厂承诺',v:d.summary.commitments,i:'check',bg:'#e8f8ef',c:'#23a862',g:'#eefaf3'}])}<section class="panel"><div class="filter-bar"><div class="tabs" id="orderTabs"><button class="tab active" data-filter="ALL">全部订单</button><button class="tab" data-filter="RISK">有交期风险</button><button class="tab" data-filter="WAITING">等待外部</button></div><div class="filters"><select class="select" id="orderView"><option value="card">卡片视图</option><option value="table">表格视图</option></select></div></div><div class="panel-body"><div class="order-grid" id="orderArea"></div></div></section></div>`;bindGo(root);const filtered=()=>base.filter(x=>orderFilter==='ALL'||(orderFilter==='RISK'&&['high','critical'].includes(x.max_risk))||(orderFilter==='WAITING'&&x.waiting_task_count>0));const drawCard=items=>{root.querySelector('#orderArea').className='order-grid';root.querySelector('#orderArea').innerHTML=items.map(x=>`<article class="order-card" data-id="${x.order_id}"><div class="order-card-top"><div><h3>${esc(x.order_no)}</h3><p>${esc(x.customer_name)}</p></div>${risk(x.max_risk)}</div><h4>${esc(x.product_name)}</h4><div class="progress"><i style="width:${Math.round((x.current_progress||0)*100)}%"></i></div><small>当前进度 ${pct(x.current_progress)} · ${esc(x.current_node||'—')}</small><div class="order-meta"><div class="metric"><small>客户交期</small><strong>${fd(x.requested_delivery_date)}</strong></div><div class="metric"><small>工厂承诺</small><strong>${fd(x.latest_supplier_commitment)}</strong></div><div class="metric"><small>未完成事项</small><strong>${x.open_task_count} 项</strong></div><div class="metric"><small>下一行动</small><strong>${fdt(x.next_action_at)}</strong></div></div></article>`).join('')||'<div class="empty"><h3>当前分类没有订单</h3></div>';root.querySelectorAll('.order-card').forEach(c=>c.onclick=()=>go(`orders/${c.dataset.id}`))};const drawTable=items=>{root.querySelector('#orderArea').className='table-wrap';root.querySelector('#orderArea').innerHTML=`<table class="data-table"><thead><tr><th>订单</th><th>客户</th><th>产品</th><th>节点</th><th>进度</th><th>客户交期</th><th>工厂承诺</th><th>风险</th><th>未完成</th></tr></thead><tbody>${items.map(x=>`<tr data-id="${x.order_id}"><td><button class="link-button">${x.order_no}</button></td><td>${x.customer_name}</td><td>${x.product_name}</td><td>${x.current_node}</td><td>${pct(x.current_progress)}</td><td>${fd(x.requested_delivery_date)}</td><td>${fd(x.latest_supplier_commitment)}</td><td>${risk(x.max_risk)}</td><td>${x.open_task_count}</td></tr>`).join('')}</tbody></table>`;root.querySelectorAll('tbody tr').forEach(c=>c.onclick=()=>go(`orders/${c.dataset.id}`))};const draw=()=>view==='table'?drawTable(filtered()):drawCard(filtered());draw();root.querySelectorAll('#orderTabs button').forEach(b=>b.onclick=()=>{orderFilter=b.dataset.filter;root.querySelectorAll('#orderTabs button').forEach(x=>x.classList.toggle('active',x===b));draw()});root.querySelector('#orderView').onchange=e=>{view=e.target.value;draw()}}
 async function pageOrderDetail(root){let d=await api(`/api/orders/${routeState.id}`),o=d.order;root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><button class="btn ghost" data-go="orders">← 返回订单中心</button></div><div class="button-row"><button class="btn" id="newTask">新增任务</button><button class="btn primary" data-go="intake">接入相关消息</button></div></div><section class="panel"><div class="detail-hero"><div><small>订单详情</small><h2>${esc(o.order_no)}</h2><p>${esc(o.customer_name)} · ${esc(o.product_name)}</p><div class="detail-chips"><span class="status SCHEDULED">${esc(o.current_node)}</span><span class="risk ${d.risks.some(r=>r.risk_level==='critical')?'critical':d.risks.some(r=>r.risk_level==='high')?'high':'none'}">${d.risks.length} 条风险</span></div></div><div class="button-row"><button class="btn" data-go="tasks">查看全部任务</button><button class="btn primary" id="orderIntake">粘贴新回复</button></div></div><div class="panel-body"><div class="info-grid"><div class="info-tile"><small>包装方式</small><strong>${esc(o.packaging_method||'—')}</strong></div><div class="info-tile"><small>客户交期</small><strong>${fd(o.requested_delivery_date)}</strong></div><div class="info-tile"><small>工厂承诺</small><strong>${fd(o.latest_supplier_commitment)}</strong></div><div class="info-tile"><small>当前进度</small><strong>${pct(o.current_progress)}</strong></div></div></div></section><div class="two-col"><section class="panel"><div class="panel-head"><div><h2>跟进时间线</h2><p>消息、承诺、确认与业务操作的完整记录</p></div></div><div class="panel-body"><div class="timeline">${timelineForOrder(d)}</div></div></section><div class="page-stack"><section class="panel"><div class="panel-head"><h3>未完成任务 (${d.tasks.filter(x=>x.status!=='DONE').length})</h3></div><div class="panel-body">${d.tasks.length?d.tasks.map(x=>`<div class="quote"><button class="link-button task-detail" data-id="${x.task_id}">${esc(x.title)}</button><br><small>${esc(x.recommended_action)} · ${fdt(x.next_action_at||x.business_deadline)}</small></div>`).join(''):'<p>暂无任务</p>'}</div></section><section class="panel"><div class="panel-head"><h3>风险与承诺</h3></div><div class="panel-body">${d.risks.map(r=>`<div class="quote">${risk(r.risk_level)} ${esc(r.evidence||r.risk_type)}</div>`).join('')||'<p>暂无风险</p>'}${d.commitments.map(c=>`<div class="quote">工厂承诺：${fd(c.commitment_value)}</div>`).join('')}</div></section></div></div></div>`;bindGo(root);root.querySelector('#orderIntake').onclick=()=>go(`intake?order_id=${o.order_id}`);root.querySelectorAll('.task-detail').forEach(b=>b.onclick=()=>openTask(b.dataset.id));root.querySelector('#newTask').onclick=()=>newTaskModal(o.order_id,o.order_no)}function timelineForOrder(d){let arr=[];d.messages.forEach(x=>arr.push({time:x.source_time||x.created_at,title:`${T[x.sender_role]||x.sender_role}消息`,text:x.raw_content}));d.commitments.forEach(x=>arr.push({time:x.created_at,title:'工厂承诺记录',text:x.commitment_value}));d.events.forEach(x=>arr.push({time:x.created_at,title:x.event_type,text:'系统审计事件'}));d.tasks.forEach(x=>arr.push({time:x.created_at,title:'任务创建',text:x.title}));return arr.sort((a,b)=>(dt(b.time)||0)-(dt(a.time)||0)).map(x=>`<div class="timeline-item"><b>${fdt(x.time)} · ${esc(x.title)}</b>${esc(x.text)}</div>`).join('')||'<div class="empty">暂无时间线记录</div>'}
-async function pageIntake(root){let orders=(await api('/api/orders')).items,pre=routeState.query.order_id||'';root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>接入业务消息</h2><p>第一阶段支持粘贴邮件、聊天文字和导入Coze结果</p></div><button class="btn" id="importCoze">导入Coze结果 JSON</button></div><div class="intake-layout"><section class="panel"><div class="panel-head"><div><h2>消息接入</h2><p>客户、工厂、货代或内部通知</p></div></div><div class="panel-body"><form class="form-stack" id="intakeForm"><div class="form-row"><label class="form-label">消息来源<select name="source_channel"><option value="email">邮箱</option><option value="wechat">工作微信</option><option value="internal">内部通知</option><option value="manual">手工录入</option></select></label><label class="form-label">发送方<select name="sender_role"><option value="customer">客户</option><option value="factory">工厂</option><option value="forwarder">货代</option><option value="internal">内部同事</option></select></label></div><label class="form-label">关联订单<select name="order_id"><option value="">自动识别订单</option>${orders.map(x=>`<option value="${x.order_id}" ${pre===x.order_id?'selected':''}>${x.order_no} · ${x.customer_name}</option>`).join('')}</select></label><label class="form-label">消息原文<textarea name="raw_content" placeholder="粘贴邮件或聊天内容，例如：PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。"></textarea></label><div class="helper-chips"><button type="button" class="helper-chip" data-sample="customer">客户修改包装</button><button type="button" class="helper-chip" data-sample="factory">工厂模糊回复</button><button type="button" class="helper-chip" data-sample="complaint">客户投诉</button></div><div class="button-row"><button class="btn primary" type="submit">${svg('sparkles')}调用Coze识别</button><button class="btn" type="reset">清空</button></div></form></div></section><aside class="panel"><div class="panel-head"><div><h2>本页功能边界</h2><p>保证作品集演示真实，不夸大能力</p></div></div><div class="panel-body page-stack"><div class="boundary-note"><b>实时Coze识别：</b>客户消息和资料调用FT01，工厂回复调用FT02；结果会保存为待确认候选。</div><div class="boundary-note"><b>确认与写回：</b>人工确认后由网站调用FT03，写回成功后自动触发FT04重新排序。</div><div class="drop-zone">${svg('upload')}<div><b>截图 / 文件上传入口</b><br>当前高保真保留入口，尚未接文件解析服务</div></div><div class="quote">识别完成后会自动进入“AI确认”，不会直接修改订单。</div></div></aside></div></div>`;root.querySelectorAll('[data-sample]').forEach(b=>b.onclick=()=>{let samples={customer:'PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。',factory:'PO-1002差不多七成，应该下周三完成，补救方案晚点回复。',complaint:'PO-1002已经严重延误，如果今天还没有明确答复，我们将取消订单。'};root.querySelector('[name=raw_content]').value=samples[b.dataset.sample]});root.querySelector('#intakeForm').onsubmit=async e=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target));let r=await api('/api/intake/analyze',{method:'POST',body:JSON.stringify(f)});toast(`${r.workflow_source||'工作流'}识别完成，进入AI确认`);go(`confirm?review=${r.review_id}`)};root.querySelector('#importCoze').onclick=importCozeModal}
+async function pageIntake(root){
+  let orders=(await api('/api/orders')).items,pre=routeState.query.order_id||'';
+  root.innerHTML=`<div class="page-stack">
+    <div class="page-toolbar">
+      <div><h2>接入业务消息</h2><p>第一阶段支持粘贴邮件、聊天文字和导入Coze结果</p></div>
+      <button class="btn" id="importCoze">导入Coze结果 JSON</button>
+    </div>
+    <div class="intake-layout">
+      <section class="panel">
+        <div class="panel-head"><div><h2>消息接入</h2><p>客户、工厂、货代或内部通知</p></div></div>
+        <div class="panel-body">
+          <form class="form-stack" id="intakeForm">
+            <div class="form-row">
+              <label class="form-label">消息来源
+                <select name="source_channel">
+                  <option value="email">邮箱</option>
+                  <option value="wechat">工作微信</option>
+                  <option value="internal">内部通知</option>
+                  <option value="manual">手工录入</option>
+                </select>
+              </label>
+              <label class="form-label">发送方
+                <select name="sender_role">
+                  <option value="customer">客户</option>
+                  <option value="factory">工厂</option>
+                  <option value="forwarder">货代</option>
+                  <option value="internal">内部同事</option>
+                </select>
+              </label>
+            </div>
+            <label class="form-label">关联订单
+              <select name="order_id">
+                <option value="">自动识别订单</option>
+                ${orders.map(x=>`<option value="${x.order_id}" ${pre===x.order_id?'selected':''}>${x.order_no} · ${x.customer_name}</option>`).join('')}
+              </select>
+            </label>
+            <label class="form-label">消息原文
+              <textarea name="raw_content" placeholder="粘贴邮件或聊天内容，例如：PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。"></textarea>
+            </label>
+            <div class="helper-chips">
+              <button type="button" class="helper-chip" data-sample="customer">客户修改包装</button>
+              <button type="button" class="helper-chip" data-sample="factory">工厂模糊回复</button>
+              <button type="button" class="helper-chip" data-sample="complaint">客户投诉</button>
+            </div>
+            <div id="intakeStatus" class="boundary-note" style="display:none"></div>
+            <div class="button-row">
+              <button class="btn primary" id="cozeAnalyzeBtn" type="submit">${svg('sparkles')}<span>调用Coze识别</span></button>
+              <button class="btn" type="reset">清空</button>
+            </div>
+          </form>
+        </div>
+      </section>
+      <aside class="panel">
+        <div class="panel-head"><div><h2>本页功能边界</h2><p>保证作品集演示真实，不夸大能力</p></div></div>
+        <div class="panel-body page-stack">
+          <div class="boundary-note"><b>实时Coze识别：</b>客户消息和资料调用FT01，工厂回复调用FT02；结果会保存为待确认候选。</div>
+          <div class="boundary-note"><b>确认与写回：</b>人工确认后由网站调用FT03，写回成功后自动触发FT04重新排序。</div>
+          <div class="drop-zone">${svg('upload')}<div><b>截图 / 文件上传入口</b><br>当前高保真保留入口，尚未接文件解析服务</div></div>
+          <div class="quote">识别完成后会自动进入“AI确认”，不会直接修改订单。</div>
+        </div>
+      </aside>
+    </div>
+  </div>`;
+
+  root.querySelectorAll('[data-sample]').forEach(b=>b.onclick=()=>{
+    let samples={
+      customer:'PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。',
+      factory:'PO-1002差不多七成，应该下周三完成，补救方案晚点回复。',
+      complaint:'PO-1002已经严重延误，如果今天还没有明确答复，我们将取消订单。'
+    };
+    root.querySelector('[name=raw_content]').value=samples[b.dataset.sample];
+  });
+
+  root.querySelector('#intakeForm').onsubmit=async e=>{
+    e.preventDefault();
+    const form=e.target;
+    const btn=root.querySelector('#cozeAnalyzeBtn');
+    const btnText=btn.querySelector('span');
+    const statusBox=root.querySelector('#intakeStatus');
+    const f=Object.fromEntries(new FormData(form));
+    const workflowName=f.sender_role==='factory'?'FT02':'FT01';
+
+    if(!String(f.raw_content||'').trim()){
+      statusBox.style.display='block';
+      statusBox.innerHTML='<b>无法提交：</b>请先填写消息原文。';
+      toast('请先填写消息原文');
+      return;
+    }
+
+    btn.disabled=true;
+    btnText.textContent=`正在调用 ${workflowName}…`;
+    statusBox.style.display='block';
+    statusBox.innerHTML=`<b>正在识别：</b>网站后端正在调用Coze ${workflowName}。首次唤醒Render或工作流执行可能需要几十秒，请不要重复点击。`;
+
+    try{
+      const coze=await api('/api/coze/status');
+      if(!coze.ready){
+        const reasons=[];
+        if(!coze.token_configured) reasons.push('Render未识别到COZE_API_TOKEN');
+        Object.entries(coze.workflows||{}).forEach(([key,value])=>{
+          if(!value.configured) reasons.push(`${key.toUpperCase()}工作流ID未配置`);
+        });
+        throw new Error(reasons.join('；')||'Coze接入尚未就绪，请检查Render环境变量');
+      }
+
+      const r=await api('/api/intake/analyze',{
+        method:'POST',
+        body:JSON.stringify(f)
+      });
+
+      statusBox.innerHTML=`<b>识别成功：</b>${esc(r.workflow_source||workflowName)} 已生成待确认候选，正在进入AI确认页面。`;
+      toast(`${r.workflow_source||'工作流'}识别完成，进入AI确认`);
+      setTimeout(()=>go(`confirm?review=${r.review_id}`),350);
+    }catch(err){
+      let message=err?.message||String(err);
+      statusBox.innerHTML=`<b>调用失败：</b>${esc(message)}<br><small>请打开 /health 和 /api/coze/status 检查配置；错误会同时记录在 recent_runs 中。</small>`;
+      toast(`Coze识别失败：${message}`);
+      console.error('Coze intake failed',err);
+    }finally{
+      btn.disabled=false;
+      btnText.textContent='调用Coze识别';
+    }
+  };
+
+  root.querySelector('#intakeForm').onreset=()=>{
+    const statusBox=root.querySelector('#intakeStatus');
+    statusBox.style.display='none';
+    statusBox.textContent='';
+  };
+  root.querySelector('#importCoze').onclick=importCozeModal;
+}
 async function pageConfirm(root){let d=await api('/api/reviews'),items=d.items.filter(x=>!search||[x.order_no,x.customer_name,x.raw_content,x.workflow_source].join(' ').toLowerCase().includes(search.toLowerCase()));selectedReview=routeState.query.review||selectedReview||items.find(x=>x.status==='PENDING')?.review_id||items[0]?.review_id;root.innerHTML=`<div class="page-stack"><div class="page-toolbar"><div><h2>AI候选确认</h2><p>审核字段、风险和行动候选；未确认内容不进入正式数据</p></div><div class="button-row"><button class="btn" data-go="intake">接入新消息</button><button class="btn" id="importReview">导入Coze JSON</button></div></div><div class="review-layout"><section class="panel"><div class="panel-head"><div><h3>候选队列</h3><p>${d.pending} 条待确认</p></div></div><div class="review-list" id="reviewList">${items.map(reviewCard).join('')||'<div class="empty"><h3>暂无候选</h3></div>'}</div></section><section class="panel" id="reviewDetail"><div class="empty"><div class="empty-icon">✓</div><h3>选择一条候选</h3></div></section></div></div>`;bindGo(root);root.querySelector('#importReview').onclick=importCozeModal;root.querySelectorAll('.review-card').forEach(c=>c.onclick=()=>{selectedReview=c.dataset.id;showReview(root,c.dataset.id)});if(selectedReview)showReview(root,selectedReview)}function reviewCard(x){return `<article class="review-card ${selectedReview===x.review_id?'active':''}" data-id="${x.review_id}"><div class="top"><small>${esc(x.workflow_source)}</small><span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status==='PENDING'?'待确认':x.status==='CONFIRMED'?'已确认':'已驳回'}</span></div><h3>${esc(x.order_no||'未关联订单')} · ${esc(x.customer_name||'待匹配')}</h3><p>${esc(x.raw_content||x.candidate.message_type||'导入的工作流结果')}</p></article>`}
 async function showReview(root,id){let x=await api(`/api/reviews/${id}`),c=x.candidate,detail=root.querySelector('#reviewDetail');root.querySelectorAll('.review-card').forEach(e=>e.classList.toggle('active',e.dataset.id===id));detail.innerHTML=`<div class="panel-head"><div><h2>${esc(x.order_no||'待关联订单')}</h2><p>${esc(x.workflow_source)} · ${fdt(x.created_at)}</p></div><span class="status ${x.status==='PENDING'?'NEEDS_CONFIRMATION':x.status==='CONFIRMED'?'DONE':'NOT_MY_RESPONSIBILITY'}">${x.status}</span></div><div class="panel-body"><div class="boundary-note">AI只生成候选。你可以修改值后确认；点击确认后，网站会真实调用Coze FT03，只有接口确认写回后才更新状态并触发FT04重排。</div><section class="candidate-section"><h3>原始消息</h3><div class="quote">${esc(x.raw_content||'该候选由JSON直接导入')}</div></section><section class="candidate-section"><h3>订单关联</h3><div class="candidate-row"><b>匹配状态</b><span>${esc(c.order_match?.status||'unknown')}</span><span>${esc(c.order_match?.matched_order_no||x.order_no||'—')}</span></div></section><section class="candidate-section"><h3>字段候选</h3><div id="candidateFields">${(c.fields||[]).map((f,i)=>`<div class="candidate-row"><div><b>${esc(fieldName(f.field_name))}</b><div class="source-quote">证据：${esc(f.source_quote||'—')}</div></div><input data-index="${i}" value="${esc(f.normalized_value??'')}"/><span>${Math.round((f.confidence||0)*100)}%置信</span></div>`).join('')||'<p>没有字段候选</p>'}</div></section><section class="candidate-section"><h3>风险提示</h3>${(c.risk_signals||[]).map(r=>`<div class="quote">${risk(r.risk_level||'medium')} ${esc(riskType(r.type))}<br><small>${esc(r.evidence||'')}</small></div>`).join('')||'<p>没有风险候选</p>'}</section><section class="candidate-section"><h3>行动候选</h3>${(c.action_candidates||[]).map(a=>`<div class="quote"><b>${esc(a.title||a.action_type)}</b><br>${esc(a.recommended_action||'')}</div>`).join('')||'<p>没有行动候选</p>'}</section>${x.status==='PENDING'?`<div class="button-row"><button class="btn primary" id="confirmReview">确认并调用FT03写回</button><button class="btn danger" id="rejectReview">驳回候选</button><button class="btn" id="copyReview">复制候选JSON</button></div>`:`<div class="button-row"><button class="btn" data-go="orders/${x.order_id}">查看关联订单</button><button class="btn" data-go="today">查看今日行动</button></div>`}</div>`;bindGo(detail);if(x.status==='PENDING'){detail.querySelector('#confirmReview').onclick=async()=>{let edited=structuredClone(c);detail.querySelectorAll('#candidateFields input').forEach(inp=>{let f=edited.fields[Number(inp.dataset.index)],v=inp.value;if(f.field_name==='current_progress')v=Number(v);f.normalized_value=v});let r=await api(`/api/reviews/${id}/confirm`,{method:'POST',body:JSON.stringify({candidate:edited,operator_id:'USER-1'})});cache={};toast(r.ft03?'FT03写回成功，FT04已重新排序':'候选已确认，订单和行动已更新');document.querySelector('#reviewBadge').textContent=Math.max(0,Number(document.querySelector('#reviewBadge').textContent)-1);go(`orders/${r.order_id}`)};detail.querySelector('#rejectReview').onclick=async()=>{await api(`/api/reviews/${id}/reject`,{method:'POST',body:'{}'});toast('候选已驳回');selectedReview=null;renderRoute(false)};detail.querySelector('#copyReview').onclick=()=>navigator.clipboard.writeText(JSON.stringify(c,null,2)).then(()=>toast('候选JSON已复制'))}}
 function fieldName(x){return{order_no:'订单号',packaging_method:'包装方式',requested_delivery_date:'客户交期',latest_supplier_commitment:'工厂承诺',current_progress:'当前进度',current_node:'当前节点'}[x]||x}function riskType(x){return{delivery_impact_unknown:'交期影响待确认',customer_complaint:'客户投诉风险',commitment_uncertain:'工厂承诺不明确',document_conflict:'文件冲突'}[x]||x}
