@@ -10,6 +10,15 @@ from pathlib import Path
 from typing import Any
 import re
 
+from coze_integration import (
+    CozeWorkflowError,
+    coze_status,
+    confirmed_payload,
+    normalize_ft01,
+    normalize_ft02,
+    run_workflow,
+)
+
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +29,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "demo-key")
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动层 MVP", version="3.0.0")
+app = FastAPI(title="AI外贸跟单行动层 MVP", version="4.0.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
@@ -68,9 +77,9 @@ def init_db() -> None:
 
 def reset_demo_data(conn: sqlite3.Connection) -> None:
     for table in [
-        "user_settings", "candidate_reviews", "idempotency_records", "event_logs",
-        "confirmation_snapshots", "commitment_history", "risk_signals", "tasks",
-        "source_messages", "orders"
+        "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
+        "idempotency_records", "event_logs", "confirmation_snapshots",
+        "commitment_history", "risk_signals", "tasks", "source_messages", "orders"
     ]:
         conn.execute(f"DELETE FROM {table}")
 
@@ -438,6 +447,200 @@ def normalize_cn_date(source_time: str | None, text: str) -> str | None:
         return None
 
 
+
+def record_coze_run(log: dict[str, Any]) -> None:
+    with db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO workflow_runs(
+               run_id,workflow_key,workflow_id,status,input_json,output_json,coze_code,coze_msg,
+               debug_url,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                log.get("run_id"), log.get("workflow_key"), log.get("workflow_id"),
+                log.get("status"), log.get("input_json") or "{}", log.get("output_json"),
+                log.get("coze_code"), log.get("coze_msg"), log.get("debug_url"),
+                log.get("duration_ms"), log.get("created_at") or iso(),
+            ),
+        )
+        conn.commit()
+
+
+def coze_http_error(exc: CozeWorkflowError) -> HTTPException:
+    detail = {
+        "message": str(exc),
+        "workflow": exc.workflow_key,
+        "coze_code": exc.code,
+        "debug_url": exc.debug_url,
+    }
+    return HTTPException(status_code=502 if exc.status_code != 401 else 401, detail=detail)
+
+
+def order_and_task_context(order_id: str | None, raw: str = "") -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    with db() as conn:
+        order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()) if order_id else None
+        if not order:
+            order_nos = extract_order_numbers(raw)
+            if len(order_nos) == 1:
+                order = rowdict(conn.execute("SELECT * FROM orders WHERE order_no=?", (order_nos[0],)).fetchone())
+        task = None
+        if order:
+            task = rowdict(conn.execute(
+                """SELECT * FROM tasks WHERE related_order_id=? AND status!='DONE'
+                   ORDER BY CASE WHEN waiting_on IS NOT NULL THEN 0 ELSE 1 END, updated_at DESC LIMIT 1""",
+                (order["order_id"],),
+            ).fetchone())
+            if task:
+                task["evidence"] = json.loads(task.pop("evidence_json") or "[]")
+        return order, task
+
+
+def build_ft01_parameters(body: dict[str, Any], order: dict[str, Any] | None, task: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "input_type": str(body.get("input_type") or "text"),
+        "existing_order_context": json.dumps(order or {}, ensure_ascii=False),
+        "timezone": str(body.get("timezone") or "Asia/Shanghai"),
+        "existing_task_context": json.dumps(task or {}, ensure_ascii=False),
+        "source_channel": str(body.get("source_channel") or "email"),
+        "sender_role_hint": str(body.get("sender_role") or body.get("sender_role_hint") or "customer"),
+        "document_type_hint": str(body.get("document_type_hint") or ""),
+        "file_url": str(body.get("file_url") or ""),
+        "raw_content": str(body.get("raw_content") or ""),
+        "source_time": str(body.get("source_time") or iso()),
+    }
+
+
+def build_ft02_parameters(body: dict[str, Any], order: dict[str, Any] | None, task: dict[str, Any] | None) -> dict[str, Any]:
+    task_context = dict(task or {})
+    task_context.setdefault("questions", [
+        "当前准确完成比例是多少？",
+        "具体完工日期是什么？",
+        "补救方案是什么？",
+    ])
+    return {
+        "task_context": json.dumps(task_context, ensure_ascii=False),
+        "message_content": str(body.get("raw_content") or body.get("message_content") or ""),
+        "source_channel": str(body.get("source_channel") or "wechat"),
+        "sender_role": str(body.get("sender_role") or "factory"),
+        "source_time": str(body.get("source_time") or iso()),
+        "timezone": str(body.get("timezone") or "Asia/Shanghai"),
+        "order_context": json.dumps(order or {}, ensure_ascii=False),
+    }
+
+
+def create_or_update_action_task(conn: sqlite3.Connection, review: dict[str, Any], candidate: dict[str, Any], order_id: str) -> str | None:
+    action = (candidate.get("action_candidates") or [None])[0]
+    if not action:
+        return None
+    integration = candidate.get("_integration") or {}
+    task_id = integration.get("task_id")
+    timestamp = iso()
+    evidence = [
+        x.get("source_quote") or x.get("evidence")
+        for x in (candidate.get("fields") or []) + (candidate.get("risk_signals") or [])
+        if x.get("source_quote") or x.get("evidence")
+    ]
+    risk_level = max(
+        (r.get("risk_level") or "none" for r in candidate.get("risk_signals") or []),
+        key=lambda x: RISK_ORDER.get(x, 0), default="medium",
+    )
+    if task_id and conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+        conn.execute(
+            """UPDATE tasks SET title=?,recommended_action=?,target=?,waiting_on=NULL,
+               promised_reply_at=NULL,next_action_at=?,risk_level=?,urgent=?,pending_confirmation=0,
+               evidence_json=?,updated_at=? WHERE task_id=?""",
+            (
+                action.get("title") or "处理AI候选行动",
+                action.get("recommended_action") or action.get("title") or "处理AI候选行动",
+                action.get("target") or "factory",
+                iso(now_cn() + timedelta(hours=4)), risk_level, int(risk_level == "critical"),
+                json.dumps(evidence, ensure_ascii=False), timestamp, task_id,
+            ),
+        )
+        return task_id
+    task_id = new_id("TASK")
+    conn.execute(
+        """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,
+           owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,
+           business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,
+           source_message_id,evidence_json,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            task_id, order_id, action.get("title") or "处理AI候选行动",
+            action.get("recommended_action") or action.get("title") or "处理AI候选行动",
+            action.get("target") or "factory", "OPEN", "USER-1", "assigned", None, None,
+            iso(now_cn() + timedelta(hours=4)), iso(now_cn() + timedelta(hours=8)), None,
+            risk_level, int(risk_level == "critical"), 0, review.get("source_message_id"),
+            json.dumps(evidence, ensure_ascii=False), timestamp, timestamp,
+        ),
+    )
+    return task_id
+
+
+def run_ft04_refresh(current_user_id: str = "USER-1", *, raise_on_error: bool = False) -> dict[str, Any] | None:
+    status = coze_status()
+    if not status.get("ready"):
+        return None
+    with db() as conn:
+        tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
+        orders = [dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()]
+        risks = [dict(r) for r in conn.execute("SELECT * FROM risk_signals WHERE status='OPEN'").fetchall()]
+    for task in tasks:
+        task["evidence"] = json.loads(task.pop("evidence_json") or "[]")
+    params = {
+        "timezone": "Asia/Shanghai",
+        "current_time": iso(),
+        "current_user_id": current_user_id,
+        "orders_json": json.dumps(orders, ensure_ascii=False),
+        "risk_signals_json": json.dumps(risks, ensure_ascii=False),
+        "workday_policy_json": json.dumps({"timezone": "Asia/Shanghai"}, ensure_ascii=False),
+        "ranking_config_json": json.dumps({"today_due_hours": 12, "escalation_overdue_hours": 8, "top_n": 5}, ensure_ascii=False),
+        "tasks_json": json.dumps(tasks, ensure_ascii=False),
+    }
+    try:
+        run = run_workflow("ft04", params, record=record_coze_run)
+    except CozeWorkflowError:
+        if raise_on_error:
+            raise
+        return None
+    result = run.result
+    if result.get("run_status") != "success":
+        if raise_on_error:
+            raise CozeWorkflowError(f"FT04未成功：{result}", workflow_key="ft04", debug_url=run.debug_url)
+        return None
+    with db() as conn:
+        conn.execute("DELETE FROM task_rankings WHERE current_user_id=?", (current_user_id,))
+        for item in result.get("items") or []:
+            if not item.get("task_id"):
+                continue
+            conn.execute(
+                """INSERT INTO task_rankings(current_user_id,task_id,action_state,recommended_action,target,
+                   next_action_at,ranking_suppressed,priority_score,priority_reasons_json,evidence_json,
+                   workflow_run_id,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    current_user_id, item.get("task_id"), item.get("action_state") or "SCHEDULED",
+                    item.get("recommended_action"), item.get("target"), item.get("next_action_at"),
+                    int(bool(item.get("ranking_suppressed"))), float(item.get("priority_score") or 0),
+                    json.dumps(item.get("priority_reasons") or [], ensure_ascii=False),
+                    json.dumps(item.get("evidence") or [], ensure_ascii=False), run.run_id, iso(),
+                ),
+            )
+        conn.commit()
+    return {"workflow_run_id": run.run_id, "debug_url": run.debug_url, "result": result}
+
+
+def coze_rankings(current_user_id: str) -> dict[str, dict[str, Any]]:
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM task_rankings WHERE current_user_id=?", (current_user_id,)
+        ).fetchall()]
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        row["ranking_suppressed"] = bool(row["ranking_suppressed"])
+        row["priority_reasons"] = json.loads(row.pop("priority_reasons_json") or "[]")
+        row["evidence"] = json.loads(row.pop("evidence_json") or "[]")
+        out[row["task_id"]] = row
+    return out
+
+
 def local_candidate(raw: str, sender_role: str, source_time: str | None, order: dict[str, Any] | None) -> dict[str, Any]:
     fields: list[dict[str, Any]] = []
     risks: list[dict[str, Any]] = []
@@ -604,23 +807,55 @@ def analyze_intake(payload: AnyPayload) -> dict[str, Any]:
     raw = str(body.get("raw_content") or "").strip()
     if not raw:
         raise HTTPException(422, "消息内容不能为空")
-    sender_role = body.get("sender_role") or "customer"
-    source_channel = body.get("source_channel") or "email"
-    source_time = body.get("source_time") or iso()
-    order_id = body.get("order_id")
-    with db() as conn:
-        order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()) if order_id else None
-        if not order:
-            order_nos = extract_order_numbers(raw)
-            if len(order_nos) == 1:
-                order = rowdict(conn.execute("SELECT * FROM orders WHERE order_no=?", (order_nos[0],)).fetchone())
-                order_id = order.get("order_id") if order else None
+    sender_role = str(body.get("sender_role") or "customer")
+    source_channel = str(body.get("source_channel") or "email")
+    source_time = str(body.get("source_time") or iso())
+    order, task = order_and_task_context(body.get("order_id"), raw)
+    order_id = order.get("order_id") if order else None
+    configured = coze_status().get("ready", False)
+    workflow_key = "ft02" if sender_role == "factory" else "ft01"
+    workflow_source = f"COZE_{workflow_key.upper()}"
+    debug_url = None
+    if configured:
+        try:
+            if workflow_key == "ft02":
+                run = run_workflow("ft02", build_ft02_parameters(body, order, task), record=record_coze_run)
+                candidate = normalize_ft02(run.result, order=order, task=task, run=run)
+            else:
+                run = run_workflow("ft01", build_ft01_parameters(body, order, task), record=record_coze_run)
+                candidate = normalize_ft01(run.result, order=order, run=run)
+            debug_url = run.debug_url
+        except CozeWorkflowError as exc:
+            allow = os.getenv("COZE_ALLOW_LOCAL_FALLBACK_ON_ERROR", "false").lower() == "true"
+            if not allow:
+                raise coze_http_error(exc)
+            candidate = local_candidate(raw, sender_role, source_time, order)
+            candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": str(exc), "debug_url": exc.debug_url}
+            workflow_source = "LOCAL_FALLBACK_AFTER_COZE_ERROR"
+    else:
+        allow = os.getenv("COZE_ALLOW_LOCAL_WHEN_UNCONFIGURED", "true").lower() == "true"
+        if not allow:
+            raise HTTPException(503, "Coze尚未配置：请在Render添加COZE_API_TOKEN")
         candidate = local_candidate(raw, sender_role, source_time, order)
-        message_id, review_id, timestamp = new_id("MSG"), new_id("REV"), iso()
-        conn.execute("INSERT INTO source_messages VALUES(?,?,?,?,?,?,?,?)", (message_id, order_id, source_channel, sender_role, candidate.get("message_type"), raw, source_time, timestamp))
-        conn.execute("INSERT INTO candidate_reviews(review_id,source_message_id,order_id,workflow_source,candidate_json,status,created_at) VALUES(?,?,?,?,?,?,?)", (review_id, message_id, order_id, "LOCAL_RULE_DEMO", json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp))
+        candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": "COZE_NOT_CONFIGURED"}
+        workflow_source = "LOCAL_FALLBACK_NO_TOKEN"
+    message_id, review_id, timestamp = new_id("MSG"), new_id("REV"), iso()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO source_messages VALUES(?,?,?,?,?,?,?,?)",
+            (message_id, order_id, source_channel, sender_role, candidate.get("message_type"), raw, source_time, timestamp),
+        )
+        conn.execute(
+            """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,workflow_source,
+               candidate_json,status,created_at) VALUES(?,?,?,?,?,?,?)""",
+            (review_id, message_id, order_id, workflow_source, json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp),
+        )
         conn.commit()
-    return {"status": "analyzed", "review_id": review_id, "message_id": message_id, "candidate": candidate, "boundary": "本地规则用于网页演示；正式语义理解仍由Coze FT01/FT02完成"}
+    return {
+        "status": "analyzed", "review_id": review_id, "message_id": message_id,
+        "candidate": candidate, "workflow_source": workflow_source, "debug_url": debug_url,
+        "boundary": "已配置令牌时由Coze FT01/FT02实时识别；所有结果仍需人工确认后才能调用FT03写回。",
+    }
 
 
 @app.post("/api/reviews/import")
@@ -664,30 +899,94 @@ def review_detail(review_id: str) -> dict[str, Any]:
 @app.post("/api/reviews/{review_id}/confirm")
 def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
     body = payload.model_dump()
+    operator_id = body.get("operator_id") or "USER-1"
     with db() as conn:
         row = conn.execute("SELECT * FROM candidate_reviews WHERE review_id=?", (review_id,)).fetchone()
-        if not row: raise HTTPException(404, "候选记录不存在")
+        if not row:
+            raise HTTPException(404, "候选记录不存在")
         review = dict(row)
         if review["status"] == "CONFIRMED":
             return {"status": "DUPLICATE_SKIPPED", "review_id": review_id, "order_id": review.get("order_id")}
         candidate = body.get("candidate") or json.loads(review["candidate_json"])
-        plan, order_id = review_to_transaction(review, candidate, body.get("operator_id") or "USER-1")
-        if not order_id: raise HTTPException(422, "候选未唯一关联订单，请先选择订单")
+        order_id = review.get("order_id") or (candidate.get("order_match") or {}).get("selected_order_id")
+        if not order_id:
+            raise HTTPException(422, "候选未唯一关联订单，请先选择订单")
+        order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone())
+        task_id = (candidate.get("_integration") or {}).get("task_id")
+        task = rowdict(conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()) if task_id else None
+        keys = [r["idempotency_key"] for r in conn.execute("SELECT idempotency_key FROM idempotency_records").fetchall()]
+    if not coze_status().get("ready"):
+        allow_local = os.getenv("COZE_ALLOW_LOCAL_CONFIRM_WHEN_UNCONFIGURED", "true").lower() == "true"
+        if not allow_local:
+            raise HTTPException(503, "Coze尚未配置，无法从网页调用FT03；请先在Render设置COZE_API_TOKEN")
+        plan, _ = review_to_transaction(review, candidate, operator_id)
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            local_result = apply_writeback(conn, {"order_id": order_id, "operator_id": operator_id}, plan)
+            task_id = create_or_update_action_task(conn, review, candidate, order_id)
+            timestamp = iso()
+            conn.execute(
+                "UPDATE candidate_reviews SET candidate_json=?,status='CONFIRMED',reviewer_id=?,reviewed_at=? WHERE review_id=?",
+                (json.dumps(candidate, ensure_ascii=False), operator_id, timestamp, review_id),
+            )
+            conn.commit()
+        return {
+            "status": "CONFIRMED", "review_id": review_id, "order_id": order_id, "task_id": task_id,
+            "writeback": local_result, "integration_mode": "LOCAL_FALLBACK_NO_TOKEN",
+            "boundary": "未配置Coze令牌时仅用于本地测试；生产部署配置令牌后会真实调用FT03。",
+        }
+    confirmed = confirmed_payload(candidate)
+    source_document_id = review.get("source_message_id") or f"MSG-{review_id}"
+    extraction_run_id = (candidate.get("_integration") or {}).get("workflow_run_id") or f"RUN-{review_id}"
+    params = {
+        "extraction_run_id": extraction_run_id,
+        "operation_time": iso(),
+        "adapter_configured": "YES",
+        "confirmed_payload_json": json.dumps(confirmed, ensure_ascii=False),
+        "existing_task_state_json": json.dumps(task or {}, ensure_ascii=False),
+        "operator_id": operator_id,
+        "source_document_id": source_document_id,
+        "existing_idempotency_keys_json": json.dumps(keys, ensure_ascii=False),
+        "confirmation_version": str(body.get("confirmation_version") or "1"),
+        "existing_business_state_json": json.dumps(order or {}, ensure_ascii=False),
+    }
+    try:
+        run = run_workflow("ft03", params, record=record_coze_run)
+    except CozeWorkflowError as exc:
+        raise coze_http_error(exc)
+    ft03 = run.result
+    persistence = str(ft03.get("persistence_status") or "")
+    if persistence not in {"committed", "duplicate_skipped"}:
+        raise HTTPException(502, detail={
+            "message": "FT03未确认写回成功",
+            "result": ft03,
+            "debug_url": run.debug_url,
+        })
+    task_id = None
+    with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        result = apply_writeback(conn, {"order_id": order_id, "operator_id": body.get("operator_id") or "USER-1"}, plan)
-        action = (candidate.get("action_candidates") or [None])[0]
-        task_id = None
-        if action:
-            task_id, timestamp = new_id("TASK"), iso()
-            evidence = [x.get("source_quote") or x.get("evidence") for x in (candidate.get("fields") or []) + (candidate.get("risk_signals") or []) if x.get("source_quote") or x.get("evidence")]
-            risk_level = max((r.get("risk_level") or "none" for r in candidate.get("risk_signals") or []), key=lambda x: RISK_ORDER.get(x,0), default="medium")
-            conn.execute("""INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,source_message_id,evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (task_id, order_id, action.get("title") or "处理AI候选行动", action.get("recommended_action") or action.get("title") or "处理AI候选行动", action.get("target") or "factory", "OPEN", "USER-1", "assigned", None, None, iso(now_cn() + timedelta(hours=4)), iso(now_cn() + timedelta(hours=8)), None, risk_level, int(risk_level == "critical"), 0, review.get("source_message_id"), json.dumps(evidence, ensure_ascii=False), timestamp, timestamp))
-            conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "order", order_id, "AI_CANDIDATE_CONFIRMED", json.dumps({"review_id": review_id, "task_id": task_id}, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
+        task_id = create_or_update_action_task(conn, review, candidate, order_id)
         timestamp = iso()
-        conn.execute("UPDATE candidate_reviews SET candidate_json=?, status='CONFIRMED', reviewer_id=?, reviewed_at=? WHERE review_id=?", (json.dumps(candidate, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp, review_id))
-        if review.get("source_message_id"): conn.execute("UPDATE source_messages SET order_id=? WHERE message_id=?", (order_id, review["source_message_id"]))
+        conn.execute(
+            "UPDATE candidate_reviews SET candidate_json=?,status='CONFIRMED',reviewer_id=?,reviewed_at=? WHERE review_id=?",
+            (json.dumps(candidate, ensure_ascii=False), operator_id, timestamp, review_id),
+        )
+        if review.get("source_message_id"):
+            conn.execute("UPDATE source_messages SET order_id=? WHERE message_id=?", (order_id, review["source_message_id"]))
+        conn.execute(
+            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "order", order_id, "COZE_FT03_CONFIRMED_FROM_UI",
+             json.dumps({"review_id": review_id, "task_id": task_id, "workflow_run_id": run.run_id}, ensure_ascii=False),
+             operator_id, timestamp),
+        )
         conn.commit()
-    return {"status": "CONFIRMED", "review_id": review_id, "order_id": order_id, "task_id": task_id, "writeback": result, "boundary": "网页确认使用同一确定性适配器写入演示数据库；正式企业流程仍由Coze FT03执行"}
+    ranking = run_ft04_refresh("USER-1")
+    return {
+        "status": "CONFIRMED", "review_id": review_id, "order_id": order_id, "task_id": task_id,
+        "ft03": ft03, "ft03_debug_url": run.debug_url,
+        "ft04": ranking["result"] if ranking else None,
+        "boundary": "网页已真实调用Coze FT03；只有FT03返回committed或duplicate_skipped后才更新确认状态并触发FT04重排。",
+    }
 
 
 @app.post("/api/reviews/{review_id}/reject")
@@ -742,6 +1041,27 @@ def put_settings(payload: AnyPayload, user_id: str = Query("USER-1")) -> dict[st
     return {"status": "saved", "user_id": user_id, "settings": settings, "updated_at": timestamp}
 
 
+@app.get("/api/coze/status")
+def api_coze_status() -> dict[str, Any]:
+    status = coze_status()
+    with db() as conn:
+        recent = [dict(r) for r in conn.execute(
+            """SELECT run_id,workflow_key,status,coze_code,coze_msg,debug_url,duration_ms,created_at
+               FROM workflow_runs ORDER BY created_at DESC LIMIT 12"""
+        ).fetchall()]
+    return {**status, "recent_runs": recent}
+
+
+@app.post("/api/coze/ft04/refresh")
+def api_ft04_refresh(payload: AnyPayload) -> dict[str, Any]:
+    user_id = payload.model_dump().get("current_user_id") or "USER-1"
+    try:
+        result = run_ft04_refresh(user_id, raise_on_error=True)
+    except CozeWorkflowError as exc:
+        raise coze_http_error(exc)
+    return {"status": "refreshed", **(result or {})}
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -755,7 +1075,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "3.0.0", "db": str(DB_PATH)}
+    return {"status": "ok", "version": "4.0.0", "db": str(DB_PATH), "coze": coze_status()}
 
 
 @app.post("/api/reset")
@@ -774,15 +1094,47 @@ def dashboard(
     with db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
         orders = {r["order_id"]: dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()}
-    items = [decide_task(r, current, current_user_id) for r in rows]
+        latest = conn.execute(
+            "SELECT MAX(calculated_at) AS last_at FROM task_rankings WHERE current_user_id=?", (current_user_id,)
+        ).fetchone()
+        latest_task = conn.execute("SELECT MAX(updated_at) AS last_task_at FROM tasks").fetchone()
+    rankings = coze_rankings(current_user_id)
+    cache_seconds = int(os.getenv("COZE_FT04_CACHE_SECONDS", "120"))
+    stale = True
+    if latest and latest["last_at"]:
+        last_dt = parse_dt(latest["last_at"])
+        task_dt = parse_dt(latest_task["last_task_at"]) if latest_task and latest_task["last_task_at"] else None
+        stale = (
+            not last_dt
+            or (current - last_dt).total_seconds() > cache_seconds
+            or bool(task_dt and task_dt > last_dt)
+        )
+    if coze_status().get("ready") and (not rankings or stale):
+        run_ft04_refresh(current_user_id)
+        rankings = coze_rankings(current_user_id)
+    items = []
+    for row in rows:
+        local = decide_task(row, current, current_user_id)
+        rank = rankings.get(row.get("task_id"))
+        if rank:
+            local.update({
+                "action_state": rank["action_state"],
+                "recommended_action": rank.get("recommended_action") or local.get("recommended_action"),
+                "target": rank.get("target") or local.get("target"),
+                "next_action_at": rank.get("next_action_at"),
+                "ranking_suppressed": rank.get("ranking_suppressed", False),
+                "priority_score": rank.get("priority_score", 0),
+                "priority_reasons": rank.get("priority_reasons") or [],
+                "evidence": rank.get("evidence") or local.get("evidence") or [],
+                "ranking_source": "COZE_FT04",
+                "ranking_workflow_run_id": rank.get("workflow_run_id"),
+            })
+        else:
+            local["ranking_source"] = "LOCAL_FALLBACK"
+        local["order"] = orders.get(local.get("related_order_id"))
+        items.append(local)
     items.sort(key=lambda x: x["priority_score"], reverse=True)
-    for item in items:
-        item["order"] = orders.get(item.get("related_order_id"))
-    top = [
-        x for x in items
-        if x["action_state"] not in {"DONE", "NOT_MY_RESPONSIBILITY"}
-        and not x["ranking_suppressed"]
-    ][:5]
+    top = [x for x in items if x["action_state"] not in {"DONE", "NOT_MY_RESPONSIBILITY"} and not x["ranking_suppressed"]][:5]
     summary = {
         "total": len(items),
         "do_now": sum(x["action_state"] == "DO_NOW" for x in items),
@@ -792,7 +1144,10 @@ def dashboard(
         "scheduled": sum(x["action_state"] == "SCHEDULED" for x in items),
         "escalate": sum(x["action_state"] == "ESCALATE" for x in items),
     }
-    return {"current_time": iso(current), "summary": summary, "items": items, "top_actions": top}
+    return {
+        "current_time": iso(current), "summary": summary, "items": items, "top_actions": top,
+        "ranking_source": "COZE_FT04" if rankings else "LOCAL_FALLBACK",
+    }
 
 
 @app.get("/api/orders/{order_id}")

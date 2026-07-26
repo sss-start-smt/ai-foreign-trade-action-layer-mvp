@@ -133,3 +133,38 @@ CREATE TABLE IF NOT EXISTS user_settings (
 
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON candidate_reviews(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_reviews_order ON candidate_reviews(order_id);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    run_id TEXT PRIMARY KEY,
+    workflow_key TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    output_json TEXT,
+    coze_code INTEGER,
+    coze_msg TEXT,
+    debug_url TEXT,
+    duration_ms INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_rankings (
+    current_user_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    action_state TEXT NOT NULL,
+    recommended_action TEXT,
+    target TEXT,
+    next_action_at TEXT,
+    ranking_suppressed INTEGER NOT NULL DEFAULT 0,
+    priority_score REAL NOT NULL DEFAULT 0,
+    priority_reasons_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    workflow_run_id TEXT,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY(current_user_id, task_id),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+    FOREIGN KEY(workflow_run_id) REFERENCES workflow_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_key_time ON workflow_runs(workflow_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_rankings_user_score ON task_rankings(current_user_id, priority_score DESC);
