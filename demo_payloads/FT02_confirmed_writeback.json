@@ -1,6 +1,0 @@
-{
-  "transaction_json": "{\"schema_version\": \"4.2\", \"workflow_id\": \"WF_FT03_ConfirmedWritebackAndAudit\", \"idempotency_key\": \"DEMO|FT02|V1\", \"change_set\": [{\"domain\": \"order_changes\", \"entity_id\": \"ORD-1001\", \"field_name\": \"current_progress\", \"new_value\": 0.7, \"evidence\": \"差不多七成\"}, {\"domain\": \"order_changes\", \"entity_id\": \"ORD-1001\", \"field_name\": \"latest_supplier_commitment\", \"new_value\": \"2026-07-29\", \"evidence\": \"应该下周三完成\"}, {\"domain\": \"risk_changes\", \"field_name\": \"risk_type\", \"new_value\": \"commitment_uncertain\", \"risk_level\": \"high\", \"evidence\": \"应该下周三完成\"}, {\"domain\": \"task_changes\", \"entity_id\": \"TASK-PO1001-CONFIRM\", \"field_name\": \"recommended_action\", \"new_value\": \"确认明确完工日期和补救方案\"}], \"writeback_actions\": [{\"action\": \"save_confirmation_snapshot\"}, {\"action\": \"save_idempotency_key\"}, {\"action\": \"update_order_or_item\"}, {\"action\": \"update_task_action_state\"}, {\"action\": \"upsert_risk_signal\"}, {\"action\": \"append_commitment_history\"}, {\"action\": \"append_event_log\"}, {\"action\": \"refresh_today_ranking\"}]}",
-  "existing_business_state_json": "{\"order_id\": \"ORD-1001\", \"order_no\": \"PO-1001\"}",
-  "existing_task_state_json": "{\"task_id\": \"TASK-PO1001-CONFIRM\"}",
-  "operator_id": "USER-1"
-}

@@ -1,6 +1,0 @@
-{
-  "transaction_json": "{\"schema_version\": \"4.2\", \"workflow_id\": \"WF_FT03_ConfirmedWritebackAndAudit\", \"idempotency_key\": \"DEMO|FT01|V1\", \"change_set\": [{\"domain\": \"order_changes\", \"entity_id\": \"ORD-1001\", \"field_name\": \"packaging_method\", \"new_value\": \"彩盒\", \"evidence\": \"包装方式请改为彩盒\"}, {\"domain\": \"risk_changes\", \"field_name\": \"risk_type\", \"new_value\": \"delivery_impact_unknown\", \"risk_level\": \"high\", \"evidence\": \"请今天确认是否会影响8月20日交期\"}], \"writeback_actions\": [{\"action\": \"save_confirmation_snapshot\"}, {\"action\": \"save_idempotency_key\"}, {\"action\": \"update_order_or_item\"}, {\"action\": \"upsert_risk_signal\"}, {\"action\": \"append_event_log\"}, {\"action\": \"refresh_today_ranking\"}]}",
-  "existing_business_state_json": "{\"order_id\": \"ORD-1001\", \"order_no\": \"PO-1001\"}",
-  "existing_task_state_json": "{}",
-  "operator_id": "USER-1"
-}
