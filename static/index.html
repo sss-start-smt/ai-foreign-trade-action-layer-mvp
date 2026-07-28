@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#092923" />
+  <meta name="color-scheme" content="light" />
+  <title>AI外贸跟单行动系统</title>
+  <link rel="stylesheet" href="/static/styles.css?v=5.0.0" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <button class="brand" data-route="today" aria-label="返回今日行动">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="brand-copy"><strong>FlowOrder</strong><small>AI外贸跟单行动系统</small></span>
+      </button>
+
+      <div class="nav-section-label">工作空间</div>
+      <nav class="side-nav" aria-label="主导航">
+        <button class="nav-item" data-route="today" data-icon="today"><span>今日行动</span><b id="todayBadge" hidden>0</b></button>
+        <button class="nav-item" data-route="tasks" data-icon="tasks"><span>全部任务</span></button>
+        <button class="nav-item" data-route="orders" data-icon="orders"><span>订单中心</span></button>
+        <button class="nav-item" data-route="intake" data-icon="message"><span>消息接入</span></button>
+        <button class="nav-item" data-route="confirm" data-icon="review"><span>AI确认</span><b id="reviewBadge" hidden>0</b></button>
+      </nav>
+
+      <div class="nav-section-label">管理</div>
+      <nav class="side-nav" aria-label="管理导航">
+        <button class="nav-item" data-route="manage" data-icon="chart"><span>管理看板</span></button>
+        <button class="nav-item" data-route="settings" data-icon="settings"><span>设置与连接</span></button>
+      </nav>
+
+      <div class="sidebar-card">
+        <span class="live-dot" id="sidebarLiveDot"></span>
+        <div><strong id="sidebarStatus">服务连接中</strong><small id="sidebarStatusDetail">正在检查工作流</small></div>
+      </div>
+    </aside>
+
+    <section class="app-main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="mobile-menu" id="mobileMenu" aria-label="打开导航" data-icon="menu"></button>
+          <div class="page-heading">
+            <span id="pageEyebrow">ACTION WORKSPACE</span>
+            <h1 id="pageTitle">今日行动</h1>
+            <p id="pageSubtitle">从订单事实出发，完成下一步行动</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <label class="global-search" id="searchWrap">
+            <span data-icon="search" aria-hidden="true"></span>
+            <input id="globalSearch" type="search" autocomplete="off" placeholder="搜索当前页面" aria-label="搜索当前页面" />
+            <kbd>⌘ K</kbd>
+          </label>
+          <button class="icon-btn" id="refreshBtn" title="刷新页面" data-icon="refresh"></button>
+          <button class="profile" id="profileButton" type="button">
+            <span class="avatar" id="profileAvatar">李</span>
+            <span><strong id="profileName">李梅</strong><small id="profileRole">跟单专员</small></span>
+            <span data-icon="chevron"></span>
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace" id="pageRoot" tabindex="-1">
+        <div class="loading-state"><span></span><p>正在载入真实业务数据…</p></div>
+      </main>
+    </section>
+  </div>
+
+  <nav class="mobile-nav" aria-label="移动端导航">
+    <button data-route="today" data-icon="today"><small>行动</small></button>
+    <button data-route="tasks" data-icon="tasks"><small>任务</small></button>
+    <button data-route="orders" data-icon="orders"><small>订单</small></button>
+    <button data-route="intake" data-icon="message"><small>接入</small></button>
+    <button data-route="confirm" data-icon="review"><small>确认</small></button>
+  </nav>
+
+  <div class="drawer-mask" id="drawerMask" hidden></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="详情面板">
+    <div id="drawerBody"></div>
+  </aside>
+
+  <dialog class="modal" id="modal">
+    <form method="dialog" id="modalForm">
+      <header class="modal-head">
+        <div><span id="modalEyebrow">操作</span><h2 id="modalTitle">操作</h2><p id="modalSubtitle"></p></div>
+        <button class="modal-close" value="cancel" aria-label="关闭">×</button>
+      </header>
+      <section class="modal-body" id="modalBody"></section>
+      <footer class="modal-actions" id="modalActions"></footer>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/app.js?v=5.0.0"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: ai-foreign-trade-action-system
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DB_PATH
+        value: /var/data/action_layer.db
+      - key: SEED_DEMO_DATA
+        value: "false"
+      - key: COZE_ALLOW_LOCAL_WHEN_UNCONFIGURED
+        value: "false"
+      - key: COZE_ALLOW_LOCAL_FALLBACK_ON_ERROR
+        value: "false"
+      - key: COZE_ALLOW_LOCAL_CONFIRM_WHEN_UNCONFIGURED
+        value: "false"
+      - key: COZE_API_TOKEN
+        sync: false
+      - key: APP_API_KEY
+        sync: false
+      - key: COMMUNICATION_ADMIN_KEY
+        sync: false
+      - key: IMPORT_ADMIN_KEY
+        sync: false
+      - key: COZE_FT01_WORKFLOW_ID
+        sync: false
+      - key: COZE_FT02_WORKFLOW_ID
+        sync: false
+      - key: COZE_FT03_WORKFLOW_ID
+        sync: false
+      - key: COZE_FT04_WORKFLOW_ID
+        sync: false
+      - key: COZE_FT05_WORKFLOW_ID
+        sync: false
+      - key: COZE_FT06_WORKFLOW_ID
+        sync: false
+    disk:
+      name: action-layer-data
+      mountPath: /var/data
+      sizeGB: 1
