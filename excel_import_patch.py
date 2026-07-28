@@ -659,8 +659,10 @@ def _insert_import_task(conn: sqlite3.Connection, order_id: str, order_no: str, 
     }
     selected = {key: value for key, value in candidate_values.items() if key in columns}
     names = list(selected)
+    quoted_names = ", ".join(f'"{name}"' for name in names)
+    placeholders = ", ".join("?" for _ in names)
     conn.execute(
-        f'INSERT INTO tasks ({", ".join(f"\"{name}\"" for name in names)}) VALUES ({", ".join("?" for _ in names)})',
+        f"INSERT INTO tasks ({quoted_names}) VALUES ({placeholders})",
         [selected[name] for name in names],
     )
     return True
@@ -685,8 +687,10 @@ def _append_event(conn: sqlite3.Connection, order_id: str, event_type: str, payl
     if not selected:
         return
     names = list(selected)
+    quoted_names = ", ".join(f'"{name}"' for name in names)
+    placeholders = ", ".join("?" for _ in names)
     conn.execute(
-        f'INSERT INTO event_logs ({", ".join(f"\"{name}\"" for name in names)}) VALUES ({", ".join("?" for _ in names)})',
+        f"INSERT INTO event_logs ({quoted_names}) VALUES ({placeholders})",
         [selected[name] for name in names],
     )
 
