@@ -22,7 +22,7 @@ from coze_integration import (
     run_workflow,
 )
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
@@ -32,10 +32,37 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="5.0.0")
+app = FastAPI(title="AI外贸跟单行动系统", version="5.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
+
+
+def storage_status() -> dict[str, Any]:
+    """Describe whether the active SQLite file is on durable storage."""
+    path = DB_PATH.resolve()
+    path_text = str(path)
+    persistent_prefixes = ("/var/data/", "/opt/render/project/src/storage/")
+    on_persistent_path = any(path_text.startswith(prefix) for prefix in persistent_prefixes)
+    render_runtime = bool(os.getenv("RENDER")) or Path("/opt/render/project/src").exists()
+    warning = None
+    if render_runtime and not on_persistent_path:
+        warning = (
+            "当前数据库不在Render持久盘目录中，重新部署、重启或休眠后数据可能丢失。"
+            "请挂载/var/data并设置DB_PATH=/var/data/action_layer.db。"
+        )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        writable = os.access(path.parent, os.W_OK)
+    except OSError:
+        writable = False
+    return {
+        "db_path": path_text,
+        "render_runtime": render_runtime,
+        "on_persistent_path": on_persistent_path,
+        "writable": writable,
+        "warning": warning,
+    }
 
 
 class AnyPayload(BaseModel):
@@ -516,6 +543,30 @@ def normalize_source_channel(value: Any) -> str:
     return aliases.get(raw, "manual_input")
 
 
+def compact_order_context(order: dict[str, Any] | None) -> dict[str, Any]:
+    if not order:
+        return {}
+    fields = (
+        "order_id", "order_no", "customer_name", "product_name", "sku",
+        "quantity", "unit", "packaging_method", "requested_delivery_date",
+        "customer_delivery_date", "latest_supplier_commitment", "current_progress",
+        "current_node", "factory_name", "owner", "specification", "material",
+        "color", "logo_process", "status",
+    )
+    return {key: order.get(key) for key in fields if order.get(key) not in (None, "")}
+
+
+def compact_task_context(task: dict[str, Any] | None) -> dict[str, Any]:
+    if not task:
+        return {}
+    fields = (
+        "task_id", "title", "recommended_action", "target", "status",
+        "waiting_on", "promised_reply_at", "next_action_at", "business_deadline",
+        "last_contact_at", "risk_level", "evidence",
+    )
+    return {key: task.get(key) for key in fields if task.get(key) not in (None, "", [])}
+
+
 def build_ft01_parameters(
     body: dict[str, Any],
     order: dict[str, Any] | None,
@@ -527,9 +578,9 @@ def build_ft01_parameters(
         input_type = "text"
     return {
         "input_type": input_type,
-        "existing_order_context": json.dumps(order or {}, ensure_ascii=False),
+        "existing_order_context": json.dumps(compact_order_context(order), ensure_ascii=False),
         "timezone": str(body.get("timezone") or "Asia/Shanghai"),
-        "existing_task_context": json.dumps(task or {}, ensure_ascii=False),
+        "existing_task_context": json.dumps(compact_task_context(task), ensure_ascii=False),
         "source_channel": normalize_source_channel(body.get("source_channel")),
         "sender_role_hint": str(
             body.get("sender_role") or body.get("sender_role_hint") or "customer"
@@ -546,7 +597,7 @@ def build_ft02_parameters(
     order: dict[str, Any] | None,
     task: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    task_context = dict(task or {})
+    task_context = compact_task_context(task)
     task_context.setdefault(
         "questions",
         [
@@ -555,7 +606,7 @@ def build_ft02_parameters(
             "补救方案是什么？",
         ],
     )
-    order_context = dict(order or {})
+    order_context = compact_order_context(order)
     # FT02的order_context是必填String。即使订单未识别，也传合法JSON对象，
     # 避免发送空字符串触发开始节点API参数校验。
     order_context.setdefault("order_id", body.get("order_id"))
@@ -958,9 +1009,7 @@ def create_order_task(order_id: str, payload: AnyPayload) -> dict[str, Any]:
     return {"status": "created", "task_id": task_id, "order_id": order_id}
 
 
-@app.post("/api/intake/analyze")
-def analyze_intake(payload: AnyPayload) -> dict[str, Any]:
-    body = payload.model_dump()
+def analyze_intake_body(body: dict[str, Any]) -> dict[str, Any]:
     raw = str(body.get("raw_content") or "").strip()
     if not raw:
         raise HTTPException(422, "消息内容不能为空")
@@ -1013,6 +1062,96 @@ def analyze_intake(payload: AnyPayload) -> dict[str, Any]:
         "candidate": candidate, "workflow_source": workflow_source, "debug_url": debug_url,
         "boundary": "已配置令牌时由Coze FT01/FT02实时识别；所有结果仍需人工确认后才能调用FT03写回。",
     }
+
+
+@app.post("/api/intake/analyze")
+def analyze_intake(payload: AnyPayload) -> dict[str, Any]:
+    """Compatibility endpoint: waits for the workflow to finish."""
+    return analyze_intake_body(payload.model_dump())
+
+
+def process_intake_job(job_id: str) -> None:
+    started_at = iso()
+    with db() as conn:
+        row = conn.execute("SELECT request_json FROM intake_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if not row:
+            return
+        body = json.loads(row["request_json"])
+        conn.execute(
+            "UPDATE intake_jobs SET status='PROCESSING', progress_message=?, started_at=?, updated_at=? WHERE job_id=?",
+            ("正在调用Coze工作流并提取候选", started_at, started_at, job_id),
+        )
+        conn.commit()
+    try:
+        result = analyze_intake_body(body)
+        completed_at = iso()
+        with db() as conn:
+            conn.execute(
+                """UPDATE intake_jobs SET status='COMPLETED', progress_message=?, result_json=?,
+                   review_id=?, message_id=?, completed_at=?, updated_at=? WHERE job_id=?""",
+                (
+                    "识别完成，等待人工确认",
+                    json.dumps(result, ensure_ascii=False),
+                    result.get("review_id"), result.get("message_id"),
+                    completed_at, completed_at, job_id,
+                ),
+            )
+            conn.commit()
+    except HTTPException as exc:
+        failed_at = iso()
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        with db() as conn:
+            conn.execute(
+                "UPDATE intake_jobs SET status='FAILED', progress_message=?, error_json=?, completed_at=?, updated_at=? WHERE job_id=?",
+                ("识别失败", json.dumps(detail, ensure_ascii=False), failed_at, failed_at, job_id),
+            )
+            conn.commit()
+    except Exception as exc:  # keep background failures visible to the user
+        failed_at = iso()
+        with db() as conn:
+            conn.execute(
+                "UPDATE intake_jobs SET status='FAILED', progress_message=?, error_json=?, completed_at=?, updated_at=? WHERE job_id=?",
+                ("识别失败", json.dumps({"message": str(exc)}, ensure_ascii=False), failed_at, failed_at, job_id),
+            )
+            conn.commit()
+
+
+@app.post("/api/intake/jobs", status_code=202)
+def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    body = payload.model_dump()
+    raw = str(body.get("raw_content") or "").strip()
+    if not raw:
+        raise HTTPException(422, "消息内容不能为空")
+    sender_role = str(body.get("sender_role") or "customer").strip().lower()
+    workflow_key = "ft02" if sender_role == "factory" else "ft01"
+    job_id = new_id("INTAKE")
+    timestamp = iso()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO intake_jobs(job_id,status,workflow_key,order_id,request_json,progress_message,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (job_id, "QUEUED", workflow_key, body.get("order_id"), json.dumps(body, ensure_ascii=False),
+             f"已进入后台队列，即将调用{workflow_key.upper()}", timestamp, timestamp),
+        )
+        conn.commit()
+    background_tasks.add_task(process_intake_job, job_id)
+    return {
+        "status": "queued", "job_id": job_id, "workflow_key": workflow_key,
+        "message": "消息已进入后台识别，可继续浏览其他页面。",
+    }
+
+
+@app.get("/api/intake/jobs/{job_id}")
+def get_intake_job(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM intake_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "识别任务不存在")
+    item = dict(row)
+    result = json.loads(item.pop("result_json") or "null")
+    error = json.loads(item.pop("error_json") or "null")
+    item.pop("request_json", None)
+    return {**item, "result": result, "error": error}
 
 
 @app.post("/api/reviews/import")
@@ -1222,6 +1361,18 @@ def api_ft04_refresh(payload: AnyPayload) -> dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    timestamp = iso()
+    with db() as conn:
+        conn.execute(
+            """UPDATE intake_jobs SET status='FAILED', progress_message='服务重启，后台识别已中断',
+               error_json=?, completed_at=?, updated_at=? WHERE status IN ('QUEUED','PROCESSING')""",
+            (json.dumps({"message": "服务重启导致后台识别中断，请重新提交消息"}, ensure_ascii=False), timestamp, timestamp),
+        )
+        conn.commit()
+    status = storage_status()
+    print(f"[storage] db={status['db_path']} persistent={status['on_persistent_path']}")
+    if status.get("warning"):
+        print(f"[storage-warning] {status['warning']}")
 
 
 @app.get("/")
@@ -1232,7 +1383,18 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "5.0.0", "db": str(DB_PATH), "coze": coze_status()}
+    return {"status": "ok", "version": "5.1.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
+
+
+@app.get("/api/system/storage")
+def system_storage() -> dict[str, Any]:
+    init_db()
+    status = storage_status()
+    with db() as conn:
+        status["order_count"] = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        status["task_count"] = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    status["status"] = "ok" if status["on_persistent_path"] or not status["render_runtime"] else "warning"
+    return status
 
 
 def clear_business_data(conn: sqlite3.Connection) -> None:
@@ -1242,7 +1404,7 @@ def clear_business_data(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     tables = [
         "communication_events", "communication_workflow_runs", "communication_drafts",
-        "communication_task_candidates", "order_import_rows", "order_import_batches",
+        "communication_task_candidates", "order_import_rows", "order_import_batches", "intake_jobs",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
         "commitment_history", "risk_signals", "tasks", "source_messages", "orders"

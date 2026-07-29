@@ -168,3 +168,24 @@ CREATE TABLE IF NOT EXISTS task_rankings (
 
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_key_time ON workflow_runs(workflow_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_rankings_user_score ON task_rankings(current_user_id, priority_score DESC);
+
+
+CREATE TABLE IF NOT EXISTS intake_jobs (
+    job_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    workflow_key TEXT NOT NULL,
+    order_id TEXT,
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    error_json TEXT,
+    review_id TEXT,
+    message_id TEXT,
+    progress_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intake_jobs_status_time ON intake_jobs(status, created_at);

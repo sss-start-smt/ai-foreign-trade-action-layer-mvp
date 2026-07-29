@@ -12,6 +12,8 @@ services:
         value: /var/data/action_layer.db
       - key: SEED_DEMO_DATA
         value: "false"
+      - key: COZE_PARAMETERS_MODE
+        value: object
       - key: COZE_ALLOW_LOCAL_WHEN_UNCONFIGURED
         value: "false"
       - key: COZE_ALLOW_LOCAL_FALLBACK_ON_ERROR
