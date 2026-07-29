@@ -121,7 +121,23 @@ function bindShell(){
   $('#profileButton').onclick=()=>go('settings');
   $('#drawerMask').onclick=closeDrawer;
   $('#globalSearch').oninput=e=>{search=e.target.value;renderRoute(false)};
-  document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();$('#globalSearch').focus()}if(e.key==='Escape')closeDrawer()});
+
+  const modal=$('#modal');
+  const modalForm=$('#modalForm');
+  modalForm.addEventListener('submit',e=>e.preventDefault());
+  $$('[data-close-modal]',modal).forEach(button=>button.onclick=closeModal);
+  modal.addEventListener('cancel',e=>{e.preventDefault();closeModal()});
+  modal.addEventListener('click',e=>{if(e.target===modal)closeModal()});
+
+  document.addEventListener('keydown',e=>{
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){
+      e.preventDefault();$('#globalSearch').focus();return;
+    }
+    if(e.key==='Escape'){
+      if(modal.open){e.preventDefault();closeModal()}
+      else closeDrawer();
+    }
+  });
 }
 function updateProfile(){const op=currentOperator();$('#profileName').textContent=op.name;$('#profileRole').textContent=op.role;$('#profileAvatar').textContent=op.name.slice(0,1)}
 function updateHealth(h,error=''){
@@ -217,8 +233,30 @@ async function pageSettings(root){
 }
 function integrationItem(name,desc,state,ok){return `<div class="integration-item"><div><strong>${esc(name)}</strong><small>${esc(desc)}</small></div><span class="integration-state ${ok?'':'bad'}">${esc(state)}</span></div>`}
 
-function openModal({eyebrow='操作',title,subtitle='',body,actions}){const m=$('#modal');$('#modalEyebrow').textContent=eyebrow;$('#modalTitle').textContent=title;$('#modalSubtitle').textContent=subtitle;$('#modalBody').innerHTML=body;$('#modalActions').innerHTML=actions||'<button class="btn" value="cancel">取消</button>';m.showModal();return m}
-function closeModal(){const m=$('#modal');if(m.open)m.close()}
+function openModal({eyebrow='操作',title,subtitle='',body,actions}){
+  const m=$('#modal');
+  if(m.open)m.close();
+  $('#modalEyebrow').textContent=eyebrow;
+  $('#modalTitle').textContent=title;
+  $('#modalSubtitle').textContent=subtitle;
+  $('#modalBody').innerHTML=body;
+  $('#modalActions').innerHTML=actions||'<button class="btn" type="button" data-close-modal>取消</button>';
+  $$('[value="cancel"], [data-close-modal]',m).forEach(button=>{
+    button.type='button';
+    button.setAttribute('data-close-modal','');
+    button.onclick=closeModal;
+  });
+  m.returnValue='';
+  m.showModal();
+  document.body.classList.add('modal-open');
+  requestAnimationFrame(()=>$('#modalBody input, #modalBody select, #modalBody textarea, #modalActions button',m)?.focus());
+  return m;
+}
+function closeModal(){
+  const m=$('#modal');
+  if(m.open)m.close('cancel');
+  document.body.classList.remove('modal-open');
+}
 async function openNewOrderModal(){
   const m=openModal({eyebrow:'CREATE ORDER',title:'新建订单',subtitle:'建立真实订单底座后，任务和沟通才能获得可靠上下文。',body:`<div class="form-grid"><label class="field"><span>订单号 *</span><input name="order_no" required placeholder="例如 PO-2026-001"></label><label class="field"><span>客户名称 *</span><input name="customer_name" required></label><label class="field"><span>产品名称</span><input name="product_name"></label><label class="field"><span>SKU</span><input name="sku"></label><label class="field"><span>数量</span><input name="quantity" type="number" step="any"></label><label class="field"><span>单位</span><input name="unit" placeholder="pcs"></label><label class="field"><span>客户正式交期</span><input name="customer_delivery_date" type="date"></label><label class="field"><span>当前节点</span><input name="current_node" placeholder="例如 资料确认"></label><label class="field"><span>工厂名称</span><input name="factory_name"></label><label class="field"><span>负责人</span><select name="owner"><option value="">待分配</option>${(cache.operators||[]).filter(o=>o.user_id!=='MANAGER-1').map(o=>`<option value="${esc(o.user_id)}">${esc(o.name)}</option>`).join('')}</select></label></div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="createOrderSubmit">创建订单</button>'});$('#createOrderSubmit',m).onclick=async()=>{const body=Object.fromEntries($$('input,select',$('#modalBody')).map(el=>[el.name,el.value]));if(!body.order_no.trim()||!body.customer_name.trim())return toast('请填写订单号和客户名称','error');if(body.quantity!=='')body.quantity=Number(body.quantity);try{const r=await api('/api/orders',{method:'POST',body:JSON.stringify({...body,operator_id:currentUser()})});cache.orders=null;closeModal();toast('订单已创建','success');go(`orders/${r.order_id}`)}catch(e){toast(e.message,'error')}}
 }
