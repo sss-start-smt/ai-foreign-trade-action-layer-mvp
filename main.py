@@ -32,7 +32,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="5.1.0")
+app = FastAPI(title="AI外贸跟单行动系统", version="5.2.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
@@ -99,9 +99,43 @@ def db():
         conn.close()
 
 
+ACTIVATION_COLUMNS: dict[str, str] = {
+    "action_readiness": "TEXT NOT NULL DEFAULT 'BASE_ONLY'",
+    "contact_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+    "issue_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+    "initialization_waiting_on": "TEXT",
+    "initialization_promised_reply_at": "TEXT",
+    "initialization_note": "TEXT",
+    "initialization_source": "TEXT",
+    "initialized_at": "TEXT",
+    "last_dynamic_update_at": "TEXT",
+}
+ACTION_READINESS_VALUES = {"BASE_ONLY", "NEEDS_STATUS", "READY_FOR_RANKING", "ACTION_GENERATED", "CLOSED"}
+CONTACT_STATUS_VALUES = {"NOT_CONTACTED", "WAITING_REPLY", "REPLIED", "UNKNOWN"}
+ISSUE_STATUS_VALUES = {"NONE", "KNOWN", "UNKNOWN"}
+
+
+def ensure_activation_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    for name, definition in ACTIVATION_COLUMNS.items():
+        if name not in columns:
+            conn.execute(f'ALTER TABLE orders ADD COLUMN "{name}" {definition}')
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date)")
+    # Existing orders that already have open tasks are not first-use base records.
+    conn.execute(
+        """UPDATE orders SET action_readiness='ACTION_GENERATED',
+           initialization_source=COALESCE(initialization_source,'MIGRATION_EXISTING_TASK'),
+           initialized_at=COALESCE(initialized_at,updated_at),
+           last_dynamic_update_at=COALESCE(last_dynamic_update_at,updated_at)
+           WHERE EXISTS(SELECT 1 FROM tasks WHERE tasks.related_order_id=orders.order_id AND tasks.status!='DONE')"""
+    )
+    conn.commit()
+
+
 def init_db() -> None:
     with db() as conn:
         conn.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
+        ensure_activation_schema(conn)
         count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         if count == 0 and os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
             reset_demo_data(conn)
@@ -187,6 +221,12 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
     )
     defaults = {"theme": "upstream", "compact": False, "show_demo": False, "current_user_id": "USER-1", "notifications": {"urgent": True, "waiting_overdue": True, "writeback": True, "daily_summary": False}}
     conn.execute("INSERT INTO user_settings(user_id,settings_json,updated_at) VALUES(?,?,?)", ("USER-1", json.dumps(defaults, ensure_ascii=False), iso(now)))
+    conn.execute(
+        """UPDATE orders SET action_readiness='ACTION_GENERATED', contact_status='UNKNOWN', issue_status='UNKNOWN',
+           initialization_source='DEMO', initialized_at=?, last_dynamic_update_at=?
+           WHERE EXISTS(SELECT 1 FROM tasks WHERE tasks.related_order_id=orders.order_id)""",
+        (iso(now), iso(now)),
+    )
     conn.commit()
 
 
@@ -213,6 +253,7 @@ def next_workday_9(now: datetime) -> datetime:
 def decide_task(task: dict[str, Any], current: datetime, current_user_id: str) -> dict[str, Any]:
     due = parse_dt(task.get("business_deadline"))
     promise = parse_dt(task.get("promised_reply_at"))
+    planned = parse_dt(task.get("next_action_at"))
     risk = str(task.get("risk_level") or "none").lower()
     urgent = bool(task.get("urgent")) or risk == "critical"
     weekend = current.weekday() >= 5
@@ -249,12 +290,18 @@ def decide_task(task: dict[str, Any], current: datetime, current_user_id: str) -
     elif task.get("waiting_on") and promise and promise <= current:
         state, action, hard = "DO_NOW", f"再次跟进{task.get('waiting_on')}", True
         reasons.append("已超过对方承诺回复时间")
+    elif planned and planned <= current:
+        state, action, hard = "DO_NOW", task.get("recommended_action") or "立即处理计划事项", True
+        reasons.append("已到计划处理时间")
     elif due and due <= current:
         state, action, hard = "DO_NOW", task.get("recommended_action") or "立即处理逾期事项", True
         reasons.append("业务截止时间已过")
     elif urgent:
         state, action, hard = "DO_NOW", task.get("recommended_action") or "立即人工处理紧急事项", True
         reasons.append("存在关键风险")
+    elif planned and (planned - current).total_seconds() <= 12 * 3600:
+        state, action = "DO_TODAY", task.get("recommended_action") or "今天完成"
+        reasons.append("计划处理时间在今天")
     elif due and (due - current).total_seconds() <= 12 * 3600:
         state, action = "DO_TODAY", task.get("recommended_action") or "今天完成"
         reasons.append("任务将在今天到期")
@@ -877,6 +924,10 @@ def create_order(payload: AnyPayload) -> dict[str, Any]:
         "current_progress": body.get("current_progress"),
         "current_node": body.get("current_node"),
         "status": body.get("status") or "ACTIVE",
+        "action_readiness": "BASE_ONLY",
+        "contact_status": "UNKNOWN",
+        "issue_status": "UNKNOWN",
+        "initialization_source": "MANUAL_CREATE",
         "created_at": timestamp,
         "updated_at": timestamp,
     }
@@ -913,6 +964,8 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         "latest_supplier_commitment": "latest_supplier_commitment",
         "supplier_completion_commitment_date": "latest_supplier_commitment",
         "current_progress": "current_progress", "current_node": "current_node", "status": "status",
+        "action_readiness": "action_readiness", "contact_status": "contact_status",
+        "issue_status": "issue_status", "initialization_note": "initialization_note",
         "sku": "sku", "quantity": "quantity", "unit": "unit", "factory_name": "factory_name",
         "owner": "owner", "specification": "specification", "material": "material",
         "color": "color", "logo_process": "logo_process",
@@ -928,6 +981,15 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
                 updates[target] = body[source]
         if not updates:
             raise HTTPException(422, "没有可更新字段")
+        dynamic_fields = {"current_node", "current_progress", "latest_supplier_commitment", "contact_status", "issue_status"}
+        if dynamic_fields.intersection(updates) and row["action_readiness"] in {"BASE_ONLY", "NEEDS_STATUS"}:
+            updates.setdefault("action_readiness", "READY_FOR_RANKING")
+            if "initialization_source" in columns:
+                updates.setdefault("initialization_source", "MANUAL_EDIT")
+            if "initialized_at" in columns:
+                updates.setdefault("initialized_at", iso())
+            if "last_dynamic_update_at" in columns:
+                updates.setdefault("last_dynamic_update_at", iso())
         if "order_no" in updates:
             exists = conn.execute("SELECT 1 FROM orders WHERE order_no=? AND order_id<>?", (updates["order_no"], order_id)).fetchone()
             if exists:
@@ -942,6 +1004,228 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         )
         conn.commit()
     return {"status": "updated", "order_id": order_id, "changes": updates}
+
+
+
+def activation_readiness_label(value: str | None) -> str:
+    return {
+        "BASE_ONLY": "仅有基础订单",
+        "NEEDS_STATUS": "待补充进展",
+        "READY_FOR_RANKING": "可生成行动",
+        "ACTION_GENERATED": "已有行动",
+        "CLOSED": "已完成",
+    }.get(value or "BASE_ONLY", value or "仅有基础订单")
+
+
+def activation_recommendation_key(order: dict[str, Any]) -> tuple[int, str, str]:
+    delivery = parse_dt(order.get("requested_delivery_date"))
+    return (0 if delivery else 1, delivery.isoformat() if delivery else "9999-12-31", str(order.get("updated_at") or ""))
+
+
+def activation_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    orders = [dict(r) for r in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()]
+    active = [o for o in orders if str(o.get("status") or "ACTIVE").upper() not in {"DONE", "COMPLETED", "CANCELLED", "CLOSED"}]
+    counts = {key: 0 for key in ACTION_READINESS_VALUES}
+    for order in active:
+        readiness = order.get("action_readiness") or "BASE_ONLY"
+        counts[readiness if readiness in counts else "BASE_ONLY"] += 1
+    candidates = [o for o in active if (o.get("action_readiness") or "BASE_ONLY") in {"BASE_ONLY", "NEEDS_STATUS"}]
+    candidates.sort(key=activation_recommendation_key)
+    recommended = []
+    for order in candidates[:6]:
+        item = dict(order)
+        item["action_readiness"] = item.get("action_readiness") or "BASE_ONLY"
+        item["action_readiness_label"] = activation_readiness_label(item["action_readiness"])
+        recommended.append(item)
+    target = min(3, len(active))
+    generated = counts["ACTION_GENERATED"]
+    return {
+        "total_orders": len(orders),
+        "active_orders": len(active),
+        "counts": counts,
+        "needs_initialization": counts["BASE_ONLY"] + counts["NEEDS_STATUS"],
+        "ready_or_action": counts["READY_FOR_RANKING"] + counts["ACTION_GENERATED"],
+        "action_generated": generated,
+        "activation_target": target,
+        "ranking_experience_ready": target > 0 and generated >= target,
+        "recommended_orders": recommended,
+    }
+
+
+def activation_risk(order: dict[str, Any], issue_status: str) -> tuple[str, int]:
+    delivery = parse_dt(order.get("requested_delivery_date"))
+    current = now_cn()
+    if issue_status == "KNOWN":
+        return "high", 1
+    if delivery:
+        hours = (delivery - current).total_seconds() / 3600
+        if hours <= 0:
+            return "high", 1
+        if hours <= 72:
+            return "high", 0
+        if hours <= 24 * 7:
+            return "medium", 0
+    return "low", 0
+
+
+def upsert_activation_task(
+    conn: sqlite3.Connection,
+    order: dict[str, Any],
+    *,
+    contact_status: str,
+    issue_status: str,
+    waiting_on: str | None,
+    promised_reply_at: str | None,
+    note: str | None,
+    operator_id: str,
+) -> str:
+    order_id = order["order_id"]
+    order_no = order.get("order_no") or order_id
+    timestamp = iso()
+    delivery = order.get("requested_delivery_date")
+    risk_level, urgent = activation_risk(order, issue_status)
+    pending_confirmation = 0
+    target = waiting_on or "factory"
+    waiting_value = None
+    promise_value = None
+    next_action = timestamp
+    evidence = ["QUICK_INITIALIZATION", f"订单{order_no}完成首次状态初始化"]
+    if note:
+        evidence.append(note)
+
+    if contact_status == "WAITING_REPLY":
+        target_label = "客户" if target == "customer" else "工厂"
+        title = f"等待{target_label}回复：{order_no}"
+        action = f"在承诺回复时间前等待{target_label}；到期后再跟进"
+        waiting_value = target
+        promise_value = promised_reply_at
+        next_action = promised_reply_at
+    elif contact_status == "REPLIED":
+        title = f"核对{order_no}最新回复"
+        action = "粘贴最近回复，确认进度、生产完成承诺、异常与未回答事项"
+        pending_confirmation = 1
+    elif issue_status == "KNOWN":
+        title = f"处理{order_no}已知异常"
+        action = "补充异常证据并联系相关方确认影响、完成时间和补救方案"
+    elif contact_status == "NOT_CONTACTED":
+        title = f"确认{order_no}当前进展"
+        action = "联系工厂确认当前节点、准确进度、生产完成承诺和已知异常"
+    else:
+        title = f"补充{order_no}当前进展"
+        action = "粘贴最近沟通，或确认当前节点、联系状态和已知异常"
+        pending_confirmation = 1
+
+    existing = conn.execute(
+        """SELECT task_id FROM tasks WHERE related_order_id=? AND status!='DONE'
+           AND evidence_json LIKE '%QUICK_INITIALIZATION%' ORDER BY updated_at DESC LIMIT 1""",
+        (order_id,),
+    ).fetchone()
+    task_id = existing["task_id"] if existing else new_id("TASK")
+    params = (
+        title, action, target, "OPEN", operator_id, "assigned", waiting_value,
+        promise_value, next_action, delivery, None, risk_level, urgent,
+        pending_confirmation, None, json.dumps(evidence, ensure_ascii=False), timestamp,
+    )
+    if existing:
+        conn.execute(
+            """UPDATE tasks SET title=?,recommended_action=?,target=?,status=?,owner_user_id=?,
+               responsibility_status=?,waiting_on=?,promised_reply_at=?,next_action_at=?,
+               business_deadline=?,last_contact_at=?,risk_level=?,urgent=?,pending_confirmation=?,
+               source_message_id=?,evidence_json=?,updated_at=? WHERE task_id=?""",
+            (*params, task_id),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,
+               owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,
+               business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,
+               source_message_id,evidence_json,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, order_id, *params[:-1], timestamp, timestamp),
+        )
+    return task_id
+
+
+@app.get("/api/activation/summary")
+def activation_summary() -> dict[str, Any]:
+    with db() as conn:
+        return activation_snapshot(conn)
+
+
+@app.post("/api/orders/{order_id}/initialize")
+def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
+    body = payload.model_dump()
+    current_node = str(body.get("current_node") or "").strip()
+    contact_status = str(body.get("contact_status") or "UNKNOWN").upper()
+    issue_status = str(body.get("issue_status") or "UNKNOWN").upper()
+    waiting_on = str(body.get("waiting_on") or "").strip().lower() or None
+    promised_reply_at = body.get("promised_reply_at")
+    note = str(body.get("initialization_note") or "").strip() or None
+    operator_id = str(body.get("operator_id") or "USER-1")
+    if contact_status not in CONTACT_STATUS_VALUES:
+        raise HTTPException(422, "contact_status无效")
+    if issue_status not in ISSUE_STATUS_VALUES:
+        raise HTTPException(422, "issue_status无效")
+    if waiting_on not in {None, "customer", "factory"}:
+        raise HTTPException(422, "waiting_on只能是customer或factory")
+    if contact_status == "WAITING_REPLY":
+        if not waiting_on:
+            raise HTTPException(422, "等待回复时必须选择等待对象")
+        if not parse_dt(promised_reply_at):
+            raise HTTPException(422, "等待回复时必须填写有效的承诺回复时间")
+    timestamp = iso()
+    with db() as conn:
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+        if not order_row:
+            raise HTTPException(404, "订单不存在")
+        order = dict(order_row)
+        closed = current_node in {"已完成", "已出货", "已取消"} or str(body.get("order_status") or "").upper() in {"DONE", "COMPLETED", "CANCELLED", "CLOSED"}
+        if closed:
+            status = "CANCELLED" if current_node == "已取消" else "COMPLETED"
+            conn.execute(
+                """UPDATE orders SET current_node=?,status=?,action_readiness='CLOSED',contact_status=?,
+                   issue_status=?,initialization_waiting_on=NULL,initialization_promised_reply_at=NULL,
+                   initialization_note=?,initialization_source='QUICK_INITIALIZATION',initialized_at=?,
+                   last_dynamic_update_at=?,updated_at=? WHERE order_id=?""",
+                (current_node or "已完成", status, contact_status, issue_status, note, timestamp, timestamp, timestamp, order_id),
+            )
+            conn.execute("UPDATE tasks SET status='DONE',updated_at=? WHERE related_order_id=? AND status!='DONE'", (timestamp, order_id))
+            task_id = None
+            readiness = "CLOSED"
+        else:
+            conn.execute(
+                """UPDATE orders SET current_node=COALESCE(NULLIF(?,''),current_node),contact_status=?,issue_status=?,
+                   initialization_waiting_on=?,initialization_promised_reply_at=?,initialization_note=?,
+                   initialization_source='QUICK_INITIALIZATION',initialized_at=COALESCE(initialized_at,?),
+                   last_dynamic_update_at=?,updated_at=? WHERE order_id=?""",
+                (current_node, contact_status, issue_status, waiting_on, promised_reply_at, note, timestamp, timestamp, timestamp, order_id),
+            )
+            order.update({"current_node": current_node or order.get("current_node")})
+            task_id = upsert_activation_task(
+                conn, order, contact_status=contact_status, issue_status=issue_status,
+                waiting_on=waiting_on, promised_reply_at=promised_reply_at,
+                note=note, operator_id=operator_id,
+            )
+            readiness = "ACTION_GENERATED"
+            conn.execute(
+                "UPDATE orders SET action_readiness=?,last_dynamic_update_at=?,updated_at=? WHERE order_id=?",
+                (readiness, timestamp, timestamp, order_id),
+            )
+        conn.execute(
+            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "order", order_id, "ORDER_STATUS_INITIALIZED", json.dumps({
+                "current_node": current_node, "contact_status": contact_status,
+                "issue_status": issue_status, "waiting_on": waiting_on,
+                "promised_reply_at": promised_reply_at, "task_id": task_id,
+                "readiness": readiness,
+            }, ensure_ascii=False), operator_id, timestamp),
+        )
+        conn.commit()
+        snapshot = activation_snapshot(conn)
+    return {
+        "status": "initialized", "order_id": order_id, "task_id": task_id,
+        "action_readiness": readiness, "activation": snapshot,
+    }
 
 
 @app.get("/api/operators")
@@ -979,14 +1263,30 @@ def order_list(q: str | None = Query(None), status: str | None = Query(None)) ->
         orisks = [r for r in risks if r.get("order_id") == order["order_id"]]
         max_risk = max((r.get("risk_level") or "none" for r in orisks), key=lambda x: RISK_ORDER.get(x, 0), default="none")
         item = dict(order)
-        item.update({"open_task_count": len(otasks), "waiting_task_count": sum(bool(t.get("waiting_on")) for t in otasks), "risk_count": len(orisks), "max_risk": max_risk, "next_action_at": min((t.get("next_action_at") or t.get("business_deadline") for t in otasks if t.get("next_action_at") or t.get("business_deadline")), default=None)})
+        readiness = item.get("action_readiness") or "BASE_ONLY"
+        item.update({
+            "action_readiness": readiness,
+            "open_task_count": len(otasks),
+            "waiting_task_count": sum(bool(t.get("waiting_on")) for t in otasks),
+            "risk_count": len(orisks),
+            "max_risk": max_risk,
+            "next_action_at": min((t.get("next_action_at") or t.get("business_deadline") for t in otasks if t.get("next_action_at") or t.get("business_deadline")), default=None),
+        })
         result.append(item)
     if q:
         needle = q.lower()
         result = [x for x in result if needle in " ".join(str(x.get(k) or "") for k in ["order_no","customer_name","product_name","current_node"]).lower()]
     if status and status != "ALL":
         result = [x for x in result if x.get("status") == status]
-    return {"items": result, "total": len(result), "summary": {"active": sum(x["status"] == "ACTIVE" for x in result), "risk_orders": sum(x["max_risk"] in {"high","critical"} for x in result), "pending_tasks": sum(x["open_task_count"] for x in result), "commitments": sum(bool(x.get("latest_supplier_commitment")) for x in result)}}
+    return {"items": result, "total": len(result), "summary": {
+        "active": sum(x["status"] == "ACTIVE" for x in result),
+        "risk_orders": sum(x["max_risk"] in {"high","critical"} for x in result),
+        "pending_tasks": sum(x["open_task_count"] for x in result),
+        "commitments": sum(bool(x.get("latest_supplier_commitment")) for x in result),
+        "base_only": sum(x.get("action_readiness") in {"BASE_ONLY", "NEEDS_STATUS"} for x in result),
+        "ranking_ready": sum(x.get("action_readiness") in {"READY_FOR_RANKING", "ACTION_GENERATED"} for x in result),
+        "action_generated": sum(x.get("action_readiness") == "ACTION_GENERATED" for x in result),
+    }}
 
 
 @app.post("/api/orders/{order_id}/tasks")
@@ -1005,6 +1305,12 @@ def create_order_task(order_id: str, payload: AnyPayload) -> dict[str, Any]:
             (task_id, order_id, title, body.get("recommended_action") or title, body.get("target") or "factory", "OPEN", body.get("owner_user_id") or "USER-1", "assigned", None, None, body.get("next_action_at"), body.get("business_deadline"), None, body.get("risk_level") or "medium", int(bool(body.get("urgent"))), 0, None, json.dumps(body.get("evidence") or [], ensure_ascii=False), timestamp, timestamp),
         )
         conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "order", order_id, "TASK_CREATED_FROM_UI", json.dumps({"task_id": task_id, **body}, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
+        conn.execute(
+            """UPDATE orders SET action_readiness='ACTION_GENERATED',
+               initialization_source=COALESCE(initialization_source,'MANUAL_TASK'),
+               initialized_at=COALESCE(initialized_at,?),last_dynamic_update_at=?,updated_at=? WHERE order_id=?""",
+            (timestamp, timestamp, timestamp, order_id),
+        )
         conn.commit()
     return {"status": "created", "task_id": task_id, "order_id": order_id}
 
@@ -1225,6 +1531,11 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
                 "UPDATE candidate_reviews SET candidate_json=?,status='CONFIRMED',reviewer_id=?,reviewed_at=? WHERE review_id=?",
                 (json.dumps(candidate, ensure_ascii=False), operator_id, timestamp, review_id),
             )
+            conn.execute(
+                """UPDATE orders SET action_readiness=?,initialization_source='MESSAGE_CONFIRMATION',
+                   initialized_at=COALESCE(initialized_at,?),last_dynamic_update_at=?,updated_at=? WHERE order_id=?""",
+                ("ACTION_GENERATED" if task_id else "READY_FOR_RANKING", timestamp, timestamp, timestamp, order_id),
+            )
             conn.commit()
         return {
             "status": "CONFIRMED", "review_id": review_id, "order_id": order_id, "task_id": task_id,
@@ -1274,6 +1585,11 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
             (new_id("EVT"), "order", order_id, "COZE_FT03_CONFIRMED_FROM_UI",
              json.dumps({"review_id": review_id, "task_id": task_id, "workflow_run_id": run.run_id}, ensure_ascii=False),
              operator_id, timestamp),
+        )
+        conn.execute(
+            """UPDATE orders SET action_readiness=?,initialization_source='MESSAGE_CONFIRMATION',
+               initialized_at=COALESCE(initialized_at,?),last_dynamic_update_at=?,updated_at=? WHERE order_id=?""",
+            ("ACTION_GENERATED" if task_id else "READY_FOR_RANKING", timestamp, timestamp, timestamp, order_id),
         )
         conn.commit()
     ranking = run_ft04_refresh("USER-1")
@@ -1383,7 +1699,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "5.1.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
+    return {"status": "ok", "version": "5.2.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
 
 
 @app.get("/api/system/storage")
@@ -1488,9 +1804,11 @@ def dashboard(
         "scheduled": sum(x["action_state"] == "SCHEDULED" for x in items),
         "escalate": sum(x["action_state"] == "ESCALATE" for x in items),
     }
+    with db() as conn:
+        activation = activation_snapshot(conn)
     return {
         "current_time": iso(current), "summary": summary, "items": items, "top_actions": top,
-        "ranking_source": "COZE_FT04" if rankings else "LOCAL_FALLBACK",
+        "ranking_source": "COZE_FT04" if rankings else "LOCAL_FALLBACK", "activation": activation,
     }
 
 

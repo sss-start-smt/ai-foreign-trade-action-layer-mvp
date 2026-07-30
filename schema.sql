@@ -11,6 +11,15 @@ CREATE TABLE IF NOT EXISTS orders (
     current_progress REAL,
     current_node TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE',
+    action_readiness TEXT NOT NULL DEFAULT 'BASE_ONLY',
+    contact_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    issue_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    initialization_waiting_on TEXT,
+    initialization_promised_reply_at TEXT,
+    initialization_note TEXT,
+    initialization_source TEXT,
+    initialized_at TEXT,
+    last_dynamic_update_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -109,6 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_waiting ON tasks(waiting_on, promised_reply_at);
 CREATE INDEX IF NOT EXISTS idx_risks_order ON risk_signals(order_id);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON event_logs(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date);
 
 
 CREATE TABLE IF NOT EXISTS candidate_reviews (

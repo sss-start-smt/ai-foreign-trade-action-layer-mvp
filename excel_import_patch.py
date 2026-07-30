@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-PATCH_VERSION = "3.1.0-excel-import"
+PATCH_VERSION = "3.2.0-excel-import-activation"
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_XLSX_UNCOMPRESSED = 20 * 1024 * 1024
 MAX_ROWS = 500
@@ -223,6 +223,22 @@ def _ensure_patch_schema(conn: sqlite3.Connection) -> None:
         if _resolve_column(existing, canonical) is None:
             conn.execute(f'ALTER TABLE orders ADD COLUMN "{canonical}" {sql_type}')
             existing.add(canonical)
+    activation_columns = {
+        "action_readiness": "TEXT NOT NULL DEFAULT 'BASE_ONLY'",
+        "contact_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+        "issue_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+        "initialization_waiting_on": "TEXT",
+        "initialization_promised_reply_at": "TEXT",
+        "initialization_note": "TEXT",
+        "initialization_source": "TEXT",
+        "initialized_at": "TEXT",
+        "last_dynamic_update_at": "TEXT",
+    }
+    for column, definition in activation_columns.items():
+        if column not in existing:
+            conn.execute(f'ALTER TABLE orders ADD COLUMN "{column}" {definition}')
+            existing.add(column)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date)")
     conn.commit()
 
 
@@ -546,11 +562,6 @@ def _required_db_fill(column: str, canonical: str | None, now: str) -> Any:
     defaults = {
         "status": "ACTIVE",
         "risk_level": "low",
-        "current_node": "资料确认",
-        "current_stage": "资料确认",
-        "stage": "资料确认",
-        "current_progress": 0,
-        "progress": 0,
         "owner": "待分配",
         "assignee": "待分配",
         "created_at": now,
@@ -581,12 +592,17 @@ def _insert_order(conn: sqlite3.Connection, normalized: dict[str, Any], column_m
         values_by_column.setdefault(column_map["status"], "ACTIVE")
     if "risk_level" in column_map:
         values_by_column.setdefault(column_map["risk_level"], "low")
-    if "current_node" in column_map:
-        values_by_column.setdefault(column_map["current_node"], "资料确认")
-    if "current_progress" in column_map:
-        values_by_column.setdefault(column_map["current_progress"], 0)
     if "owner" in column_map:
         values_by_column.setdefault(column_map["owner"], "待分配")
+    existing_columns = _column_names(conn, "orders")
+    if "action_readiness" in existing_columns:
+        values_by_column["action_readiness"] = "BASE_ONLY"
+    if "contact_status" in existing_columns:
+        values_by_column["contact_status"] = "UNKNOWN"
+    if "issue_status" in existing_columns:
+        values_by_column["issue_status"] = "UNKNOWN"
+    if "initialization_source" in existing_columns:
+        values_by_column["initialization_source"] = "EXCEL_BASE_IMPORT"
 
     canonical_by_column = {column: canonical for canonical, column in column_map.items()}
     for info in _columns(conn, "orders"):
@@ -749,15 +765,15 @@ def _csv_template() -> bytes:
 
 
 IMPORT_HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>订单批量导入</title><link rel="stylesheet" href="/api/import/assets/style.css"></head><body>
-<header><a class="back" href="/">← 返回工作台</a><div><h1>订单批量导入</h1><p>Excel/CSV → 字段映射 → 校验预览 → 人工确认 → 写入订单</p></div><span class="version">V3.1</span></header>
+<header><a class="back" href="/">← 返回工作台</a><div><h1>订单批量导入</h1><p>原始订单 → 字段映射 → 校验预览 → 建立订单底座 → 补充进展</p></div><span class="version">V3.2</span></header>
 <main>
 <section class="panel"><div class="step-title"><b>1</b><div><h2>上传订单文件</h2><p>支持 .xlsx 与 .csv，单次最多500行、5MB。旧版 .xls 请先另存为 .xlsx。</p></div></div><div class="upload-row"><label class="file-box"><input id="file" type="file" accept=".xlsx,.csv"><span id="file-name">选择文件或拖入文件</span></label><button id="preview-btn" class="primary">读取并预览</button></div><div class="template-links"><a href="/api/import/template.xlsx">下载Excel模板</a><a href="/api/import/template.csv">下载CSV模板</a></div></section>
 <section id="mapping-panel" class="panel hidden"><div class="step-title"><b>2</b><div><h2>确认字段映射</h2><p>系统自动匹配表头；未匹配或匹配错误的列可手动调整。</p></div></div><div id="mapping-grid" class="mapping-grid"></div><button id="repreview-btn" class="secondary">按当前映射重新校验</button></section>
-<section id="result-panel" class="panel hidden"><div class="step-title"><b>3</b><div><h2>校验结果</h2><p>错误行不会写入；更新已有订单时只展示发生变化的字段。</p></div></div><div id="summary" class="summary"></div><div class="toolbar"><label>筛选 <select id="status-filter"><option value="ALL">全部</option><option value="NEW">新增</option><option value="UPDATE">更新</option><option value="DUPLICATE">重复</option><option value="ERROR">错误</option></select></label><span id="schema-warning"></span></div><div class="table-wrap"><table><thead><tr><th>行</th><th>状态</th><th>订单号</th><th>客户</th><th>产品/SKU</th><th>数量</th><th>交期</th><th>问题/变化</th></tr></thead><tbody id="rows"></tbody></table></div><div class="commit-box"><label id="key-wrap" class="hidden">导入密钥<input id="import-key" type="password" autocomplete="off" placeholder="Render中的IMPORT_ADMIN_KEY"></label><button id="commit-btn" class="primary">确认导入有效数据</button><p>导入会新增订单或更新已确认的变化；重复和错误行自动跳过。原文件不会被修改。</p></div></section>
+<section id="result-panel" class="panel hidden"><div class="step-title"><b>3</b><div><h2>校验结果</h2><p>错误行不会写入；更新已有订单时只展示发生变化的字段。</p></div></div><div id="summary" class="summary"></div><div class="toolbar"><label>筛选 <select id="status-filter"><option value="ALL">全部</option><option value="NEW">新增</option><option value="UPDATE">更新</option><option value="DUPLICATE">重复</option><option value="ERROR">错误</option></select></label><span id="schema-warning"></span></div><div class="table-wrap"><table><thead><tr><th>行</th><th>状态</th><th>订单号</th><th>客户</th><th>产品/SKU</th><th>数量</th><th>交期</th><th>问题/变化</th></tr></thead><tbody id="rows"></tbody></table></div><div class="commit-box"><label id="key-wrap" class="hidden">导入密钥<input id="import-key" type="password" autocomplete="off" placeholder="Render中的IMPORT_ADMIN_KEY"></label><button id="commit-btn" class="primary">确认导入有效数据</button><p>导入只建立或更新订单基础档案，不会根据原始订单虚构风险或自动生成行动。重复和错误行自动跳过。</p></div></section>
 <section id="commit-result" class="panel hidden"></section>
 </main><div id="toast"></div><script src="/api/import/assets/app.js"></script></body></html>'''
 
-IMPORT_CSS = r''':root{font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;color:#17201d;background:#f4f4f3}*{box-sizing:border-box}body{margin:0}header{height:88px;background:#fff;border-bottom:1px solid #dde2dc;display:flex;align-items:center;gap:22px;padding:0 5vw;position:sticky;top:0;z-index:5}header h1{font-size:22px;margin:0 0 4px}header p{margin:0;color:#68736e;font-size:13px}.back{color:#092923;text-decoration:none;font-weight:600}.version{margin-left:auto;background:#e8eee9;color:#092923;padding:6px 10px;border-radius:999px;font-size:12px}main{max-width:1180px;margin:28px auto;padding:0 20px 80px}.panel{background:#fff;border:1px solid #dde2dc;border-radius:16px;padding:24px;margin-bottom:18px;box-shadow:0 8px 24px rgba(29,55,105,.05)}.hidden{display:none!important}.step-title{display:flex;gap:14px;align-items:flex-start}.step-title>b{width:32px;height:32px;display:grid;place-items:center;border-radius:10px;background:#092923;color:#fff}.step-title h2{margin:1px 0 5px;font-size:18px}.step-title p{margin:0;color:#68736e;font-size:13px}.upload-row{display:flex;gap:12px;margin-top:20px}.file-box{flex:1;border:1px dashed #b8c0b9;background:#fafaf8;border-radius:12px;height:54px;display:flex;align-items:center;padding:0 16px;color:#3f4d44;cursor:pointer}.file-box input{display:none}button{border:0;border-radius:10px;padding:12px 18px;font-weight:700;cursor:pointer}.primary{background:#092923;color:#fff}.primary:disabled{opacity:.5;cursor:not-allowed}.secondary{background:#e8eee9;color:#3f4d44}.template-links{display:flex;gap:16px;margin-top:12px}.template-links a{font-size:13px;color:#092923}.mapping-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:20px 0}.mapping-item{border:1px solid #dde2dc;border-radius:10px;padding:11px}.mapping-item label{font-size:12px;color:#68736e;display:block;margin-bottom:6px}.mapping-item select{width:100%;border:1px solid #cfd6cf;border-radius:8px;padding:9px;background:#fff}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:20px 0}.summary-card{border:1px solid #dde2dc;border-radius:12px;padding:14px}.summary-card span{display:block;color:#68736e;font-size:12px}.summary-card strong{display:block;font-size:24px;margin-top:5px}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;color:#68736e;font-size:13px}.toolbar select{padding:7px 10px;border:1px solid #cfd6cf;border-radius:8px}.table-wrap{overflow:auto;border:1px solid #dde2dc;border-radius:12px}table{width:100%;border-collapse:collapse;min-width:980px}th,td{text-align:left;padding:12px;border-bottom:1px solid #e9ece8;font-size:13px;vertical-align:top}th{background:#fafaf8;color:#3f4d44}.badge{display:inline-flex;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700}.NEW{background:#e9f3ed;color:#216844}.UPDATE{background:#f5ecdf;color:#8b5b2f}.DUPLICATE{background:#ecefea;color:#68736e}.ERROR{background:#f7e8e6;color:#9c3d36}.detail{max-width:340px;color:#68736e}.detail div{margin-bottom:4px}.commit-box{display:flex;align-items:end;gap:14px;margin-top:18px;flex-wrap:wrap}.commit-box label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#68736e}.commit-box input{width:280px;padding:10px;border:1px solid #cfd6cf;border-radius:8px}.commit-box p{width:100%;margin:0;color:#7a849a;font-size:12px}#commit-result h2{margin-top:0}.result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.result-grid div{background:#fafaf8;border-radius:12px;padding:16px}.result-grid strong{display:block;font-size:24px}#toast{position:fixed;right:24px;bottom:24px;background:#17201d;color:#fff;padding:12px 16px;border-radius:10px;opacity:0;transform:translateY(10px);transition:.2s;pointer-events:none}#toast.show{opacity:1;transform:none}@media(max-width:800px){header{height:auto;padding:16px 18px;flex-wrap:wrap}.version{margin-left:0}.mapping-grid{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.upload-row{flex-direction:column}.result-grid{grid-template-columns:repeat(2,1fr)}}'''
+IMPORT_CSS = r''':root{font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;color:#17201d;background:#f4f4f3}*{box-sizing:border-box}body{margin:0}header{height:88px;background:#fff;border-bottom:1px solid #dde2dc;display:flex;align-items:center;gap:22px;padding:0 5vw;position:sticky;top:0;z-index:5}header h1{font-size:22px;margin:0 0 4px}header p{margin:0;color:#68736e;font-size:13px}.back{color:#092923;text-decoration:none;font-weight:600}.version{margin-left:auto;background:#e8eee9;color:#092923;padding:6px 10px;border-radius:999px;font-size:12px}main{max-width:1180px;margin:28px auto;padding:0 20px 80px}.panel{background:#fff;border:1px solid #dde2dc;border-radius:16px;padding:24px;margin-bottom:18px;box-shadow:0 8px 24px rgba(29,55,105,.05)}.hidden{display:none!important}.step-title{display:flex;gap:14px;align-items:flex-start}.step-title>b{width:32px;height:32px;display:grid;place-items:center;border-radius:10px;background:#092923;color:#fff}.step-title h2{margin:1px 0 5px;font-size:18px}.step-title p{margin:0;color:#68736e;font-size:13px}.upload-row{display:flex;gap:12px;margin-top:20px}.file-box{flex:1;border:1px dashed #b8c0b9;background:#fafaf8;border-radius:12px;height:54px;display:flex;align-items:center;padding:0 16px;color:#3f4d44;cursor:pointer}.file-box input{display:none}button{border:0;border-radius:10px;padding:12px 18px;font-weight:700;cursor:pointer}.primary{background:#092923;color:#fff}.primary:disabled{opacity:.5;cursor:not-allowed}.secondary{background:#e8eee9;color:#3f4d44}.template-links{display:flex;gap:16px;margin-top:12px}.template-links a{font-size:13px;color:#092923}.mapping-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:20px 0}.mapping-item{border:1px solid #dde2dc;border-radius:10px;padding:11px}.mapping-item label{font-size:12px;color:#68736e;display:block;margin-bottom:6px}.mapping-item select{width:100%;border:1px solid #cfd6cf;border-radius:8px;padding:9px;background:#fff}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:20px 0}.summary-card{border:1px solid #dde2dc;border-radius:12px;padding:14px}.summary-card span{display:block;color:#68736e;font-size:12px}.summary-card strong{display:block;font-size:24px;margin-top:5px}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;color:#68736e;font-size:13px}.toolbar select{padding:7px 10px;border:1px solid #cfd6cf;border-radius:8px}.table-wrap{overflow:auto;border:1px solid #dde2dc;border-radius:12px}table{width:100%;border-collapse:collapse;min-width:980px}th,td{text-align:left;padding:12px;border-bottom:1px solid #e9ece8;font-size:13px;vertical-align:top}th{background:#fafaf8;color:#3f4d44}.badge{display:inline-flex;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700}.NEW{background:#e9f3ed;color:#216844}.UPDATE{background:#f5ecdf;color:#8b5b2f}.DUPLICATE{background:#ecefea;color:#68736e}.ERROR{background:#f7e8e6;color:#9c3d36}.detail{max-width:340px;color:#68736e}.detail div{margin-bottom:4px}.commit-box{display:flex;align-items:end;gap:14px;margin-top:18px;flex-wrap:wrap}.commit-box label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#68736e}.commit-box input{width:280px;padding:10px;border:1px solid #cfd6cf;border-radius:8px}.commit-box p{width:100%;margin:0;color:#7a849a;font-size:12px}#commit-result h2{margin-top:0}.result-note{margin:18px 0;padding:16px;border:1px solid #d4e0d7;border-radius:12px;background:#f0f6f2;color:#24463e;line-height:1.7}.result-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.result-actions a{display:inline-flex;align-items:center;justify-content:center;border-radius:10px;padding:12px 18px;font-weight:700;text-decoration:none}.result-actions .primary-link{background:#092923;color:#fff}.result-actions .secondary-link{background:#e8eee9;color:#3f4d44}.result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.result-grid div{background:#fafaf8;border-radius:12px;padding:16px}.result-grid strong{display:block;font-size:24px}#toast{position:fixed;right:24px;bottom:24px;background:#17201d;color:#fff;padding:12px 16px;border-radius:10px;opacity:0;transform:translateY(10px);transition:.2s;pointer-events:none}#toast.show{opacity:1;transform:none}@media(max-width:800px){header{height:auto;padding:16px 18px;flex-wrap:wrap}.version{margin-left:0}.mapping-grid{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.upload-row{flex-direction:column}.result-grid{grid-template-columns:repeat(2,1fr)}}'''
 
 IMPORT_JS = r'''let state={file:null,contentBase64:null,headers:[],mapping:{},rows:[],batchId:null,authRequired:false};
 const $=s=>document.querySelector(s);const toast=m=>{const el=$("#toast");el.textContent=m;el.classList.add("show");setTimeout(()=>el.classList.remove("show"),2500)};
@@ -769,7 +785,7 @@ function renderSummary(summary){const labels={total:"总行数",new:"可新增",
 function rowDetail(r){const problems=(r.issues||[]).map(i=>`<div>⚠ ${escapeHtml(i.message)}</div>`);const changes=(r.changes||[]).map(c=>`<div>${escapeHtml(c.label)}：${escapeHtml(String(c.old_value??"空"))} → ${escapeHtml(String(c.new_value??"空"))}</div>`);return [...problems,...changes].join("")||"—"}
 function renderRows(){const filter=$("#status-filter").value;const rows=state.rows.filter(r=>filter==="ALL"||r.classification===filter);$("#rows").innerHTML=rows.map(r=>`<tr><td>${r.row_number}</td><td><span class="badge ${r.classification}">${r.classification}</span></td><td>${escapeHtml(r.normalized.order_no||"")}</td><td>${escapeHtml(r.normalized.customer_name||"")}</td><td>${escapeHtml(r.normalized.sku||r.normalized.product_name||"")}</td><td>${escapeHtml(String(r.normalized.quantity??""))} ${escapeHtml(r.normalized.unit||"")}</td><td>${escapeHtml(r.normalized.customer_delivery_date||"")}</td><td class="detail">${rowDetail(r)}</td></tr>`).join("")}
 async function preview(useCurrentMapping=false){try{$("#preview-btn").disabled=true;if(!state.file)await loadFile($("#file").files[0]);const payload={filename:state.file.name,content_base64:state.contentBase64,mapping:useCurrentMapping?state.mapping:null};const res=await fetch("/api/import/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)throw new Error(data.detail||"预览失败");window.__fields=data.fields;state.headers=data.headers;state.mapping=data.mapping;state.rows=data.rows;state.batchId=data.batch_id;state.authRequired=data.auth_required;renderMapping();renderSummary(data.summary);renderRows();$("#result-panel").classList.remove("hidden");$("#key-wrap").classList.toggle("hidden",!data.auth_required);$("#schema-warning").textContent=data.schema_notes?.join("；")||"";toast("校验完成");}catch(e){toast(e.message)}finally{$("#preview-btn").disabled=false}}
-async function commit(){if(!state.batchId)return;try{$("#commit-btn").disabled=true;const res=await fetch("/api/import/commit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({batch_id:state.batchId,import_key:$("#import-key").value||null,row_actions:{}})});const data=await res.json();if(!res.ok)throw new Error(data.detail||"导入失败");$("#commit-result").classList.remove("hidden");$("#commit-result").innerHTML=`<h2>导入完成</h2><div class="result-grid"><div><span>新增</span><strong>${data.inserted}</strong></div><div><span>更新</span><strong>${data.updated}</strong></div><div><span>跳过</span><strong>${data.skipped}</strong></div><div><span>失败</span><strong>${data.failed}</strong></div></div><p>已创建/更新订单，并尽可能生成“核对导入资料”的待确认任务。请返回订单中心查看结果。</p><a class="back" href="/">返回工作台</a>`;toast("导入成功");window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});}catch(e){toast(e.message)}finally{$("#commit-btn").disabled=false}}
+async function commit(){if(!state.batchId)return;try{$("#commit-btn").disabled=true;const res=await fetch("/api/import/commit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({batch_id:state.batchId,import_key:$("#import-key").value||null,row_actions:{}})});const data=await res.json();if(!res.ok)throw new Error(data.detail||"导入失败");$("#commit-result").classList.remove("hidden");$("#commit-result").innerHTML=`<h2>订单底座已建立</h2><div class="result-grid"><div><span>新增基础订单</span><strong>${data.inserted}</strong></div><div><span>更新订单</span><strong>${data.updated}</strong></div><div><span>跳过</span><strong>${data.skipped}</strong></div><div><span>失败</span><strong>${data.failed}</strong></div></div><div class="result-note"><strong>下一步不是直接查看风险。</strong><br>原始客户订单通常只有订单号、客户、数量和正式交期，缺少当前进度、最近沟通和等待状态。请先选择活跃订单补充最新进展，系统才能生成首条行动和跨订单排序。</div><div class="result-actions"><a class="primary-link" href="/#activation">开始初始化活跃订单</a><a class="secondary-link" href="/#orders">查看订单中心</a></div>`;toast("导入成功");window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});}catch(e){toast(e.message)}finally{$("#commit-btn").disabled=false}}
 function escapeHtml(v){return String(v).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]))}function escapeAttr(v){return escapeHtml(v)}
 $("#file").addEventListener("change",async e=>{try{await loadFile(e.target.files[0]);$("#file-name").textContent=state.file.name}catch(err){toast(err.message)}});$("#preview-btn").addEventListener("click",()=>preview(false));$("#repreview-btn").addEventListener("click",()=>preview(true));$("#status-filter").addEventListener("change",renderRows);$("#commit-btn").addEventListener("click",commit);'''
 
@@ -902,10 +918,6 @@ def register_excel_import_patch(app: FastAPI) -> None:
         schema_notes = []
         if "order_id" not in order_columns:
             schema_notes.append("orders表未识别到order_id，新增订单会使用现有主键规则尝试写入")
-        with _connect() as note_conn:
-            has_tasks = _table_exists(note_conn, "tasks")
-        if not has_tasks:
-            schema_notes.append("当前数据库没有tasks表，导入后不会自动创建待确认任务")
         return {
             "patch_version": PATCH_VERSION,
             "batch_id": batch_id,
@@ -933,7 +945,8 @@ def register_excel_import_patch(app: FastAPI) -> None:
             column_map = _map_order_columns(conn)
             order_no_column = column_map.get("order_no")
             order_id_column = column_map.get("order_id")
-            inserted = updated = skipped = failed = task_created = 0
+            inserted = updated = skipped = failed = 0
+            imported_order_ids: list[str] = []
             failures: list[dict[str, Any]] = []
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -951,9 +964,8 @@ def register_excel_import_patch(app: FastAPI) -> None:
                         if classification == "NEW":
                             order_id = _insert_order(conn, normalized, column_map, payload.batch_id)
                             inserted += 1
-                            created_task = _insert_import_task(conn, order_id, normalized.get("order_no") or "", False)
-                            task_created += int(created_task)
-                            _append_event(conn, order_id, "ORDER_IMPORTED", {"batch_id": payload.batch_id, "source": "excel_csv", "normalized": normalized})
+                            imported_order_ids.append(order_id)
+                            _append_event(conn, order_id, "ORDER_IMPORTED_BASE_ONLY", {"batch_id": payload.batch_id, "source": "excel_csv", "normalized": normalized, "action_readiness": "BASE_ONLY"})
                         elif classification == "UPDATE":
                             order_id = row["existing_order_id"]
                             if not order_id and order_no_column and order_id_column:
@@ -963,8 +975,7 @@ def register_excel_import_patch(app: FastAPI) -> None:
                                 raise ValueError("找不到已有订单的系统ID")
                             _update_order(conn, order_id, changes, column_map)
                             updated += 1
-                            created_task = _insert_import_task(conn, order_id, normalized.get("order_no") or "", True)
-                            task_created += int(created_task)
+                            imported_order_ids.append(order_id)
                             _append_event(conn, order_id, "ORDER_IMPORT_UPDATED", {"batch_id": payload.batch_id, "changes": changes})
                         else:
                             skipped += 1
@@ -979,10 +990,13 @@ def register_excel_import_patch(app: FastAPI) -> None:
                     "updated": updated,
                     "skipped": skipped,
                     "failed": failed,
-                    "tasks_created": task_created,
+                    "tasks_created": 0,
+                    "base_orders_created": inserted,
+                    "imported_order_ids": imported_order_ids,
                     "failures": failures,
-                    "ranking_refresh_required": True,
-                    "ranking_refresh_note": "导入后请刷新今日行动；若已配置FT04，现有任务变化会进入下一次重排。",
+                    "ranking_refresh_required": False,
+                    "ranking_refresh_note": "原始订单只建立事实底座；补充当前进展或最近沟通后，系统才会生成行动并进入排序。",
+                    "next_step_url": "/#activation",
                 }
                 conn.execute(
                     "UPDATE order_import_batches SET status='COMMITTED',summary_json=?,committed_at=? WHERE batch_id=?",
