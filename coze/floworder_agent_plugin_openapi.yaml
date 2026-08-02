@@ -1,0 +1,218 @@
+openapi: 3.0.3
+info:
+  title: FlowOrder Agent Tools
+  version: 1.0.0
+  description: >-
+    FlowOrder订单异常诊断Agent的受控工具集。读取工具只返回当前用户权限范围内的订单；
+    诊断工具只生成异常候选；正式任务、订单修改、联系记录和高风险决定必须创建审批请求。
+servers:
+  - url: https://ai-ft-action-layer-mvp.onrender.com
+security:
+  - FlowOrderAgentKey: []
+components:
+  securitySchemes:
+    FlowOrderAgentKey:
+      type: apiKey
+      in: header
+      name: X-FlowOrder-Agent-Key
+  schemas:
+    ActorContext:
+      type: object
+      required: [current_user_id]
+      properties:
+        organization_id:
+          type: string
+          default: ORG-DEMO
+        current_user_id:
+          type: string
+          description: 当前FlowOrder用户ID，例如USER-1或MANAGER-1。
+        current_role:
+          type: string
+          enum: [operator, manager]
+          default: operator
+        allowed_owner_ids:
+          type: array
+          items: {type: string}
+          description: 可选的额外授权负责人ID；普通用户默认仅允许本人。
+        run_id:
+          type: string
+          description: start_agent_run返回的运行ID，用于审计工具轨迹。
+    StartRunRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [goal]
+          properties:
+            goal: {type: string}
+            trigger_type:
+              type: string
+              enum: [USER, SCHEDULED, WEBSITE]
+              default: USER
+    CandidateOrdersRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          properties:
+            due_within_days: {type: integer, minimum: 1, maximum: 90, default: 14}
+            limit: {type: integer, minimum: 1, maximum: 200, default: 50}
+            current_time: {type: string, format: date-time}
+    OrderContextRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [order_id]
+          properties:
+            order_id: {type: string}
+            event_limit: {type: integer, minimum: 1, maximum: 100, default: 20}
+    BuildAnomalyRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [order_id]
+          properties:
+            order_id: {type: string}
+            anomaly_types:
+              type: array
+              items:
+                type: string
+                enum: [SUPPLIER_COMMITMENT_OVERDUE, CUSTOMER_CONFIRMATION_BLOCKING, DELIVERY_RISK, LOGISTICS_EXCEPTION, INFORMATION_GAP]
+            current_time: {type: string, format: date-time}
+    RankAnomaliesRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [items]
+          properties:
+            top_n: {type: integer, minimum: 1, maximum: 20, default: 7}
+            items:
+              type: array
+              items: {type: object, additionalProperties: true}
+    TaskDraftRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [order_id, title]
+          properties:
+            order_id: {type: string}
+            title: {type: string}
+            recommended_action: {type: string}
+            target: {type: string, enum: [customer, factory, supplier, internal, manager]}
+            owner_user_id: {type: string}
+            risk_level: {type: string, enum: [low, medium, high, critical]}
+            business_deadline: {type: string, format: date-time}
+            evidence: {type: array, items: {type: string}}
+    MessageDraftRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [order_id, recipient_role]
+          properties:
+            order_id: {type: string}
+            recipient_role: {type: string, enum: [customer, supplier, factory, internal]}
+            questions_to_ask: {type: array, items: {type: string}}
+            user_instruction: {type: string}
+    ApprovalRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [action_type, idempotency_key]
+          properties:
+            order_id: {type: string}
+            candidate_id: {type: string}
+            action_type:
+              type: string
+              enum: [CONFIRM_ANOMALY, CREATE_TASK, RECORD_CONTACT, UPDATE_ORDER, SEND_MESSAGE, ACCEPT_DELAY, HIGH_RISK_OVERRIDE]
+            action_payload: {type: object, additionalProperties: true}
+            idempotency_key: {type: string}
+            high_risk: {type: boolean, default: false}
+    ApprovalStatusRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [approval_id]
+          properties:
+            approval_id: {type: string}
+    CompleteRunRequest:
+      allOf:
+        - $ref: '#/components/schemas/ActorContext'
+        - type: object
+          required: [run_id]
+          properties:
+            status: {type: string, enum: [COMPLETED, PARTIAL, FAILED], default: COMPLETED}
+            stop_reason: {type: string}
+            result: {type: object, additionalProperties: true}
+paths:
+  /api/agent/tools/runs/start:
+    post:
+      operationId: start_agent_run
+      summary: 开始一次Agent诊断运行
+      description: 每次新的用户诊断或定时巡检首先调用一次，获得run_id。单次最多8次工具调用、最长60秒。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/StartRunRequest'}}}}
+      responses: {'200': {description: 运行已建立, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/candidate-orders/list:
+    post:
+      operationId: list_candidate_orders
+      summary: 筛选需要深入诊断的候选订单
+      description: >-
+        先调用本工具做确定性粗筛。默认返回当前用户负责、未来14天交期的活跃订单；等待超时、
+        高风险开放任务、待确认事项、24小时内高风险消息和物流异常会越过交期窗口。不要无差别读取所有订单。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CandidateOrdersRequest'}}}}
+      responses: {'200': {description: 候选订单, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/orders/context:
+    post:
+      operationId: get_order_diagnostic_context
+      summary: 获取一笔订单的完整诊断上下文
+      description: 返回订单快照、最近消息、开放任务、承诺、前后置依赖、物流事件和开放风险。只有筛选后的订单或用户明确指定的订单才调用。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/OrderContextRequest'}}}}
+      responses: {'200': {description: 诊断上下文, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/anomalies/build:
+    post:
+      operationId: build_anomaly_candidate
+      summary: 基于确定性规则生成异常候选
+      description: >-
+        对单笔订单生成带证据、缺失信息、严重度和建议动作的异常候选。结果不是正式业务异常，
+        不允许Agent把ANOMALY_CANDIDATE表述为“已经确认”。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BuildAnomalyRequest'}}}}
+      responses: {'200': {description: 异常候选, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/anomalies/rank:
+    post:
+      operationId: rank_anomaly_candidates
+      summary: 对异常候选做跨订单Top 7排序
+      description: 只对已经有证据的候选排序；不足7笔时不得凑数。排序后仍需人工确认。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RankAnomaliesRequest'}}}}
+      responses: {'200': {description: 排序结果, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/task-drafts/create:
+    post:
+      operationId: create_task_draft
+      summary: 生成任务草稿
+      description: 仅生成DRAFT，不创建正式任务。需要创建正式任务时继续调用create_approval_request。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TaskDraftRequest'}}}}
+      responses: {'200': {description: 任务草稿, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/message-drafts/create:
+    post:
+      operationId: draft_message
+      summary: 生成受控沟通草稿
+      description: 只生成待人工审核草稿，不自动发送。不得承诺交期、费用、赔偿或责任。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MessageDraftRequest'}}}}
+      responses: {'200': {description: 沟通草稿, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/approvals/create:
+    post:
+      operationId: create_approval_request
+      summary: 为正式业务动作创建人工审批
+      description: 所有正式写入和高风险动作都通过本工具创建审批。调用后停止执行并告诉用户等待人工审批。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApprovalRequest'}}}}
+      responses: {'200': {description: 审批请求, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/approvals/status:
+    post:
+      operationId: get_approval_status
+      summary: 查询人工审批状态
+      description: 只在用户询问审批进度或继续先前任务时调用；PENDING时不得假设已执行。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApprovalStatusRequest'}}}}
+      responses: {'200': {description: 审批状态, content: {application/json: {schema: {type: object}}}}}
+  /api/agent/tools/runs/complete:
+    post:
+      operationId: complete_agent_run
+      summary: 完成Agent运行并记录停止原因
+      description: 输出最终诊断前调用。stop_reason应说明正常完成、证据不足、有效等待、需要审批、工具失败或达到预算。
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CompleteRunRequest'}}}}
+      responses: {'200': {description: 运行已完成, content: {application/json: {schema: {type: object}}}}}

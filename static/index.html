@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#092923" />
   <meta name="color-scheme" content="light" />
   <title>AI外贸跟单行动系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=5.2.0" />
+  <link rel="stylesheet" href="/static/styles.css?v=6.0.0" />
 </head>
 <body>
   <div class="app-shell">
@@ -19,10 +19,11 @@
       <div class="nav-section-label">工作空间</div>
       <nav class="side-nav" aria-label="主导航">
         <button class="nav-item" data-route="today" data-icon="today"><span>今日行动</span><b id="todayBadge" hidden>0</b></button>
+        <button class="nav-item" data-route="agent" data-icon="agent"><span>异常诊断</span><b id="agentBadge" hidden>0</b></button>
         <button class="nav-item" data-route="tasks" data-icon="tasks"><span>全部任务</span></button>
         <button class="nav-item" data-route="orders" data-icon="orders"><span>订单中心</span></button>
         <button class="nav-item" data-route="intake" data-icon="message"><span>消息接入</span></button>
-        <button class="nav-item" data-route="confirm" data-icon="review"><span>AI确认</span><b id="reviewBadge" hidden>0</b></button>
+        <button class="nav-item" data-route="confirm" data-icon="review"><span>人工确认</span><b id="reviewBadge" hidden>0</b></button>
       </nav>
 
       <div class="nav-section-label">管理</div>
@@ -33,7 +34,7 @@
 
       <div class="sidebar-card">
         <span class="live-dot" id="sidebarLiveDot"></span>
-        <div><strong id="sidebarStatus">服务连接中</strong><small id="sidebarStatusDetail">正在检查工作流</small></div>
+        <div><strong id="sidebarStatus">服务连接中</strong><small id="sidebarStatusDetail">正在检查自动化连接</small></div>
       </div>
     </aside>
 
@@ -93,6 +94,6 @@
   </dialog>
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
-  <script src="/static/app.js?v=5.2.0"></script>
+  <script src="/static/app.js?v=6.0.0"></script>
 </body>
 </html>

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS orders (
     current_progress REAL,
     current_node TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE',
+    owner TEXT,
     action_readiness TEXT NOT NULL DEFAULT 'BASE_ONLY',
     contact_status TEXT NOT NULL DEFAULT 'UNKNOWN',
     issue_status TEXT NOT NULL DEFAULT 'UNKNOWN',
@@ -115,6 +116,7 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_order ON tasks(related_order_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_waiting ON tasks(waiting_on, promised_reply_at);
 CREATE INDEX IF NOT EXISTS idx_risks_order ON risk_signals(order_id);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON event_logs(entity_type, entity_id);
@@ -199,3 +201,133 @@ CREATE TABLE IF NOT EXISTS intake_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_intake_jobs_status_time ON intake_jobs(status, created_at);
+
+-- FlowOrder Agent V6.0 tables
+CREATE TABLE IF NOT EXISTS order_dependencies (
+    dependency_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    dependency_type TEXT NOT NULL,
+    dependency_name TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    blocking_party TEXT,
+    due_at TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS logistics_events (
+    logistics_event_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    location TEXT,
+    description TEXT,
+    event_time TEXT,
+    estimated_arrival_at TEXT,
+    source TEXT NOT NULL DEFAULT 'SYNTHETIC_OR_MANUAL',
+    resolved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL DEFAULT 'ORG-DEMO',
+    current_user_id TEXT NOT NULL,
+    current_role TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    trigger_type TEXT NOT NULL DEFAULT 'USER',
+    status TEXT NOT NULL,
+    max_tool_calls INTEGER NOT NULL DEFAULT 8,
+    max_duration_seconds INTEGER NOT NULL DEFAULT 60,
+    result_json TEXT,
+    stop_reason TEXT,
+    duration_ms INTEGER,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_tool_calls (
+    call_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    tool_name TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    response_json TEXT,
+    status TEXT NOT NULL,
+    error_code TEXT,
+    error_message TEXT,
+    duration_ms INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS anomaly_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    order_id TEXT NOT NULL,
+    anomaly_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    score REAL NOT NULL DEFAULT 0,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    missing_information_json TEXT NOT NULL DEFAULT '[]',
+    recommended_action TEXT,
+    status TEXT NOT NULL DEFAULT 'ANOMALY_CANDIDATE',
+    created_by TEXT,
+    confirmed_by TEXT,
+    confirmed_at TEXT,
+    resolution_note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id),
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    approval_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    candidate_id TEXT,
+    order_id TEXT,
+    action_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    requested_by TEXT NOT NULL,
+    required_role TEXT NOT NULL DEFAULT 'operator_or_manager',
+    idempotency_key TEXT UNIQUE NOT NULL,
+    decided_by TEXT,
+    decision_note TEXT,
+    decided_at TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id),
+    FOREIGN KEY(candidate_id) REFERENCES anomaly_candidates(candidate_id),
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_inspection_reports (
+    report_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    organization_id TEXT NOT NULL DEFAULT 'ORG-DEMO',
+    current_user_id TEXT NOT NULL,
+    inspection_date TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    scope_json TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dependencies_order_status ON order_dependencies(order_id,status);
+CREATE INDEX IF NOT EXISTS idx_logistics_order_status ON logistics_events(order_id,status,event_time);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_user_time ON agent_runs(current_user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_calls_run_time ON agent_tool_calls(run_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_anomalies_order_status ON anomaly_candidates(order_id,status,severity);
+CREATE INDEX IF NOT EXISTS idx_approvals_status_role ON approval_requests(status,required_role,created_at);
+CREATE INDEX IF NOT EXISTS idx_reports_user_date ON daily_inspection_reports(current_user_id,inspection_date DESC);

@@ -1788,6 +1788,19 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
             open_tasks = payload.existing_open_tasks
             if open_tasks is None:
                 open_tasks = _list_tasks(conn, selected_order, open_only=True) if selected_order else _list_tasks(conn, None, open_only=True)
+            # FT05只需要用于去重和判断行动的最小任务上下文，避免把整张任务表送入模型。
+            compact_tasks = []
+            for task in (open_tasks or [])[:20]:
+                compact_tasks.append({
+                    key: task.get(key)
+                    for key in (
+                        "task_id", "title", "status", "task_type", "action_target",
+                        "due_at", "next_action_at", "waiting_for", "promised_reply_at",
+                        "related_order_no", "source_message_id"
+                    )
+                    if task.get(key) not in (None, "")
+                })
+            open_tasks = compact_tasks
 
         parameters = {
             "communication_text": payload.communication_text,
@@ -1861,6 +1874,27 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
             fact_catalog = payload.fact_catalog if payload.fact_catalog is not None else _fact_catalog_from_order(order)
             task_context = payload.task_context if payload.task_context is not None else _task_context_from_tasks(tasks)
             history = payload.communication_history if payload.communication_history is not None else _list_messages(conn, order)
+
+            # FT06按草稿类型只保留最小必要上下文。事实目录保留已确认事实，
+            # 开放任务与沟通历史限制条数，降低Token和等待时间。
+            fact_catalog = [
+                fact for fact in (fact_catalog or [])
+                if not isinstance(fact, dict) or fact.get("confirmed", True) is not False
+            ][:40]
+            task_context = [
+                {key: task.get(key) for key in (
+                    "task_id", "title", "status", "task_type", "action_target",
+                    "due_at", "waiting_for", "promised_reply_at", "risk_level"
+                ) if task.get(key) not in (None, "")}
+                for task in (task_context or [])[:10]
+            ]
+            history = [
+                {key: message.get(key) for key in (
+                    "message_id", "sender_role", "channel", "raw_content",
+                    "received_at", "created_at"
+                ) if message.get(key) not in (None, "")}
+                for message in (history or [])[-8:]
+            ]
 
         parameters = {
             "draft_type": payload.draft_type,

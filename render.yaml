@@ -40,6 +40,16 @@ services:
         sync: false
       - key: COZE_FT06_WORKFLOW_ID
         sync: false
+      - key: FLOWORDER_AGENT_API_KEY
+        sync: false
+      - key: FLOWORDER_CRON_API_KEY
+        sync: false
+      - key: COZE_AGENT_BOT_ID
+        sync: false
+      - key: COZE_API_BASE
+        value: https://api.coze.cn
+      - key: ALLOW_INSECURE_AGENT_TOOLS
+        value: "false"
     disk:
       name: action-layer-data
       mountPath: /var/data

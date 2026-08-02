@@ -12,6 +12,8 @@ import re
 
 from communication_workflows_patch import register_communication_workflows_patch
 from excel_import_patch import register_excel_import_patch
+import agent_api
+from agent_api import register_agent_api
 
 from coze_integration import (
     CozeWorkflowError,
@@ -32,10 +34,11 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="5.2.0")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.0.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
+register_agent_api(app)
 
 
 def storage_status() -> dict[str, Any]:
@@ -100,6 +103,7 @@ def db():
 
 
 ACTIVATION_COLUMNS: dict[str, str] = {
+    "owner": "TEXT",
     "action_readiness": "TEXT NOT NULL DEFAULT 'BASE_ONLY'",
     "contact_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
     "issue_status": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
@@ -121,6 +125,7 @@ def ensure_activation_schema(conn: sqlite3.Connection) -> None:
         if name not in columns:
             conn.execute(f'ALTER TABLE orders ADD COLUMN "{name}" {definition}')
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner)")
     # Existing orders that already have open tasks are not first-use base records.
     conn.execute(
         """UPDATE orders SET action_readiness='ACTION_GENERATED',
@@ -129,10 +134,27 @@ def ensure_activation_schema(conn: sqlite3.Connection) -> None:
            last_dynamic_update_at=COALESCE(last_dynamic_update_at,updated_at)
            WHERE EXISTS(SELECT 1 FROM tasks WHERE tasks.related_order_id=orders.order_id AND tasks.status!='DONE')"""
     )
+    # Normalize legacy owner names so role-based views remain stable after upgrade.
+    if "owner" in columns:
+        for owner_name, owner_id in (("李梅", "USER-1"), ("王晓", "USER-2"), ("陈琳", "USER-3"), ("周主管", "MANAGER-1")):
+            conn.execute("UPDATE orders SET owner=? WHERE TRIM(COALESCE(owner,''))=?", (owner_id, owner_name))
+        # V5.2 and earlier allowed every imported order to remain unassigned. If an
+        # upgraded database has no assigned order at all, preserve the old default
+        # workspace by binding those legacy records to USER-1 once. Mixed databases
+        # keep their unassigned records for the manager to allocate explicitly.
+        total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        assigned_orders = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE TRIM(COALESCE(owner,'')) NOT IN ('','待分配','未分配','-','—')"
+        ).fetchone()[0]
+        if total_orders and not assigned_orders:
+            conn.execute(
+                "UPDATE orders SET owner='USER-1' WHERE TRIM(COALESCE(owner,'')) IN ('','待分配','未分配','-','—')"
+            )
     conn.commit()
 
 
 def init_db() -> None:
+    agent_api.DB_PATH = DB_PATH
     with db() as conn:
         conn.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
         ensure_activation_schema(conn)
@@ -143,6 +165,7 @@ def init_db() -> None:
 
 def reset_demo_data(conn: sqlite3.Connection) -> None:
     for table in [
+        "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
         "commitment_history", "risk_signals", "tasks", "source_messages", "orders"
@@ -164,6 +187,8 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
                created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (*row, iso(now), iso(now)),
         )
+    for order_id, owner_id in (("ORD-1001", "USER-1"), ("ORD-1002", "USER-1"), ("ORD-1003", "USER-1"), ("ORD-1004", "USER-2"), ("ORD-1005", "USER-3")):
+        conn.execute("UPDATE orders SET owner=? WHERE order_id=?", (owner_id, order_id))
 
     tasks = [
         ("TASK-WAIT-001", "ORD-1002", "等待工厂确认拉链到料时间", "等待工厂回复", "factory", "OPEN", "USER-1", "assigned", "factory", iso(now + timedelta(hours=3)), iso(now + timedelta(hours=3)), iso(now + timedelta(days=2)), iso(now - timedelta(hours=20)), "high", 0, 0, None, ["工厂承诺3小时内回复"]),
@@ -500,8 +525,37 @@ def apply_writeback(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dic
 
 
 
-OWNER_NAMES = {"USER-1": "李梅", "USER-2": "张晓", "USER-3": "陈静", "MANAGER-1": "王主管", None: "未分配"}
+OPERATORS = [
+    {"user_id": "USER-1", "name": "李梅", "role": "跟单专员"},
+    {"user_id": "USER-2", "name": "王晓", "role": "高级跟单"},
+    {"user_id": "USER-3", "name": "陈琳", "role": "客户协调"},
+    {"user_id": "MANAGER-1", "name": "周主管", "role": "业务主管"},
+]
+OWNER_NAMES = {item["user_id"]: item["name"] for item in OPERATORS} | {None: "未分配", "": "未分配", "待分配": "未分配"}
+OWNER_IDS_BY_NAME = {item["name"]: item["user_id"] for item in OPERATORS}
 RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def normalize_owner_value(value: Any, *, fallback: str | None = None) -> str | None:
+    """Normalize Excel/UI owner names to stable user IDs."""
+    text = str(value or "").strip()
+    if not text or text in {"待分配", "未分配", "—", "-"}:
+        return fallback
+    if text in OWNER_NAMES:
+        return text
+    return OWNER_IDS_BY_NAME.get(text, fallback or text)
+
+
+def is_manager(user_id: str | None) -> bool:
+    return str(user_id or "").upper() == "MANAGER-1"
+
+
+def owner_matches(owner: Any, user_id: str | None) -> bool:
+    if is_manager(user_id):
+        return True
+    normalized = normalize_owner_value(owner)
+    return bool(normalized and normalized == user_id)
+
 
 
 def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -935,9 +989,12 @@ def create_order(payload: AnyPayload) -> dict[str, Any]:
         if conn.execute("SELECT 1 FROM orders WHERE order_no=?", (order_no,)).fetchone():
             raise HTTPException(409, "订单号已存在")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+        operator_id = str(body.get("operator_id") or "USER-1")
+        requested_owner = normalize_owner_value(body.get("owner"), fallback=operator_id)
+        effective_owner = requested_owner if is_manager(operator_id) else operator_id
         optional = {
             "sku": body.get("sku"), "quantity": body.get("quantity"), "unit": body.get("unit"),
-            "factory_name": body.get("factory_name"), "owner": body.get("owner"),
+            "factory_name": body.get("factory_name"), "owner": effective_owner,
             "specification": body.get("specification"), "material": body.get("material"),
             "color": body.get("color"), "logo_process": body.get("logo_process"),
         }
@@ -974,11 +1031,19 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         if not row:
             raise HTTPException(404, "订单不存在")
+        operator_id = str(body.get("operator_id") or "USER-1")
+        if not is_manager(operator_id) and not owner_matches(dict(row).get("owner"), operator_id):
+            raise HTTPException(403, "只能修改本人负责的订单")
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
         updates = {}
         for source, target in canonical.items():
             if source in body and target in columns:
-                updates[target] = body[source]
+                if target == "owner":
+                    if not is_manager(operator_id):
+                        continue
+                    updates[target] = normalize_owner_value(body[source], fallback=dict(row).get("owner"))
+                else:
+                    updates[target] = body[source]
         if not updates:
             raise HTTPException(422, "没有可更新字段")
         dynamic_fields = {"current_node", "current_progress", "latest_supplier_commitment", "contact_status", "issue_status"}
@@ -1022,8 +1087,10 @@ def activation_recommendation_key(order: dict[str, Any]) -> tuple[int, str, str]
     return (0 if delivery else 1, delivery.isoformat() if delivery else "9999-12-31", str(order.get("updated_at") or ""))
 
 
-def activation_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+def activation_snapshot(conn: sqlite3.Connection, current_user_id: str | None = None) -> dict[str, Any]:
     orders = [dict(r) for r in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()]
+    if current_user_id and not is_manager(current_user_id):
+        orders = [o for o in orders if owner_matches(o.get("owner"), current_user_id)]
     active = [o for o in orders if str(o.get("status") or "ACTIVE").upper() not in {"DONE", "COMPLETED", "CANCELLED", "CLOSED"}]
     counts = {key: 0 for key in ACTION_READINESS_VALUES}
     for order in active:
@@ -1121,8 +1188,9 @@ def upsert_activation_task(
         (order_id,),
     ).fetchone()
     task_id = existing["task_id"] if existing else new_id("TASK")
+    task_owner_id = normalize_owner_value(order.get("owner"), fallback=operator_id) or operator_id
     params = (
-        title, action, target, "OPEN", operator_id, "assigned", waiting_value,
+        title, action, target, "OPEN", task_owner_id, "assigned", waiting_value,
         promise_value, next_action, delivery, None, risk_level, urgent,
         pending_confirmation, None, json.dumps(evidence, ensure_ascii=False), timestamp,
     )
@@ -1147,9 +1215,9 @@ def upsert_activation_task(
 
 
 @app.get("/api/activation/summary")
-def activation_summary() -> dict[str, Any]:
+def activation_summary(current_user_id: str = Query("USER-1")) -> dict[str, Any]:
     with db() as conn:
-        return activation_snapshot(conn)
+        return activation_snapshot(conn, current_user_id)
 
 
 @app.post("/api/orders/{order_id}/initialize")
@@ -1221,7 +1289,7 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
             }, ensure_ascii=False), operator_id, timestamp),
         )
         conn.commit()
-        snapshot = activation_snapshot(conn)
+        snapshot = activation_snapshot(conn, operator_id)
     return {
         "status": "initialized", "order_id": order_id, "task_id": task_id,
         "action_readiness": readiness, "activation": snapshot,
@@ -1230,12 +1298,7 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
 
 @app.get("/api/operators")
 def operator_list() -> dict[str, Any]:
-    return {"items": [
-        {"user_id": "USER-1", "name": "李梅", "role": "跟单专员"},
-        {"user_id": "USER-2", "name": "王晓", "role": "高级跟单"},
-        {"user_id": "USER-3", "name": "陈琳", "role": "客户协调"},
-        {"user_id": "MANAGER-1", "name": "周主管", "role": "业务主管"},
-    ]}
+    return {"items": OPERATORS}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -1252,11 +1315,17 @@ def task_detail(task_id: str, current_user_id: str = Query("USER-1")) -> dict[st
 
 
 @app.get("/api/orders")
-def order_list(q: str | None = Query(None), status: str | None = Query(None)) -> dict[str, Any]:
+def order_list(
+    q: str | None = Query(None),
+    status: str | None = Query(None),
+    current_user_id: str = Query("USER-1"),
+) -> dict[str, Any]:
     with db() as conn:
         orders = [dict(r) for r in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()]
         tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
         risks = [dict(r) for r in conn.execute("SELECT * FROM risk_signals WHERE status='OPEN'").fetchall()]
+    if not is_manager(current_user_id):
+        orders = [order for order in orders if owner_matches(order.get("owner"), current_user_id)]
     result = []
     for order in orders:
         otasks = [t for t in tasks if t.get("related_order_id") == order["order_id"] and t.get("status") != "DONE"]
@@ -1299,10 +1368,13 @@ def create_order_task(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         if not conn.execute("SELECT 1 FROM orders WHERE order_id=?", (order_id,)).fetchone():
             raise HTTPException(404, "订单不存在")
         task_id, timestamp = new_id("TASK"), iso()
+        operator_id = str(body.get("operator_id") or "USER-1")
+        requested_owner = normalize_owner_value(body.get("owner_user_id"), fallback=operator_id) or operator_id
+        effective_owner = requested_owner if is_manager(operator_id) else operator_id
         conn.execute(
             """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,source_message_id,evidence_json,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task_id, order_id, title, body.get("recommended_action") or title, body.get("target") or "factory", "OPEN", body.get("owner_user_id") or "USER-1", "assigned", None, None, body.get("next_action_at"), body.get("business_deadline"), None, body.get("risk_level") or "medium", int(bool(body.get("urgent"))), 0, None, json.dumps(body.get("evidence") or [], ensure_ascii=False), timestamp, timestamp),
+            (task_id, order_id, title, body.get("recommended_action") or title, body.get("target") or "factory", "OPEN", effective_owner, "assigned", None, None, body.get("next_action_at"), body.get("business_deadline"), None, body.get("risk_level") or "medium", int(bool(body.get("urgent"))), 0, None, json.dumps(body.get("evidence") or [], ensure_ascii=False), timestamp, timestamp),
         )
         conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "order", order_id, "TASK_CREATED_FROM_UI", json.dumps({"task_id": task_id, **body}, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
         conn.execute(
@@ -1611,9 +1683,87 @@ def reject_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
     return {"status": "REJECTED", "review_id": review_id}
 
 
+@app.post("/api/drafts/{draft_id}/review")
+def review_draft_locally(draft_id: str, payload: AnyPayload) -> dict[str, Any]:
+    """Persist a human draft decision locally without another model call."""
+    body = payload.model_dump()
+    action = str(body.get("action") or "").strip().lower()
+    if action not in {"approve", "reject", "save_edit", "copy_and_record"}:
+        raise HTTPException(400, "不支持的草稿操作")
+    operator_id = str(body.get("operator_id") or "USER-1")
+    timestamp = iso()
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='communication_drafts'").fetchone():
+            raise HTTPException(404, "草稿记录表不存在，请重新生成草稿")
+        row = conn.execute("SELECT * FROM communication_drafts WHERE draft_id=?", (draft_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "草稿不存在或已过期，请重新生成")
+        record = dict(row)
+        subject = body.get("edited_subject") if body.get("edited_subject") is not None else record.get("edited_subject") or record.get("ai_subject") or ""
+        draft = body.get("edited_draft") if body.get("edited_draft") is not None else record.get("edited_draft") or record.get("ai_draft") or ""
+        note = str(body.get("note") or "").strip()
+        override = bool(body.get("risk_override_confirmed"))
+        blocked = str(record.get("approval_status") or "").upper().startswith("BLOCKED")
+        if action in {"approve", "copy_and_record"} and blocked:
+            if not override:
+                raise HTTPException(409, "该草稿被安全规则阻断；请修改草稿，或完成人工放行核对")
+            if not note:
+                raise HTTPException(422, "人工放行时必须填写核对依据")
+        if action != "reject" and not str(draft).strip():
+            raise HTTPException(422, "草稿正文不能为空")
+
+        previous_status = str(record.get("human_status") or "PENDING")
+        if action == "reject":
+            human_status, event_type, message = "REJECTED", "DRAFT_REJECTED", "草稿已驳回"
+            final_text = record.get("final_text")
+            approved_at, copied_at = record.get("approved_at"), record.get("copied_at")
+        elif action == "save_edit":
+            human_status, event_type, message = "EDITED", "DRAFT_EDIT_SAVED", "修改已保存"
+            final_text = draft
+            approved_at, copied_at = record.get("approved_at"), record.get("copied_at")
+        elif action == "approve":
+            human_status, event_type, message = "APPROVED", "DRAFT_APPROVED", "草稿已人工确认，尚未发送"
+            final_text = draft
+            approved_at, copied_at = record.get("approved_at") or timestamp, record.get("copied_at")
+        else:
+            human_status, event_type, message = "COPIED_AND_RECORDED", "DRAFT_COPIED_AND_RECORDED", "已复制并记录联系状态"
+            final_text = draft
+            approved_at, copied_at = record.get("approved_at") or timestamp, record.get("copied_at") or timestamp
+
+        duplicate = previous_status == human_status and action in {"approve", "copy_and_record"}
+        conn.execute(
+            """UPDATE communication_drafts SET edited_subject=?,edited_draft=?,final_text=?,human_status=?,
+               reviewer_id=?,review_note=?,approved_at=?,copied_at=?,updated_at=? WHERE draft_id=?""",
+            (subject, draft, final_text, human_status, operator_id, note, approved_at, copied_at, timestamp, draft_id),
+        )
+        task_update = None
+        task_id = body.get("task_id")
+        if action == "copy_and_record" and task_id:
+            if not conn.execute("SELECT task_id FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+                raise HTTPException(404, "关联任务不存在，尚未记录为已联系")
+            waiting_on = str(body.get("waiting_on") or "").strip() or None
+            promised_reply_at = body.get("promised_reply_at")
+            next_action_at = body.get("next_action_at") or promised_reply_at
+            conn.execute(
+                """UPDATE tasks SET status='OPEN',waiting_on=?,promised_reply_at=?,next_action_at=?,
+                   last_contact_at=?,updated_at=? WHERE task_id=?""",
+                (waiting_on, promised_reply_at, next_action_at, timestamp, timestamp, task_id),
+            )
+            task_update = {"updated": True, "task_id": task_id, "waiting_on": waiting_on, "promised_reply_at": promised_reply_at}
+        if not duplicate:
+            conn.execute(
+                "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+                (new_id("EVT"), "communication_draft", draft_id, event_type,
+                 json.dumps({"action": action, "task_id": task_id, "risk_override": override, "note": note}, ensure_ascii=False),
+                 operator_id, timestamp),
+            )
+        conn.commit()
+    return {"ok": True, "message": message, "human_status": human_status, "duplicate_skipped": duplicate, "task_update": task_update}
+
+
 @app.get("/api/management")
 def management_dashboard() -> dict[str, Any]:
-    data = dashboard(current_user_id="", current_time=None)
+    data = dashboard(current_user_id="MANAGER-1", current_time=None)
     items = data["items"]
     workload: dict[str, dict[str, Any]] = {}
     waiting: dict[str, int] = {}
@@ -1699,7 +1849,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "5.2.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
+    return {"status": "ok", "version": "6.0.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
 
 
 @app.get("/api/system/storage")
@@ -1721,6 +1871,7 @@ def clear_business_data(conn: sqlite3.Connection) -> None:
     tables = [
         "communication_events", "communication_workflow_runs", "communication_drafts",
         "communication_task_candidates", "order_import_rows", "order_import_batches", "intake_jobs",
+        "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
         "commitment_history", "risk_signals", "tasks", "source_messages", "orders"
@@ -1753,7 +1904,12 @@ def dashboard(
     current = parse_dt(current_time) or now_cn()
     with db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
-        orders = {r["order_id"]: dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()}
+        order_rows = [dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()]
+        if not is_manager(current_user_id):
+            rows = [row for row in rows if normalize_owner_value(row.get("owner_user_id")) == current_user_id]
+            assigned_order_ids = {row.get("related_order_id") for row in rows if row.get("related_order_id")}
+            order_rows = [order for order in order_rows if owner_matches(order.get("owner"), current_user_id) or order.get("order_id") in assigned_order_ids]
+        orders = {r["order_id"]: r for r in order_rows}
         latest = conn.execute(
             "SELECT MAX(calculated_at) AS last_at FROM task_rankings WHERE current_user_id=?", (current_user_id,)
         ).fetchone()
@@ -1805,7 +1961,7 @@ def dashboard(
         "escalate": sum(x["action_state"] == "ESCALATE" for x in items),
     }
     with db() as conn:
-        activation = activation_snapshot(conn)
+        activation = activation_snapshot(conn, current_user_id)
     return {
         "current_time": iso(current), "summary": summary, "items": items, "top_actions": top,
         "ranking_source": "COZE_FT04" if rankings else "LOCAL_FALLBACK", "activation": activation,
@@ -1813,11 +1969,18 @@ def dashboard(
 
 
 @app.get("/api/orders/{order_id}")
-def order_detail(order_id: str) -> dict[str, Any]:
+def order_detail(order_id: str, current_user_id: str = Query("USER-1")) -> dict[str, Any]:
     with db() as conn:
         order = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         if not order:
             raise HTTPException(404, "订单不存在")
+        if not is_manager(current_user_id) and not owner_matches(dict(order).get("owner"), current_user_id):
+            assigned = conn.execute(
+                "SELECT 1 FROM tasks WHERE related_order_id=? AND owner_user_id=? LIMIT 1",
+                (order_id, current_user_id),
+            ).fetchone()
+            if not assigned:
+                raise HTTPException(403, "当前身份无权查看该订单")
         tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks WHERE related_order_id=? ORDER BY created_at DESC", (order_id,))]
         risks = [dict(r) for r in conn.execute("SELECT * FROM risk_signals WHERE order_id=? ORDER BY created_at DESC", (order_id,))]
         messages = [dict(r) for r in conn.execute("SELECT * FROM source_messages WHERE order_id=? ORDER BY created_at DESC", (order_id,))]

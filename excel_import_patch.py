@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-PATCH_VERSION = "3.2.0-excel-import-activation"
+PATCH_VERSION = "3.3.0-excel-import-owner-binding"
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_XLSX_UNCOMPRESSED = 20 * 1024 * 1024
 MAX_ROWS = 500
@@ -103,8 +103,30 @@ class PreviewRequest(BaseModel):
 class CommitRequest(BaseModel):
     batch_id: str
     import_key: str | None = None
+    current_user_id: str = "USER-1"
     row_actions: dict[str, str] = Field(default_factory=dict)  # row number -> import/skip
 
+
+OPERATOR_NAME_TO_ID = {
+    "李梅": "USER-1",
+    "王晓": "USER-2",
+    "陈琳": "USER-3",
+    "周主管": "MANAGER-1",
+}
+VALID_OPERATOR_IDS = set(OPERATOR_NAME_TO_ID.values())
+
+
+def _normalize_owner(value: Any, fallback_user_id: str | None = None) -> str:
+    text = str(value or "").strip()
+    if text in VALID_OPERATOR_IDS:
+        return text
+    if text in OPERATOR_NAME_TO_ID:
+        return OPERATOR_NAME_TO_ID[text]
+    if text and text not in {"待分配", "未分配", "-", "—"}:
+        return text
+    if fallback_user_id and fallback_user_id != "MANAGER-1":
+        return fallback_user_id
+    return "待分配"
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -574,7 +596,7 @@ def _required_db_fill(column: str, canonical: str | None, now: str) -> Any:
     return ""
 
 
-def _insert_order(conn: sqlite3.Connection, normalized: dict[str, Any], column_map: dict[str, str], batch_id: str) -> str:
+def _insert_order(conn: sqlite3.Connection, normalized: dict[str, Any], column_map: dict[str, str], batch_id: str, current_user_id: str) -> str:
     now = _now_iso()
     order_id = f"ORD-IMP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     values_by_column: dict[str, Any] = {}
@@ -583,6 +605,8 @@ def _insert_order(conn: sqlite3.Connection, normalized: dict[str, Any], column_m
     for canonical, value in normalized.items():
         column = column_map.get(canonical)
         if column and value is not None:
+            if canonical == "owner":
+                value = _normalize_owner(value, current_user_id)
             values_by_column[column] = value
     if "created_at" in column_map:
         values_by_column.setdefault(column_map["created_at"], now)
@@ -593,7 +617,7 @@ def _insert_order(conn: sqlite3.Connection, normalized: dict[str, Any], column_m
     if "risk_level" in column_map:
         values_by_column.setdefault(column_map["risk_level"], "low")
     if "owner" in column_map:
-        values_by_column.setdefault(column_map["owner"], "待分配")
+        values_by_column.setdefault(column_map["owner"], _normalize_owner(None, current_user_id))
     existing_columns = _column_names(conn, "orders")
     if "action_readiness" in existing_columns:
         values_by_column["action_readiness"] = "BASE_ONLY"
@@ -634,8 +658,11 @@ def _update_order(conn: sqlite3.Connection, existing_order_id: str, changes: lis
         current_value = current[0] if current else None
         if not _json_equal(current_value, change.get("old_value")):
             raise RuntimeError(f"字段{canonical}在预览后已被其他操作修改")
+        new_value = change.get("new_value")
+        if canonical == "owner":
+            new_value = _normalize_owner(new_value)
         assignments.append(f'"{column}"=?')
-        values.append(change.get("new_value"))
+        values.append(new_value)
     if "updated_at" in column_map:
         assignments.append(f'"{column_map["updated_at"]}"=?')
         values.append(_now_iso())
@@ -785,7 +812,7 @@ function renderSummary(summary){const labels={total:"总行数",new:"可新增",
 function rowDetail(r){const problems=(r.issues||[]).map(i=>`<div>⚠ ${escapeHtml(i.message)}</div>`);const changes=(r.changes||[]).map(c=>`<div>${escapeHtml(c.label)}：${escapeHtml(String(c.old_value??"空"))} → ${escapeHtml(String(c.new_value??"空"))}</div>`);return [...problems,...changes].join("")||"—"}
 function renderRows(){const filter=$("#status-filter").value;const rows=state.rows.filter(r=>filter==="ALL"||r.classification===filter);$("#rows").innerHTML=rows.map(r=>`<tr><td>${r.row_number}</td><td><span class="badge ${r.classification}">${r.classification}</span></td><td>${escapeHtml(r.normalized.order_no||"")}</td><td>${escapeHtml(r.normalized.customer_name||"")}</td><td>${escapeHtml(r.normalized.sku||r.normalized.product_name||"")}</td><td>${escapeHtml(String(r.normalized.quantity??""))} ${escapeHtml(r.normalized.unit||"")}</td><td>${escapeHtml(r.normalized.customer_delivery_date||"")}</td><td class="detail">${rowDetail(r)}</td></tr>`).join("")}
 async function preview(useCurrentMapping=false){try{$("#preview-btn").disabled=true;if(!state.file)await loadFile($("#file").files[0]);const payload={filename:state.file.name,content_base64:state.contentBase64,mapping:useCurrentMapping?state.mapping:null};const res=await fetch("/api/import/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)throw new Error(data.detail||"预览失败");window.__fields=data.fields;state.headers=data.headers;state.mapping=data.mapping;state.rows=data.rows;state.batchId=data.batch_id;state.authRequired=data.auth_required;renderMapping();renderSummary(data.summary);renderRows();$("#result-panel").classList.remove("hidden");$("#key-wrap").classList.toggle("hidden",!data.auth_required);$("#schema-warning").textContent=data.schema_notes?.join("；")||"";toast("校验完成");}catch(e){toast(e.message)}finally{$("#preview-btn").disabled=false}}
-async function commit(){if(!state.batchId)return;try{$("#commit-btn").disabled=true;const res=await fetch("/api/import/commit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({batch_id:state.batchId,import_key:$("#import-key").value||null,row_actions:{}})});const data=await res.json();if(!res.ok)throw new Error(data.detail||"导入失败");$("#commit-result").classList.remove("hidden");$("#commit-result").innerHTML=`<h2>订单底座已建立</h2><div class="result-grid"><div><span>新增基础订单</span><strong>${data.inserted}</strong></div><div><span>更新订单</span><strong>${data.updated}</strong></div><div><span>跳过</span><strong>${data.skipped}</strong></div><div><span>失败</span><strong>${data.failed}</strong></div></div><div class="result-note"><strong>下一步不是直接查看风险。</strong><br>原始客户订单通常只有订单号、客户、数量和正式交期，缺少当前进度、最近沟通和等待状态。请先选择活跃订单补充最新进展，系统才能生成首条行动和跨订单排序。</div><div class="result-actions"><a class="primary-link" href="/#activation">开始初始化活跃订单</a><a class="secondary-link" href="/#orders">查看订单中心</a></div>`;toast("导入成功");window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});}catch(e){toast(e.message)}finally{$("#commit-btn").disabled=false}}
+async function commit(){if(!state.batchId)return;try{$("#commit-btn").disabled=true;const res=await fetch("/api/import/commit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({batch_id:state.batchId,import_key:$("#import-key").value||null,current_user_id:localStorage.getItem("currentUserId")||"USER-1",row_actions:{}})});const data=await res.json();if(!res.ok)throw new Error(data.detail||"导入失败");$("#commit-result").classList.remove("hidden");$("#commit-result").innerHTML=`<h2>订单底座已建立</h2><div class="result-grid"><div><span>新增基础订单</span><strong>${data.inserted}</strong></div><div><span>更新订单</span><strong>${data.updated}</strong></div><div><span>跳过</span><strong>${data.skipped}</strong></div><div><span>失败</span><strong>${data.failed}</strong></div></div><div class="result-note"><strong>订单已按负责人进入对应工作空间。</strong><br>表格内负责人会优先映射到系统人员；未填写负责人时，默认分配给本次导入人。原始订单仍需补充当前进度或最近沟通后，才能进入行动排序。</div><div class="result-actions"><a class="primary-link" href="/#activation">开始初始化活跃订单</a><a class="secondary-link" href="/#orders">查看订单中心</a></div>`;toast("导入成功");window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});}catch(e){toast(e.message)}finally{$("#commit-btn").disabled=false}}
 function escapeHtml(v){return String(v).replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]))}function escapeAttr(v){return escapeHtml(v)}
 $("#file").addEventListener("change",async e=>{try{await loadFile(e.target.files[0]);$("#file-name").textContent=state.file.name}catch(err){toast(err.message)}});$("#preview-btn").addEventListener("click",()=>preview(false));$("#repreview-btn").addEventListener("click",()=>preview(true));$("#status-filter").addEventListener("change",renderRows);$("#commit-btn").addEventListener("click",commit);'''
 
@@ -962,7 +989,7 @@ def register_excel_import_patch(app: FastAPI) -> None:
                     changes = json.loads(row["changes_json"])
                     try:
                         if classification == "NEW":
-                            order_id = _insert_order(conn, normalized, column_map, payload.batch_id)
+                            order_id = _insert_order(conn, normalized, column_map, payload.batch_id, payload.current_user_id)
                             inserted += 1
                             imported_order_ids.append(order_id)
                             _append_event(conn, order_id, "ORDER_IMPORTED_BASE_ONLY", {"batch_id": payload.batch_id, "source": "excel_csv", "normalized": normalized, "action_readiness": "BASE_ONLY"})
