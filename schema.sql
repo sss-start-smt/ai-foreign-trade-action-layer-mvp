@@ -234,6 +234,29 @@ CREATE TABLE IF NOT EXISTS logistics_events (
     FOREIGN KEY(order_id) REFERENCES orders(order_id)
 );
 
+
+CREATE TABLE IF NOT EXISTS agent_chat_jobs (
+    job_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL DEFAULT 'ORG-DEMO',
+    current_user_id TEXT NOT NULL,
+    current_role TEXT NOT NULL,
+    question TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'QUEUED',
+    request_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT,
+    error_message TEXT,
+    conversation_id TEXT,
+    linked_run_id TEXT,
+    duration_ms INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_chat_jobs_user_status
+ON agent_chat_jobs(current_user_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS agent_runs (
     run_id TEXT PRIMARY KEY,
     organization_id TEXT NOT NULL DEFAULT 'ORG-DEMO',

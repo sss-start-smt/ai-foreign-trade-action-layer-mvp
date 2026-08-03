@@ -320,23 +320,58 @@ async function pageAgent(root){
     <section class="panel"><div class="panel-head"><div><h2>待审批动作</h2><p>高风险动作必须等待人工；系统不会自动发送客户或工厂消息。</p></div></div><div class="approval-list">${data.approvals.filter(x=>x.status==='PENDING').map(a=>`<article><div><strong>${esc(a.action_type)}</strong><small>${esc(a.order_no||a.order_id||'')} · ${esc(a.approval_id)}</small></div><span class="status NEEDS_CONFIRMATION">${esc(a.required_role==='manager'?'需要主管':'需要人工')}</span></article>`).join('')||emptyState('当前没有待审批动作','Agent生成的正式动作会进入这里。')}</div></section>
   </div>`;
   $$('[data-agent-prompt]',root).forEach(b=>b.onclick=()=>{$('#agentQuestion',root).value=b.dataset.agentPrompt});
-  $('#askAgent',root).onclick=async()=>{
-    const b=$('#askAgent',root),q=$('#agentQuestion',root).value.trim(),box=$('#agentAnswer',root);
+  const agentButton=$('#askAgent',root),agentBox=$('#agentAnswer',root);
+  const renderAgentJobResult=(job)=>{
+    const r=job.result||{},runId=r.run?.run_id||job.linked_run_id||'';
+    const identity=r.resolved_identity||{},identityText=identity.current_user_name?`${identity.current_user_name} · ${identity.current_role==='manager'?'团队订单':'本人负责订单'}`:`${operatorNames[currentUser()]||currentUser()}`;
+    agentBox.hidden=false;
+    agentBox.innerHTML=`<strong>Coze Agent诊断结果</strong><p class="agent-identity-note">已按当前身份：${esc(identityText)}</p><pre>${esc(r.answer||'Agent已完成工具执行，但未返回文本总结；请刷新查看执行轨迹和诊断结果。')}</pre><small>后台耗时 ${(Number(job.duration_ms||r.duration_ms||0)/1000).toFixed(1)}s${runId?` · run_id: ${esc(runId)}`:''}${r.conversation_id?' · 已保留Coze会话':''}</small><p class="agent-no-fallback">本结果来自Coze Agent；页面轮询不会重复提交目标，也不会静默替换成规则巡检结果。</p>`;
+    toast('Agent后台运行完成，可刷新查看执行轨迹','success');
+  };
+  const pollAgentJob=async(jobId,startedAt=Date.now(),attempt=0)=>{
+    if(!root.isConnected||route.name!=='agent')return;
+    try{
+      const job=await api(`/api/agent/chat/jobs/${encodeURIComponent(jobId)}`,{timeoutMs:15000});
+      if(job.status==='COMPLETED'){
+        sessionSet('floworderAgentJobId','');
+        agentButton.disabled=!cozeConfigured;agentButton.textContent='启动Agent诊断';
+        renderAgentJobResult(job);return;
+      }
+      if(job.status==='FAILED'){
+        sessionSet('floworderAgentJobId','');
+        agentButton.disabled=!cozeConfigured;agentButton.textContent='启动Agent诊断';
+        agentBox.hidden=false;agentBox.innerHTML=`<strong>Coze Agent后台任务未完成</strong><p>${esc(job.error_message||'未知错误')}</p><p>本次没有自动切换为规则结果，也无需重复提交相同目标。</p>`;
+        toast(job.error_message||'Agent后台任务失败','error');return;
+      }
+      const elapsed=Math.max(0,Math.round((Date.now()-startedAt)/1000));
+      agentBox.hidden=false;
+      agentBox.innerHTML=`<div class="loading-state compact"><span></span><div><strong>${esc(job.message||'Agent正在后台执行')}</strong><p>已等待 ${elapsed} 秒 · job_id: ${esc(jobId)}</p><small>你可以切换到其他页面；后台任务不会取消，也不要重复点击。</small></div></div>`;
+      agentButton.disabled=true;agentButton.textContent='Agent后台运行中…';
+      setTimeout(()=>pollAgentJob(jobId,startedAt,attempt+1),attempt<15?1800:3000);
+    }catch(e){
+      const elapsed=Math.max(0,Math.round((Date.now()-startedAt)/1000));
+      agentBox.hidden=false;agentBox.innerHTML=`<strong>正在恢复Agent运行状态</strong><p>${esc(e.message)}</p><small>后台任务可能仍在执行，系统将在3秒后继续查询。已等待 ${elapsed} 秒。</small>`;
+      if(attempt<60)setTimeout(()=>pollAgentJob(jobId,startedAt,attempt+1),3000);else{agentButton.disabled=!cozeConfigured;agentButton.textContent='启动Agent诊断'}
+    }
+  };
+  agentButton.onclick=async()=>{
+    const q=$('#agentQuestion',root).value.trim();
     if(!q)return toast('请输入诊断目标','error');
-    b.disabled=true;b.textContent='Agent正在选择工具…';box.hidden=false;
-    box.innerHTML='<div class="loading-state compact"><span></span><p>正在理解目标、选择工具并检索业务证据…</p></div>';
+    agentButton.disabled=true;agentButton.textContent='正在提交后台任务…';agentBox.hidden=false;
+    agentBox.innerHTML='<div class="loading-state compact"><span></span><p>正在创建Agent后台任务…</p></div>';
     try{
       const payload={question:q,current_user_id:currentUser(),current_role:role,due_within_days:Number($('#agentDueDays',root).value),top_n:Number($('#agentTopN',root).value),create_task_draft:$('#agentCreateTask',root).checked,create_approval_request:$('#agentCreateApproval',root).checked};
-      const r=await api('/api/agent/chat',{method:'POST',body:JSON.stringify(payload),timeoutMs:(maxSeconds+20)*1000});
-      const runId=r.run?.run_id||'';
-      const identity=r.resolved_identity||{},identityText=identity.current_user_name?`${identity.current_user_name} · ${identity.current_role==='manager'?'团队订单':'本人负责订单'}`:`${operatorNames[currentUser()]||currentUser()}`;
-      box.innerHTML=`<strong>Coze Agent诊断结果</strong><p class="agent-identity-note">已按当前身份：${esc(identityText)}</p><pre>${esc(r.answer||'Agent未返回文本结果')}</pre><small>耗时 ${(Number(r.duration_ms||0)/1000).toFixed(1)}s${runId?` · run_id: ${esc(runId)}`:''}${r.conversation_id?' · 已保留Coze会话':''}</small><p class="agent-no-fallback">本结果来自Coze Agent；如调用失败，系统不会静默替换成规则巡检结果。</p>`;
-      toast('Agent运行完成，可刷新查看执行轨迹','success');
+      const job=await api('/api/agent/chat/jobs',{method:'POST',body:JSON.stringify(payload),timeoutMs:15000});
+      sessionSet('floworderAgentJobId',job.job_id);
+      toast('Agent任务已进入后台，不会因页面请求超时而中断','success');
+      pollAgentJob(job.job_id,Date.now());
     }catch(e){
-      box.innerHTML=`<strong>Coze Agent调用未完成</strong><p>${esc(e.message)}</p><p>本次没有自动切换为规则结果。需要兜底时，请明确点击“仅运行规则巡检”。</p>`;
-      toast(e.message,'error');
-    }finally{b.disabled=!cozeConfigured;b.textContent='启动Agent诊断'}
+      agentBox.innerHTML=`<strong>Agent任务提交失败</strong><p>${esc(e.message)}</p><p>任务尚未进入后台，可以确认服务状态后重新点击。</p>`;
+      toast(e.message,'error');agentButton.disabled=!cozeConfigured;agentButton.textContent='启动Agent诊断';
+    }
   };
+  const pendingAgentJobId=sessionGet('floworderAgentJobId');
+  if(pendingAgentJobId){agentBox.hidden=false;agentButton.disabled=true;agentButton.textContent='Agent后台运行中…';pollAgentJob(pendingAgentJobId,Date.now())}
   $('#runAgentInspection',root).onclick=async()=>{
     const b=$('#runAgentInspection',root),days=Number($('#agentDueDays',root).value),topN=Number($('#agentTopN',root).value);
     b.disabled=true;b.textContent='规则巡检中…';

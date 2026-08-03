@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -25,7 +26,7 @@ CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
 AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
 AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
-COZE_AGENT_TIMEOUT_SECONDS = max(30, int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "120")))
+COZE_AGENT_TIMEOUT_SECONDS = max(AGENT_MAX_DURATION_SECONDS + 90, int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "240")))
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 OWNER_ID_TO_NAME = {value: key for key, value in OWNER_NAME_TO_ID.items()}
@@ -141,9 +142,10 @@ def owner_allowed(owner: Any, user_id: str, role: str | None = None, allowed_own
 @contextmanager
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:
@@ -898,6 +900,101 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
     return report
 
 
+
+def _execute_agent_chat_job(
+    job_id: str,
+    *,
+    user_id: str,
+    body: dict[str, Any],
+    identity: dict[str, Any],
+    parameters: dict[str, Any],
+    agent_question: str,
+    started_at: str,
+) -> None:
+    """Run a Coze Agent chat outside the browser request lifecycle.
+
+    Railway/HTTP clients may close a long, idle request while Coze is still
+    executing tools. Persisting the job first lets the browser poll without
+    resubmitting the Agent goal or creating duplicate drafts/approvals.
+    """
+    with db() as conn:
+        conn.execute(
+            "UPDATE agent_chat_jobs SET status='RUNNING',started_at=?,updated_at=? WHERE job_id=?",
+            (iso(), iso(), job_id),
+        )
+        conn.commit()
+    started_perf = time.perf_counter()
+    try:
+        result = run_agent_chat(
+            user_id=user_id,
+            question=agent_question,
+            parameters=parameters,
+            conversation_id=body.get("conversation_id"),
+            timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS,
+        )
+        with db() as conn:
+            latest = conn.execute(
+                """SELECT run_id,status,stop_reason,created_at,completed_at
+                   FROM agent_runs WHERE current_user_id=? AND created_at>=?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (user_id, started_at),
+            ).fetchone()
+            payload = {
+                **result,
+                "execution_mode": "COZE_AGENT",
+                "run": dict(latest) if latest else None,
+                "resolved_identity": {
+                    "current_user_id": identity["current_user_id"],
+                    "current_user_name": identity["current_user_name"],
+                    "current_role": identity["current_role"],
+                    "scope_description": identity["scope_description"],
+                },
+            }
+            conn.execute(
+                """UPDATE agent_chat_jobs
+                   SET status='COMPLETED',result_json=?,conversation_id=?,linked_run_id=?,duration_ms=?,
+                       completed_at=?,updated_at=? WHERE job_id=?""",
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    result.get("conversation_id"),
+                    latest["run_id"] if latest else None,
+                    int((time.perf_counter() - started_perf) * 1000),
+                    iso(),
+                    iso(),
+                    job_id,
+                ),
+            )
+            conn.commit()
+    except Exception as exc:  # Background jobs must persist failures for polling.
+        with db() as conn:
+            conn.execute(
+                """UPDATE agent_chat_jobs SET status='FAILED',error_message=?,duration_ms=?,completed_at=?,updated_at=?
+                   WHERE job_id=?""",
+                (str(exc), int((time.perf_counter() - started_perf) * 1000), iso(), iso(), job_id),
+            )
+            conn.commit()
+
+
+def _agent_chat_job_payload(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    result = safe_json(data.pop("result_json", None), None)
+    request_data = safe_json(data.pop("request_json", None), {})
+    return {
+        **data,
+        "result": result,
+        "request": {
+            "question": request_data.get("question"),
+            "due_within_days": request_data.get("due_within_days"),
+            "top_n": request_data.get("top_n"),
+        },
+        "message": {
+            "QUEUED": "Agent任务已进入后台队列",
+            "RUNNING": "Agent正在理解目标、选择工具并检索证据",
+            "COMPLETED": "Agent诊断已完成",
+            "FAILED": "Agent诊断未完成",
+        }.get(data.get("status"), "Agent任务状态已更新"),
+    }
+
 def register_agent_api(app) -> None:
     router = APIRouter()
 
@@ -910,9 +1007,9 @@ def register_agent_api(app) -> None:
                    WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
             ).fetchone()
         return {
-            "version": "6.1.3.2",
+            "version": "6.1.3.3",
             "agent_name": "FlowOrder订单异常诊断Agent",
-            "backend": {"online": True, "version": "6.1.3.2"},
+            "backend": {"online": True, "version": "6.1.3.3"},
             "coze_agent": {
                 "configured": coze["configured"],
                 "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
@@ -926,6 +1023,7 @@ def register_agent_api(app) -> None:
             "limits": {"max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS, "top_n": 7},
             "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
             "analytics_enabled": True,
+            "async_agent_chat": {"available": True, "polling": True, "stream_timeout_seconds": COZE_AGENT_TIMEOUT_SECONDS},
         }
 
     # ---- Coze plugin tools (API-key protected) ----
@@ -1164,6 +1262,84 @@ def register_agent_api(app) -> None:
             "approvals": approvals, "reports": reports,
             "latest_run": latest_run, "latest_tool_calls": calls,
         }
+
+    @router.post("/api/agent/chat/jobs", status_code=202)
+    def create_agent_chat_job(payload: AnyPayload) -> dict[str, Any]:
+        body = payload.model_dump()
+        question = str(body.get("question") or "").strip()
+        if not question:
+            raise HTTPException(422, "问题不能为空")
+        identity = resolve_chat_identity(body)
+        user_id = identity["current_user_id"]
+        role = identity["current_role"]
+        parameters = {
+            "organization_id": identity["organization_id"],
+            "current_user_id": user_id,
+            "current_user_name": identity["current_user_name"],
+            "current_role": role,
+            "allowed_owner_ids": identity["allowed_owner_ids"],
+            "scope_description": identity["scope_description"],
+            "default_due_within_days": max(1, min(int(body.get("due_within_days") or 14), 90)),
+            "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
+            "create_task_draft": bool(body.get("create_task_draft", True)),
+            "create_approval_request": bool(body.get("create_approval_request", True)),
+        }
+        agent_question = build_trusted_agent_question(question, identity, parameters)
+        job_id = new_id("AJOB")
+        created_at = iso()
+        with db() as conn:
+            # Prevent accidental double-clicks from spawning identical live jobs.
+            existing = conn.execute(
+                """SELECT * FROM agent_chat_jobs
+                   WHERE current_user_id=? AND question=? AND status IN ('QUEUED','RUNNING')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (user_id, question),
+            ).fetchone()
+            if existing:
+                return _agent_chat_job_payload(existing)
+            conn.execute(
+                """INSERT INTO agent_chat_jobs(
+                   job_id,organization_id,current_user_id,current_role,question,status,request_json,
+                   created_at,updated_at)
+                   VALUES(?,?,?,?,?,'QUEUED',?,?,?)""",
+                (
+                    job_id,
+                    identity["organization_id"],
+                    user_id,
+                    role,
+                    question,
+                    json.dumps(body, ensure_ascii=False),
+                    created_at,
+                    created_at,
+                ),
+            )
+            conn.commit()
+        worker = threading.Thread(
+            target=_execute_agent_chat_job,
+            kwargs={
+                "job_id": job_id,
+                "user_id": user_id,
+                "body": body,
+                "identity": identity,
+                "parameters": parameters,
+                "agent_question": agent_question,
+                "started_at": created_at,
+            },
+            daemon=True,
+            name=f"floworder-agent-{job_id}",
+        )
+        worker.start()
+        with db() as conn:
+            row = conn.execute("SELECT * FROM agent_chat_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return _agent_chat_job_payload(row)
+
+    @router.get("/api/agent/chat/jobs/{job_id}")
+    def get_agent_chat_job(job_id: str) -> dict[str, Any]:
+        with db() as conn:
+            row = conn.execute("SELECT * FROM agent_chat_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Agent后台任务不存在")
+        return _agent_chat_job_payload(row)
 
     @router.post("/api/agent/chat")
     def agent_chat(payload: AnyPayload) -> dict[str, Any]:

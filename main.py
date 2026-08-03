@@ -35,7 +35,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="6.1.3.2")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.1.3.3")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
@@ -171,7 +171,7 @@ def init_db() -> None:
 def reset_demo_data(conn: sqlite3.Connection) -> None:
     for table in [
         "bulk_update_candidates", "bulk_update_batches", "analytics_events",
-        "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
+        "agent_chat_jobs", "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
         "commitment_history", "risk_signals", "tasks", "source_messages", "orders"
@@ -1855,7 +1855,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "6.1.3.2", "db": str(DB_PATH), "storage": storage_status(),
+    return {"status": "ok", "version": "6.1.3.3", "db": str(DB_PATH), "storage": storage_status(),
             "coze": coze_status(), "agent": agent_api.coze_agent_status()}
 
 
@@ -1879,7 +1879,7 @@ def clear_business_data(conn: sqlite3.Connection) -> None:
         "communication_events", "communication_workflow_runs", "communication_drafts",
         "communication_task_candidates", "order_import_rows", "order_import_batches", "intake_jobs",
         "bulk_update_candidates", "bulk_update_batches", "analytics_events",
-        "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
+        "agent_chat_jobs", "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
         "commitment_history", "risk_signals", "tasks", "source_messages", "orders"

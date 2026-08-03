@@ -135,7 +135,7 @@ def test_status_exposes_backend_agent_and_rule_modes_separately():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.2"
+    assert data["version"] == "6.1.3.3"
     assert data["backend"]["online"] is True
     assert data["rule_inspection"]["available"] is True
     assert data["rule_inspection"]["silent_fallback"] is False
@@ -224,3 +224,55 @@ def test_rule_rerun_retires_stale_same_day_false_positive():
     with db() as conn:
         row = conn.execute("SELECT status FROM anomaly_candidates WHERE candidate_id='STALE-1'").fetchone()
     assert row[0] == 'SUPERSEDED'
+
+
+def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
+    import time
+
+    def fake_run_agent_chat(*, user_id, question, parameters, conversation_id=None, timeout_seconds=90):
+        assert user_id == "USER-1"
+        assert '"current_user_id":"USER-1"' in question
+        time.sleep(0.05)
+        return {
+            "answer": "已完成诊断",
+            "reasoning_summary": "",
+            "conversation_id": "CONV-TEST",
+            "duration_ms": 50,
+            "usage": {},
+        }
+
+    monkeypatch.setattr(agent_api, "run_agent_chat", fake_run_agent_chat)
+    created = client.post(
+        "/api/agent/chat/jobs",
+        json={
+            "question": "检查我未来14天内最需要处理的订单。",
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "due_within_days": 14,
+            "top_n": 7,
+        },
+    )
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    assert created.json()["status"] in {"QUEUED", "RUNNING"}
+
+    completed = None
+    for _ in range(30):
+        polled = client.get(f"/api/agent/chat/jobs/{job_id}")
+        assert polled.status_code == 200, polled.text
+        if polled.json()["status"] == "COMPLETED":
+            completed = polled.json()
+            break
+        time.sleep(0.02)
+    assert completed is not None
+    assert completed["result"]["answer"] == "已完成诊断"
+    assert completed["result"]["resolved_identity"]["current_user_id"] == "USER-1"
+
+
+def test_status_advertises_async_agent_chat():
+    response = client.get("/api/agent/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["version"] == "6.1.3.3"
+    assert data["async_agent_chat"]["available"] is True
+    assert data["async_agent_chat"]["polling"] is True
