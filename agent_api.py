@@ -23,6 +23,9 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 AGENT_API_KEY = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip()
 CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
+AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
+AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
+COZE_AGENT_TIMEOUT_SECONDS = max(30, int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "120")))
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 ACTIVE_ORDER_STATUSES = {"ACTIVE", "OPEN", "IN_PROGRESS", "进行中", "活跃"}
@@ -159,10 +162,10 @@ def enforce_run_budget(conn: sqlite3.Connection, run_id: str | None) -> None:
     if row["status"] not in {"RUNNING", "PARTIAL"}:
         raise HTTPException(409, f"Agent运行当前状态为{row['status']}，不能继续调用工具")
     used = conn.execute("SELECT COUNT(*) FROM agent_tool_calls WHERE run_id=?", (run_id,)).fetchone()[0]
-    max_calls = int(row["max_tool_calls"] or 8)
+    max_calls = int(row["max_tool_calls"] or AGENT_MAX_TOOL_CALLS)
     started_at = parse_dt(row["started_at"] or row["created_at"]) or now_cn()
     elapsed = max(0.0, (now_cn() - started_at).total_seconds())
-    max_seconds = int(row["max_duration_seconds"] or 60)
+    max_seconds = int(row["max_duration_seconds"] or AGENT_MAX_DURATION_SECONDS)
     if used >= max_calls or elapsed >= max_seconds:
         conn.execute(
             "UPDATE agent_runs SET status='PARTIAL',stop_reason='BUDGET_REACHED',duration_ms=?,completed_at=? WHERE run_id=?",
@@ -610,7 +613,7 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
            max_tool_calls,max_duration_seconds,started_at,created_at)
            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (run_id, a["organization_id"], a["current_user_id"], a["current_role"],
-         payload.get("goal") or "检查今天最需要处理的订单", trigger_type, "RUNNING", 8, 60, iso(), iso()),
+         payload.get("goal") or "检查今天最需要处理的订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
     )
     screened = list_candidate_orders_logic(conn, {**payload, **a, "limit": 50})
     all_candidates: list[dict[str, Any]] = []
@@ -663,13 +666,13 @@ def register_agent_api(app) -> None:
     @router.get("/api/agent/status")
     def agent_status() -> dict[str, Any]:
         return {
-            "version": "6.1.1",
+            "version": "6.1.2",
             "agent_name": "FlowOrder订单异常诊断Agent",
             "tool_auth_configured": bool(AGENT_API_KEY),
             "cron_auth_configured": bool(CRON_API_KEY or AGENT_API_KEY),
             "coze_agent_configured": coze_agent_status()["configured"],
             "daily_schedule": {"timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
-            "limits": {"max_tool_calls": 8, "max_duration_seconds": 60, "top_n": 7},
+            "limits": {"max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS, "top_n": 7},
             "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
             "analytics_enabled": True,
         }
@@ -686,7 +689,7 @@ def register_agent_api(app) -> None:
                 """INSERT INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,max_tool_calls,
                    max_duration_seconds,started_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (run_id, a["organization_id"], a["current_user_id"], a["current_role"], body.get("goal") or "订单异常诊断",
-                 str(body.get("trigger_type") or "USER").upper(), "RUNNING", 8, 60, iso(), iso()),
+                 str(body.get("trigger_type") or "USER").upper(), "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
             )
             track_event(
                 conn, "agent_run_started", organization_id=a["organization_id"], user_id=a["current_user_id"],
@@ -694,7 +697,7 @@ def register_agent_api(app) -> None:
                 properties={"goal": str(body.get("goal") or "订单异常诊断")[:120], "trigger_type": str(body.get("trigger_type") or "USER").upper()},
             )
             conn.commit()
-        return {"run_id": run_id, "status": "RUNNING", "max_tool_calls": 8, "max_duration_seconds": 60}
+        return {"run_id": run_id, "status": "RUNNING", "max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS}
 
     @router.post("/api/agent/tools/candidate-orders/list")
     def tool_list_candidate_orders(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
@@ -901,7 +904,7 @@ def register_agent_api(app) -> None:
         }
         try:
             result = run_agent_chat(user_id=user_id, question=question, parameters=parameters,
-                                    conversation_id=body.get("conversation_id"), timeout_seconds=90)
+                                    conversation_id=body.get("conversation_id"), timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS)
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
         return result
