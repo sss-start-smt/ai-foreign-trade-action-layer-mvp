@@ -103,6 +103,19 @@ def deadline_is_overdue(value: Any, current: datetime) -> bool:
     return parsed < current
 
 
+def business_date_is_overdue(value: Any, current: datetime) -> bool:
+    """Compare a business milestone by calendar date, regardless of storage format.
+
+    Supplier completion commitments are day-level business promises. Imports may
+    normalize ``2026-08-03`` into ``2026-08-03T00:00:00+08:00``; treating that
+    midnight timestamp as an exact instant would incorrectly mark it overdue
+    during the same day. Promised reply timestamps continue to use
+    :func:`deadline_is_overdue` and therefore retain hour/minute precision.
+    """
+    parsed = parse_dt(value)
+    return bool(parsed and parsed.date() < current.date())
+
+
 def normalize_owner(value: Any) -> str | None:
     text = str(value or "").strip()
     if not text or text in {"待分配", "未分配", "-", "—"}:
@@ -429,13 +442,13 @@ def build_anomaly_logic(conn: sqlite3.Connection, payload: dict[str, Any], persi
     # 1) Supplier commitment overdue.
     if "SUPPLIER_COMMITMENT_OVERDUE" in requested_types:
         commitment = parse_dt(order.get("latest_supplier_commitment"))
-        commitment_overdue = deadline_is_overdue(order.get("latest_supplier_commitment"), current)
+        commitment_overdue = business_date_is_overdue(order.get("latest_supplier_commitment"), current)
         overdue_tasks = [t for t in ctx["open_tasks"] if deadline_is_overdue(t.get("promised_reply_at"), current)]
         if (commitment_overdue and float(order.get("current_progress") or 0) < 1) or overdue_tasks:
             evidence = []
             score = 60.0
             if commitment_overdue and commitment:
-                evidence.append(f"供应商完工承诺{order.get('latest_supplier_commitment')}已过期")
+                evidence.append(f"供应商完工承诺{commitment.date().isoformat()}已过期")
                 score += min(25, max(1, (current.date()-commitment.date()).days)*5)
             for task in overdue_tasks[:3]:
                 evidence.append(f"等待事项“{task.get('title')}”的承诺回复时间已过")
@@ -507,21 +520,54 @@ def build_anomaly_logic(conn: sqlite3.Connection, payload: dict[str, Any], persi
     persisted: list[dict[str, Any]] = []
     for candidate in candidates:
         candidate_id = new_id("ANOM")
+        candidate_status = "ANOMALY_CANDIDATE"
+        created_at = iso(current)
+        reused = False
+        if persist:
+            existing = conn.execute(
+                """SELECT * FROM anomaly_candidates
+                   WHERE order_id=? AND anomaly_type=?
+                     AND status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')
+                   ORDER BY CASE status WHEN 'PENDING_CONFIRMATION' THEN 0 ELSE 1 END,
+                            updated_at DESC, created_at DESC LIMIT 1""",
+                (order_id, candidate["anomaly_type"]),
+            ).fetchone()
+            if existing:
+                candidate_id = existing["candidate_id"]
+                candidate_status = existing["status"]
+                created_at = existing["created_at"]
+                reused = True
+                conn.execute(
+                    """UPDATE anomaly_candidates SET run_id=?,severity=?,confidence=?,score=?,evidence_json=?,
+                       missing_information_json=?,recommended_action=?,created_by=?,updated_at=?
+                       WHERE candidate_id=?""",
+                    (payload.get("run_id"), candidate["severity"], candidate["confidence"], candidate["score"],
+                     json.dumps(candidate["evidence"], ensure_ascii=False),
+                     json.dumps(candidate["missing_information"], ensure_ascii=False), candidate["recommended_action"],
+                     a["current_user_id"], iso(current), candidate_id),
+                )
+                conn.execute(
+                    """UPDATE anomaly_candidates SET status='SUPERSEDED',
+                       resolution_note=COALESCE(resolution_note,'重复候选已自动合并'),updated_at=?
+                       WHERE order_id=? AND anomaly_type=? AND candidate_id<>?
+                         AND status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')""",
+                    (iso(current), order_id, candidate["anomaly_type"], candidate_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO anomaly_candidates(candidate_id,run_id,order_id,anomaly_type,severity,confidence,score,evidence_json,
+                       missing_information_json,recommended_action,status,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (candidate_id, payload.get("run_id"), order_id, candidate["anomaly_type"], candidate["severity"],
+                     candidate["confidence"], candidate["score"], json.dumps(candidate["evidence"], ensure_ascii=False),
+                     json.dumps(candidate["missing_information"], ensure_ascii=False), candidate["recommended_action"],
+                     candidate_status, a["current_user_id"], created_at, iso(current)),
+                )
         record = {
             **candidate, "candidate_id": candidate_id, "order_id": order_id, "order_no": order.get("order_no"),
             "customer_name": order.get("customer_name"), "owner_user_id": order.get("owner"),
-            "status": "ANOMALY_CANDIDATE", "created_at": iso(current),
+            "status": candidate_status, "created_at": created_at, "reused_candidate": reused,
         }
-        if persist:
-            conn.execute(
-                """INSERT INTO anomaly_candidates(candidate_id,run_id,order_id,anomaly_type,severity,confidence,score,evidence_json,
-                   missing_information_json,recommended_action,status,created_by,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (candidate_id, payload.get("run_id"), order_id, candidate["anomaly_type"], candidate["severity"],
-                 candidate["confidence"], candidate["score"], json.dumps(candidate["evidence"], ensure_ascii=False),
-                 json.dumps(candidate["missing_information"], ensure_ascii=False), candidate["recommended_action"],
-                 "ANOMALY_CANDIDATE", a["current_user_id"], iso(current), iso(current)),
-            )
         persisted.append(record)
     return {"order_id": order_id, "count": len(persisted), "items": persisted, "requires_human_confirmation": True}
 
@@ -713,6 +759,30 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
     for order in screened["items"]:
         result = build_anomaly_logic(conn, {**payload, **a, "run_id": run_id, "order_id": order["order_id"]}, persist=True)
         all_candidates.extend(result["items"])
+
+    # Retire unresolved rule candidates that were in scope but did not recur in
+    # this inspection. This removes stale false positives after rule fixes and
+    # prevents the active-candidate badge from growing on every scheduled run.
+    current_keys = {(str(x.get("order_id") or ""), str(x.get("anomaly_type") or "")) for x in all_candidates}
+    screened_ids = [str(x.get("order_id") or "") for x in screened["items"] if x.get("order_id")]
+    if screened_ids:
+        placeholders = ",".join("?" for _ in screened_ids)
+        stale_rows = conn.execute(
+            f"""SELECT candidate_id,order_id,anomaly_type FROM anomaly_candidates
+                WHERE order_id IN ({placeholders}) AND status='ANOMALY_CANDIDATE'
+                  AND COALESCE(run_id,'')<>?""",
+            [*screened_ids, run_id],
+        ).fetchall()
+        stale_ids = [row["candidate_id"] for row in stale_rows
+                     if (str(row["order_id"]), str(row["anomaly_type"])) not in current_keys]
+        if stale_ids:
+            stale_placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"""UPDATE anomaly_candidates SET status='SUPERSEDED',
+                    resolution_note=COALESCE(resolution_note,'本次巡检未再次识别'),updated_at=?
+                    WHERE candidate_id IN ({stale_placeholders})""",
+                [iso(), *stale_ids],
+            )
     aggregated = aggregate_order_candidates(all_candidates, int(payload.get("top_n") or 7))
     ranked = aggregated["risk_items"]
     information_gaps = aggregated["information_gaps"]
@@ -773,9 +843,9 @@ def register_agent_api(app) -> None:
                    WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
             ).fetchone()
         return {
-            "version": "6.1.3",
+            "version": "6.1.3.1",
             "agent_name": "FlowOrder订单异常诊断Agent",
-            "backend": {"online": True, "version": "6.1.3"},
+            "backend": {"online": True, "version": "6.1.3.1"},
             "coze_agent": {
                 "configured": coze["configured"],
                 "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
@@ -985,7 +1055,8 @@ def register_agent_api(app) -> None:
             scope_sql, params = _order_scope_sql(a)
             cands = [dict(r) for r in conn.execute(
                 f"""SELECT a.*,o.order_no,o.customer_name,o.owner FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id
-                    WHERE {scope_sql.replace('owner','o.owner')} ORDER BY a.created_at DESC LIMIT 150""", params)]
+                    WHERE {scope_sql.replace('owner','o.owner')} AND a.status!='SUPERSEDED'
+                    ORDER BY a.updated_at DESC, a.created_at DESC LIMIT 150""", params)]
             approvals = [dict(r) for r in conn.execute(
                 f"""SELECT p.*,o.order_no,o.customer_name FROM approval_requests p LEFT JOIN orders o ON o.order_id=p.order_id
                     WHERE ({scope_sql.replace('owner','o.owner')}) OR p.requested_by=? ORDER BY p.created_at DESC LIMIT 50""", [*params, current_user_id])]

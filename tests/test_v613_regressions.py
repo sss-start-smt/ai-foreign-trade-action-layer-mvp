@@ -135,8 +135,92 @@ def test_status_exposes_backend_agent_and_rule_modes_separately():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3"
+    assert data["version"] == "6.1.3.1"
     assert data["backend"]["online"] is True
     assert data["rule_inspection"]["available"] is True
     assert data["rule_inspection"]["silent_fallback"] is False
     assert "coze_agent" in data
+
+
+def test_midnight_iso_supplier_commitment_is_still_day_level():
+    with db() as conn:
+        conn.execute(
+            "UPDATE orders SET latest_supplier_commitment=?,current_progress=? WHERE order_id=?",
+            ("2026-08-03T00:00:00+08:00", 0.45, "ORD-1001"),
+        )
+        conn.commit()
+    response = client.post(
+        "/api/agent/tools/anomalies/build",
+        headers=HEADERS,
+        json={
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "order_id": "ORD-1001",
+            "current_time": "2026-08-03T19:30:00+08:00",
+            "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["count"] == 0
+
+
+def test_repeated_rule_inspection_reuses_active_candidates_instead_of_inflating_badge():
+    payload = {
+        "current_user_id": "USER-1",
+        "current_role": "operator",
+        "due_within_days": 60,
+        "top_n": 7,
+        "trigger_type": "MANUAL_RULE",
+        "current_time": "2026-08-03T19:30:00+08:00",
+    }
+    first = client.post("/api/agent/inspection/run", json=payload)
+    assert first.status_code == 200, first.text
+    with db() as conn:
+        active_after_first = conn.execute(
+            "SELECT COUNT(*) FROM anomaly_candidates WHERE status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')"
+        ).fetchone()[0]
+    second = client.post("/api/agent/inspection/run", json=payload)
+    assert second.status_code == 200, second.text
+    with db() as conn:
+        active_after_second = conn.execute(
+            "SELECT COUNT(*) FROM anomaly_candidates WHERE status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')"
+        ).fetchone()[0]
+        duplicate_groups = conn.execute(
+            """SELECT COUNT(*) FROM (
+                SELECT order_id,anomaly_type,COUNT(*) AS c FROM anomaly_candidates
+                WHERE status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')
+                GROUP BY order_id,anomaly_type HAVING c>1
+            )"""
+        ).fetchone()[0]
+    assert active_after_second == active_after_first
+    assert duplicate_groups == 0
+
+
+def test_rule_rerun_retires_stale_same_day_false_positive():
+    with db() as conn:
+        conn.execute(
+            "UPDATE orders SET latest_supplier_commitment=?,current_progress=? WHERE order_id=?",
+            ("2026-08-03T00:00:00+08:00", 0.45, "ORD-1001"),
+        )
+        conn.execute(
+            """INSERT INTO anomaly_candidates(candidate_id,run_id,order_id,anomaly_type,severity,confidence,score,
+               evidence_json,missing_information_json,recommended_action,status,created_by,created_at,updated_at)
+               VALUES('STALE-1',NULL,'ORD-1001','SUPPLIER_COMMITMENT_OVERDUE','HIGH',0.9,80,'[]','[]','联系工厂',
+               'ANOMALY_CANDIDATE','USER-1','2026-08-03T10:00:00+08:00','2026-08-03T10:00:00+08:00')"""
+        )
+        conn.commit()
+    response = client.post(
+        "/api/agent/inspection/run",
+        json={
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "due_within_days": 60,
+            "top_n": 7,
+            "trigger_type": "MANUAL_RULE",
+            "current_time": "2026-08-03T19:30:00+08:00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    with db() as conn:
+        row = conn.execute("SELECT status FROM anomaly_candidates WHERE candidate_id='STALE-1'").fetchone()
+    assert row[0] == 'SUPERSEDED'
