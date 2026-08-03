@@ -15,6 +15,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 
 from coze_agent_client import agent_status as coze_agent_status, run_agent_chat
+from analytics import ensure_analytics_schema, track_event
 
 CN_TZ = timezone(timedelta(hours=8))
 BASE_DIR = Path(__file__).resolve().parent
@@ -167,8 +168,26 @@ def enforce_run_budget(conn: sqlite3.Connection, run_id: str | None) -> None:
             "UPDATE agent_runs SET status='PARTIAL',stop_reason='BUDGET_REACHED',duration_ms=?,completed_at=? WHERE run_id=?",
             (int(elapsed * 1000), iso(), run_id),
         )
-        conn.commit()
         reason = "工具调用次数已达到上限" if used >= max_calls else "分析时间已达到上限"
+        track_event(
+            conn,
+            "agent_run_timeout",
+            organization_id=row["organization_id"],
+            user_id=row["current_user_id"],
+            user_role=row["current_role"],
+            run_id=run_id,
+            source="agent_tool",
+            properties={
+                "reason": "TOOL_BUDGET" if used >= max_calls else "TIME_BUDGET",
+                "tool_call_count": used,
+                "max_tool_calls": max_calls,
+                "elapsed_seconds": round(elapsed, 2),
+                "max_duration_seconds": max_seconds,
+                "approval_created": bool(conn.execute("SELECT 1 FROM approval_requests WHERE run_id=? LIMIT 1", (run_id,)).fetchone()),
+                "final_response_generated": False,
+            },
+        )
+        conn.commit()
         raise HTTPException(429, f"{reason}；请基于当前证据返回部分结果")
 
 def log_tool_call(conn: sqlite3.Connection, *, run_id: str | None, tool_name: str, request: dict[str, Any], response: Any,
@@ -623,6 +642,18 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
         (json.dumps(report, ensure_ascii=False), duration_ms, iso(), run_id),
     )
     audit_event(conn, "agent_run", run_id, "AGENT_INSPECTION_COMPLETED", report, a["current_user_id"])
+    track_event(
+        conn, "priority_diagnosis_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
+        user_role=a["current_role"], run_id=run_id, source="website_inspection",
+        properties={"screened_order_count": screened["count"], "anomaly_candidate_count": len(all_candidates),
+                    "top_count": len(ranked), "duration_ms": duration_ms},
+    )
+    track_event(
+        conn, "agent_run_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
+        user_role=a["current_role"], run_id=run_id, source="website_inspection",
+        properties={"status": "COMPLETED", "stop_reason": "DIAGNOSIS_COMPLETED", "duration_ms": duration_ms,
+                    "final_response_generated": True},
+    )
     return report
 
 
@@ -632,13 +663,15 @@ def register_agent_api(app) -> None:
     @router.get("/api/agent/status")
     def agent_status() -> dict[str, Any]:
         return {
-            "version": "6.0.0",
+            "version": "6.1.0",
             "agent_name": "FlowOrder订单异常诊断Agent",
             "tool_auth_configured": bool(AGENT_API_KEY),
             "cron_auth_configured": bool(CRON_API_KEY or AGENT_API_KEY),
             "coze_agent_configured": coze_agent_status()["configured"],
             "daily_schedule": {"timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
             "limits": {"max_tool_calls": 8, "max_duration_seconds": 60, "top_n": 7},
+            "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
+            "analytics_enabled": True,
         }
 
     # ---- Coze plugin tools (API-key protected) ----
@@ -654,6 +687,11 @@ def register_agent_api(app) -> None:
                    max_duration_seconds,started_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (run_id, a["organization_id"], a["current_user_id"], a["current_role"], body.get("goal") or "订单异常诊断",
                  str(body.get("trigger_type") or "USER").upper(), "RUNNING", 8, 60, iso(), iso()),
+            )
+            track_event(
+                conn, "agent_run_started", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                user_role=a["current_role"], run_id=run_id, source="agent_tool",
+                properties={"goal": str(body.get("goal") or "订单异常诊断")[:120], "trigger_type": str(body.get("trigger_type") or "USER").upper()},
             )
             conn.commit()
         return {"run_id": run_id, "status": "RUNNING", "max_tool_calls": 8, "max_duration_seconds": 60}
@@ -723,7 +761,13 @@ def register_agent_api(app) -> None:
                 "risk_level": body.get("risk_level") or "medium", "business_deadline": body.get("business_deadline"),
                 "evidence": body.get("evidence") or [], "status": "DRAFT", "requires_approval": True,
             }
-            audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"]); conn.commit()
+            audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
+            track_event(
+                conn, "task_draft_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool",
+                properties={"task_draft_id": draft_id, "risk_level": task["risk_level"], "requires_approval": True},
+            )
+            conn.commit()
         return task
 
     @router.post("/api/agent/tools/message-drafts/create")
@@ -763,7 +807,15 @@ def register_agent_api(app) -> None:
         with db() as conn:
             body = payload.model_dump()
             enforce_run_budget(conn, body.get("run_id"))
-            result = create_approval_logic(conn, body); conn.commit()
+            result = create_approval_logic(conn, body)
+            a = actor(body)
+            track_event(
+                conn, "approval_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                user_role=a["current_role"], order_id=body.get("order_id"), run_id=body.get("run_id"), source="agent_tool",
+                properties={"approval_id": result.get("approval_id"), "action_type": body.get("action_type"),
+                            "required_role": result.get("required_role"), "duplicate_skipped": bool(result.get("duplicate_skipped"))},
+            )
+            conn.commit()
         return result
 
     @router.post("/api/agent/tools/approvals/status")
@@ -782,10 +834,23 @@ def register_agent_api(app) -> None:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); run_id = str(body.get("run_id") or "")
         with db() as conn:
+            run = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            status = body.get("status") or "COMPLETED"
+            completed_at = iso()
             conn.execute("UPDATE agent_runs SET status=?,result_json=?,stop_reason=?,completed_at=? WHERE run_id=?",
-                         (body.get("status") or "COMPLETED", json.dumps(body.get("result") or {}, ensure_ascii=False),
-                          body.get("stop_reason") or "AGENT_COMPLETED", iso(), run_id)); conn.commit()
-        return {"run_id": run_id, "status": body.get("status") or "COMPLETED"}
+                         (status, json.dumps(body.get("result") or {}, ensure_ascii=False),
+                          body.get("stop_reason") or "AGENT_COMPLETED", completed_at, run_id))
+            if run:
+                started_at = parse_dt(run["started_at"] or run["created_at"])
+                duration_ms = int(max(0, (now_cn() - started_at).total_seconds()) * 1000) if started_at else None
+                track_event(
+                    conn, "agent_run_completed", organization_id=run["organization_id"], user_id=run["current_user_id"],
+                    user_role=run["current_role"], run_id=run_id, source="agent_tool",
+                    properties={"status": status, "stop_reason": body.get("stop_reason") or "AGENT_COMPLETED",
+                                "duration_ms": duration_ms, "final_response_generated": True},
+                )
+            conn.commit()
+        return {"run_id": run_id, "status": status}
 
     # ---- FlowOrder website / human approval endpoints ----
     @router.get("/api/agent/overview")
@@ -895,7 +960,15 @@ def register_agent_api(app) -> None:
             new_status = "APPROVED" if decision == "APPROVE" else "REJECTED"
             conn.execute("UPDATE approval_requests SET status=?,decided_by=?,decision_note=?,decided_at=?,result_json=?,updated_at=? WHERE approval_id=?",
                          (new_status, operator_id, body.get("note"), iso(), json.dumps(result or {}, ensure_ascii=False), iso(), approval_id))
-            audit_event(conn, "approval", approval_id, f"AGENT_APPROVAL_{new_status}", body, operator_id); conn.commit()
+            audit_event(conn, "approval", approval_id, f"AGENT_APPROVAL_{new_status}", body, operator_id)
+            track_event(
+                conn, "approval_decided", organization_id="ORG-DEMO", user_id=operator_id,
+                user_role=str(body.get("current_role") or "operator"), order_id=approval.get("order_id"),
+                run_id=approval.get("run_id"), source="website",
+                properties={"approval_id": approval_id, "decision": decision, "status": new_status,
+                            "action_type": approval.get("action_type")},
+            )
+            conn.commit()
         return {"approval_id": approval_id, "status": new_status, "result": result}
 
     @router.get("/api/agent/runs/{run_id}/trace")

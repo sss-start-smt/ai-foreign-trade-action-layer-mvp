@@ -331,3 +331,62 @@ CREATE INDEX IF NOT EXISTS idx_agent_calls_run_time ON agent_tool_calls(run_id,c
 CREATE INDEX IF NOT EXISTS idx_anomalies_order_status ON anomaly_candidates(order_id,status,severity);
 CREATE INDEX IF NOT EXISTS idx_approvals_status_role ON approval_requests(status,required_role,created_at);
 CREATE INDEX IF NOT EXISTS idx_reports_user_date ON daily_inspection_reports(current_user_id,inspection_date DESC);
+
+-- FlowOrder V6.1 composite tools, bulk natural-language updates and analytics
+CREATE TABLE IF NOT EXISTS bulk_update_batches (
+    batch_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL DEFAULT 'ORG-DEMO',
+    current_user_id TEXT NOT NULL,
+    current_role TEXT NOT NULL,
+    source_text TEXT NOT NULL,
+    parser_mode TEXT NOT NULL DEFAULT 'hybrid_rules_v1',
+    status TEXT NOT NULL DEFAULT 'PARSED',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bulk_update_candidates (
+    update_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    order_id TEXT,
+    order_no TEXT,
+    source_segment TEXT NOT NULL,
+    match_confidence REAL NOT NULL DEFAULT 0,
+    field_name TEXT NOT NULL,
+    old_value_json TEXT,
+    new_value_json TEXT,
+    confidence REAL NOT NULL DEFAULT 0,
+    risk_level TEXT NOT NULL DEFAULT 'normal',
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    edited_value_json TEXT,
+    approval_id TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    FOREIGN KEY(batch_id) REFERENCES bulk_update_batches(batch_id),
+    FOREIGN KEY(order_id) REFERENCES orders(order_id)
+);
+
+CREATE TABLE IF NOT EXISTS analytics_events (
+    event_id TEXT PRIMARY KEY,
+    event_name TEXT NOT NULL,
+    organization_id TEXT,
+    user_id TEXT,
+    user_role TEXT,
+    session_id TEXT,
+    order_id TEXT,
+    run_id TEXT,
+    source TEXT NOT NULL DEFAULT 'server',
+    app_version TEXT NOT NULL DEFAULT '6.1.0',
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    client_timestamp TEXT,
+    server_timestamp TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bulk_update_batch_status ON bulk_update_candidates(batch_id,status);
+CREATE INDEX IF NOT EXISTS idx_bulk_update_order ON bulk_update_candidates(order_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_event_time ON analytics_events(event_name,server_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_user_time ON analytics_events(user_id,server_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_run ON analytics_events(run_id,server_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_order ON analytics_events(order_id,server_timestamp DESC);

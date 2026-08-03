@@ -1,0 +1,1211 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "FlowOrder Agent Tools V6.1",
+    "version": "1.1.0",
+    "description": "FlowOrder订单异常诊断Agent的12个工具。新增批量自然语言更新解析和Top7组合诊断。插件固定Header配置X-FlowOrder-Agent-Key。"
+  },
+  "servers": [
+    {
+      "url": "https://ai-foreign-trade-action-system-production-ce23.up.railway.app"
+    }
+  ],
+  "paths": {
+    "/api/agent/tools/runs/start": {
+      "post": {
+        "operationId": "start_agent_run",
+        "summary": "开始一次Agent诊断运行",
+        "description": "创建运行记录并返回run_id；每次新诊断或巡检首先调用。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "goal": {
+                    "type": "string",
+                    "description": "本次诊断目标",
+                    "example": "检查我未来14天最需要处理的订单"
+                  },
+                  "trigger_type": {
+                    "type": "string",
+                    "enum": [
+                      "USER",
+                      "SCHEDULED",
+                      "WEBSITE"
+                    ],
+                    "default": "USER"
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "goal"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/candidate-orders/list": {
+      "post": {
+        "operationId": "list_candidate_orders",
+        "summary": "筛选候选订单",
+        "description": "按当前用户权限、未来14天、等待超时和高风险事件筛选候选订单。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "due_within_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 90,
+                    "default": 14
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50
+                  },
+                  "current_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "可选，默认北京时间当前时间"
+                  }
+                },
+                "required": [
+                  "current_user_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/orders/context": {
+      "post": {
+        "operationId": "get_order_diagnostic_context",
+        "summary": "读取订单诊断上下文",
+        "description": "读取订单、消息、任务、承诺、等待、依赖和物流事件。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "order_id": {
+                    "type": "string",
+                    "description": "FlowOrder订单内部ID或接口接受的订单ID"
+                  },
+                  "event_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "order_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/anomalies/build": {
+      "post": {
+        "operationId": "build_anomaly_candidate",
+        "summary": "生成异常候选",
+        "description": "基于确定性规则生成带证据的异常候选，不代表正式确认。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "order_id": {
+                    "type": "string"
+                  },
+                  "anomaly_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "SUPPLIER_COMMITMENT_OVERDUE",
+                        "CUSTOMER_CONFIRMATION_BLOCKING",
+                        "DELIVERY_RISK",
+                        "LOGISTICS_EXCEPTION",
+                        "INFORMATION_GAP"
+                      ]
+                    }
+                  },
+                  "current_time": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "order_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/anomalies/rank": {
+      "post": {
+        "operationId": "rank_anomaly_candidates",
+        "summary": "排序异常候选",
+        "description": "对已有候选做Top N排序，不足7笔不凑数。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "top_n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 7
+                  },
+                  "items": {
+                    "type": "array",
+                    "description": "已经生成的异常候选数组",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "items"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/task-drafts/create": {
+      "post": {
+        "operationId": "create_task_draft",
+        "summary": "生成任务草稿",
+        "description": "只生成DRAFT，不创建正式任务。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "order_id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "recommended_action": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string",
+                    "enum": [
+                      "customer",
+                      "factory",
+                      "supplier",
+                      "internal",
+                      "manager"
+                    ]
+                  },
+                  "owner_user_id": {
+                    "type": "string"
+                  },
+                  "risk_level": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high",
+                      "critical"
+                    ]
+                  },
+                  "business_deadline": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "order_id",
+                  "title"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/message-drafts/create": {
+      "post": {
+        "operationId": "draft_message",
+        "summary": "生成沟通草稿",
+        "description": "生成待人工审核草稿，不自动发送。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "order_id": {
+                    "type": "string"
+                  },
+                  "recipient_role": {
+                    "type": "string",
+                    "enum": [
+                      "customer",
+                      "supplier",
+                      "factory",
+                      "internal"
+                    ]
+                  },
+                  "questions_to_ask": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "user_instruction": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "order_id",
+                  "recipient_role"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/approvals/create": {
+      "post": {
+        "operationId": "create_approval_request",
+        "summary": "创建人工审批",
+        "description": "为正式写入或高风险动作创建审批请求。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "order_id": {
+                    "type": "string"
+                  },
+                  "candidate_id": {
+                    "type": "string"
+                  },
+                  "action_type": {
+                    "type": "string",
+                    "enum": [
+                      "CONFIRM_ANOMALY",
+                      "CREATE_TASK",
+                      "RECORD_CONTACT",
+                      "UPDATE_ORDER",
+                      "SEND_MESSAGE",
+                      "ACCEPT_DELAY",
+                      "HIGH_RISK_OVERRIDE"
+                    ]
+                  },
+                  "action_payload": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "idempotency_key": {
+                    "type": "string",
+                    "description": "业务幂等键，每次正式动作必须唯一"
+                  },
+                  "high_risk": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "action_type",
+                  "idempotency_key"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/approvals/status": {
+      "post": {
+        "operationId": "get_approval_status",
+        "summary": "查询审批状态",
+        "description": "查询审批状态；PENDING时不得假设已执行。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "approval_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "approval_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/runs/complete": {
+      "post": {
+        "operationId": "complete_agent_run",
+        "summary": "完成Agent运行",
+        "description": "记录最终结果和停止原因。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "start_agent_run返回的运行ID"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "COMPLETED",
+                      "PARTIAL",
+                      "FAILED"
+                    ],
+                    "default": "COMPLETED"
+                  },
+                  "stop_reason": {
+                    "type": "string"
+                  },
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "run_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/bulk-updates/parse": {
+      "post": {
+        "operationId": "parse_bulk_order_updates",
+        "summary": "解析一段多订单进展文本",
+        "description": "把用户粘贴的一大段订单进展拆分、匹配订单并生成字段更新候选。不会直接写回；返回review_url供用户人工确认。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "可选，start_agent_run返回的运行ID"
+                  },
+                  "text": {
+                    "type": "string",
+                    "description": "包含一笔或多笔订单最新进展的自然语言文本",
+                    "example": "PO-AGENT-001工厂说现在做到60%，8月5日完工；PO-AGENT-002客户明天下午回复彩盒确认结果。"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "调用来源",
+                    "default": "agent_tool"
+                  }
+                },
+                "required": [
+                  "current_user_id",
+                  "text"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    },
+    "/api/agent/tools/priority-orders/diagnose": {
+      "post": {
+        "operationId": "diagnose_priority_orders",
+        "summary": "一次完成Top7订单异常诊断",
+        "description": "组合工具：在一次调用内完成候选池筛选、证据读取、异常生成和Top7排序，不为凑数制造异常。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "organization_id": {
+                    "type": "string",
+                    "description": "组织ID，演示环境填写ORG-DEMO",
+                    "default": "ORG-DEMO"
+                  },
+                  "current_user_id": {
+                    "type": "string",
+                    "description": "当前FlowOrder用户ID，例如USER-1或MANAGER-1",
+                    "example": "USER-1"
+                  },
+                  "current_role": {
+                    "type": "string",
+                    "description": "当前角色",
+                    "enum": [
+                      "operator",
+                      "manager"
+                    ],
+                    "default": "operator"
+                  },
+                  "allowed_owner_ids": {
+                    "type": "array",
+                    "description": "可选的额外授权负责人ID",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "run_id": {
+                    "type": "string",
+                    "description": "可选，start_agent_run返回的运行ID"
+                  },
+                  "due_within_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 90,
+                    "default": 14,
+                    "description": "默认交期时间窗口"
+                  },
+                  "top_n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 7,
+                    "default": 7,
+                    "description": "最多返回7个异常候选"
+                  },
+                  "scan_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "候选池最多扫描订单数"
+                  },
+                  "current_time": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "可选，默认北京时间当前时间"
+                  },
+                  "persist_candidates": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "是否保存异常候选供网站查看"
+                  }
+                },
+                "required": [
+                  "current_user_id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数或业务条件错误"
+          },
+          "401": {
+            "description": "插件密钥错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "资源不存在"
+          },
+          "429": {
+            "description": "达到工具调用或时间预算"
+          }
+        }
+      }
+    }
+  }
+}

@@ -14,6 +14,7 @@ from communication_workflows_patch import register_communication_workflows_patch
 from excel_import_patch import register_excel_import_patch
 import agent_api
 from agent_api import register_agent_api
+from v61_extensions import register_v61_extensions
 
 from coze_integration import (
     CozeWorkflowError,
@@ -34,25 +35,28 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="6.0.0")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
 register_agent_api(app)
+register_v61_extensions(app)
 
 
 def storage_status() -> dict[str, Any]:
     """Describe whether the active SQLite file is on durable storage."""
     path = DB_PATH.resolve()
     path_text = str(path)
-    persistent_prefixes = ("/var/data/", "/opt/render/project/src/storage/")
+    persistent_prefixes = ("/var/data/", "/opt/render/project/src/storage/", "/data/")
     on_persistent_path = any(path_text.startswith(prefix) for prefix in persistent_prefixes)
     render_runtime = bool(os.getenv("RENDER")) or Path("/opt/render/project/src").exists()
+    railway_runtime = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+    cloud_runtime = render_runtime or railway_runtime
     warning = None
-    if render_runtime and not on_persistent_path:
+    if cloud_runtime and not on_persistent_path:
         warning = (
-            "当前数据库不在Render持久盘目录中，重新部署、重启或休眠后数据可能丢失。"
-            "请挂载/var/data并设置DB_PATH=/var/data/action_layer.db。"
+            "当前数据库不在云平台持久卷目录中，重新部署或重启后数据可能丢失。"
+            "Railway请挂载/data并设置DB_PATH=/data/action_layer.db；Render请挂载/var/data。"
         )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +66,7 @@ def storage_status() -> dict[str, Any]:
     return {
         "db_path": path_text,
         "render_runtime": render_runtime,
+        "railway_runtime": railway_runtime,
         "on_persistent_path": on_persistent_path,
         "writable": writable,
         "warning": warning,
@@ -165,6 +170,7 @@ def init_db() -> None:
 
 def reset_demo_data(conn: sqlite3.Connection) -> None:
     for table in [
+        "bulk_update_candidates", "bulk_update_batches", "analytics_events",
         "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
@@ -1849,7 +1855,7 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "6.0.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
+    return {"status": "ok", "version": "6.1.0", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
 
 
 @app.get("/api/system/storage")
@@ -1859,7 +1865,7 @@ def system_storage() -> dict[str, Any]:
     with db() as conn:
         status["order_count"] = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         status["task_count"] = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    status["status"] = "ok" if status["on_persistent_path"] or not status["render_runtime"] else "warning"
+    status["status"] = "ok" if status["on_persistent_path"] or not (status["render_runtime"] or status.get("railway_runtime")) else "warning"
     return status
 
 
@@ -1871,6 +1877,7 @@ def clear_business_data(conn: sqlite3.Connection) -> None:
     tables = [
         "communication_events", "communication_workflow_runs", "communication_drafts",
         "communication_task_candidates", "order_import_rows", "order_import_batches", "intake_jobs",
+        "bulk_update_candidates", "bulk_update_batches", "analytics_events",
         "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",

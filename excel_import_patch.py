@@ -19,6 +19,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
+from analytics import ensure_analytics_schema, track_event
 
 PATCH_VERSION = "3.3.0-excel-import-owner-binding"
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -178,6 +179,7 @@ def _resolve_column(existing: Iterable[str], canonical: str) -> str | None:
 
 
 def _ensure_patch_schema(conn: sqlite3.Connection) -> None:
+    ensure_analytics_schema(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS order_import_batches (
@@ -968,6 +970,13 @@ def register_excel_import_patch(app: FastAPI) -> None:
             if batch["status"] == "COMMITTED":
                 previous = json.loads(batch["summary_json"])
                 return {"status": "DUPLICATE_SKIPPED", "batch_id": payload.batch_id, **previous}
+            track_event(
+                conn, "order_import_started", organization_id="ORG-DEMO", user_id=payload.current_user_id,
+                user_role="manager" if payload.current_user_id == "MANAGER-1" else "operator", source="website",
+                properties={"batch_id": payload.batch_id, "source_filename": batch["source_filename"],
+                            "total_rows": batch["total_rows"], "importable_rows": batch["importable_rows"]},
+            )
+            conn.commit()
             rows = conn.execute("SELECT * FROM order_import_rows WHERE batch_id=? ORDER BY row_number", (payload.batch_id,)).fetchall()
             column_map = _map_order_columns(conn)
             order_no_column = column_map.get("order_no")
@@ -1029,9 +1038,24 @@ def register_excel_import_patch(app: FastAPI) -> None:
                     "UPDATE order_import_batches SET status='COMMITTED',summary_json=?,committed_at=? WHERE batch_id=?",
                     (json.dumps(result_summary, ensure_ascii=False), _now_iso(), payload.batch_id),
                 )
+                track_event(
+                    conn, "order_import_completed", organization_id="ORG-DEMO", user_id=payload.current_user_id,
+                    user_role="manager" if payload.current_user_id == "MANAGER-1" else "operator", source="website",
+                    properties={"batch_id": payload.batch_id, "total_rows": len(rows), "created_count": inserted,
+                                "updated_count": updated, "skipped_count": skipped, "failed_count": failed},
+                )
                 conn.commit()
-            except Exception:
+            except Exception as exc:
                 conn.rollback()
+                try:
+                    track_event(
+                        conn, "order_import_failed", organization_id="ORG-DEMO", user_id=payload.current_user_id,
+                        user_role="manager" if payload.current_user_id == "MANAGER-1" else "operator", source="website",
+                        properties={"batch_id": payload.batch_id, "error_type": type(exc).__name__},
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
                 raise
         return {"status": "COMMITTED", "batch_id": payload.batch_id, **result_summary}
 
