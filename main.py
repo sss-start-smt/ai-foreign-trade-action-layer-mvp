@@ -35,7 +35,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="6.1.2")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.1.3")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
@@ -1855,7 +1855,8 @@ def home() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
-    return {"status": "ok", "version": "6.1.2", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
+    return {"status": "ok", "version": "6.1.3", "db": str(DB_PATH), "storage": storage_status(),
+            "coze": coze_status(), "agent": agent_api.coze_agent_status()}
 
 
 @app.get("/api/system/storage")

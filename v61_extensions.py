@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 import agent_api
 from analytics import build_analytics_summary, ensure_analytics_schema, track_event
 
-VERSION = "6.1.2"
+VERSION = "6.1.3"
 
 SAFE_ORDER_FIELDS = {
     "current_progress",
@@ -708,74 +708,26 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
             persist=bool(payload.get("persist_candidates", True)),
         )
         all_candidates.extend(result["items"])
-    # 先对全部异常候选排序，再按订单聚合，确保Top N表示Top N笔不同订单。
-    ranked_candidates = agent_api.rank_candidates_logic(all_candidates, max(1, len(all_candidates)))
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    order_sequence: list[str] = []
-    for item in ranked_candidates:
-        order_key = str(item.get("order_id") or item.get("order_no") or item.get("candidate_id") or "")
-        if order_key not in grouped:
-            grouped[order_key] = []
-            order_sequence.append(order_key)
-        grouped[order_key].append(item)
-
-    aggregated_orders: list[dict[str, Any]] = []
-    for order_key in order_sequence:
-        anomalies = grouped[order_key]
-        primary = dict(anomalies[0])
-        anomaly_types: list[str] = []
-        combined_evidence: list[str] = []
-        combined_missing: list[str] = []
-        combined_actions: list[str] = []
-        for anomaly in anomalies:
-            anomaly_type = str(anomaly.get("anomaly_type") or "")
-            if anomaly_type and anomaly_type not in anomaly_types:
-                anomaly_types.append(anomaly_type)
-            for evidence in anomaly.get("evidence") or []:
-                text = str(evidence)
-                if text and text not in combined_evidence:
-                    combined_evidence.append(text)
-            for missing in anomaly.get("missing_information") or []:
-                text = str(missing)
-                if text and text not in combined_missing:
-                    combined_missing.append(text)
-            action = str(anomaly.get("recommended_action") or "").strip()
-            if action and action not in combined_actions:
-                combined_actions.append(action)
-
-        multi_anomaly_bonus = min(10, max(0, len(anomalies) - 1) * 5)
-        primary["priority_score"] = round(float(primary.get("priority_score") or 0) + multi_anomaly_bonus, 2)
-        primary["order_anomaly_count"] = len(anomalies)
-        primary["anomaly_types"] = anomaly_types
-        primary["secondary_anomaly_types"] = anomaly_types[1:]
-        primary["evidence"] = combined_evidence
-        primary["missing_information"] = combined_missing
-        primary["recommended_action"] = "；".join(combined_actions)
-        primary["approval_required"] = any(bool(x.get("approval_required")) for x in anomalies)
-        primary["priority_reasons"] = (
-            combined_evidence[:3]
-            + ([f"同一订单共识别{len(anomalies)}类异常"] if len(anomalies) > 1 else [])
-        )
-        aggregated_orders.append(primary)
-
-    aggregated_orders.sort(
-        key=lambda x: (-float(x.get("priority_score") or 0), str(x.get("order_no") or ""))
-    )
-    ranked = aggregated_orders[:top_n]
-    for index, item in enumerate(ranked, 1):
-        item["rank"] = index
+    # V6.1.3: information gaps are reported separately and never pad the risk Top N.
+    aggregated = agent_api.aggregate_order_candidates(all_candidates, top_n)
+    ranked = aggregated["risk_items"]
+    information_gaps = aggregated["information_gaps"]
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     result = {
         "scope": screened["scope"],
         "due_within_days": due_days,
         "screened_order_count": screened["count"],
-        "anomaly_candidate_count": len(all_candidates),
+        "anomaly_candidate_count": aggregated["risk_signal_count"],
+        "anomaly_signal_count": aggregated["risk_signal_count"],
+        "risk_order_count": len(ranked),
+        "information_gap_order_count": aggregated["information_gap_order_count"],
+        "information_gaps": information_gaps,
         "count": len(ranked),
         "items": ranked,
         "selection_strategy": {
             "candidate_pool": "当前用户有权限的活跃订单，满足未来时间窗口或承诺超时、高风险任务、客户确认阻塞、高风险消息、物流异常任一条件",
-            "ranking": "先按异常基础分、严重程度和信息缺口计算候选分；再按订单聚合，多异常订单加分；同分按订单号稳定排序",
+            "ranking": "先过滤信息缺口，再按异常基础分与严重程度排序；同订单异常聚合，多异常订单加分；同分按订单号稳定排序",
             "not_padded": True,
             "max_items": 7,
             "unit": "unique_order",
@@ -793,7 +745,9 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
         source=str(payload.get("source") or "agent_tool"),
         properties={
             "screened_order_count": screened["count"],
-            "anomaly_candidate_count": len(all_candidates),
+            "anomaly_candidate_count": aggregated["risk_signal_count"],
+            "risk_order_count": len(ranked),
+            "information_gap_order_count": aggregated["information_gap_order_count"],
             "top_count": len(ranked),
             "duration_ms": duration_ms,
         },
@@ -873,6 +827,8 @@ def register_v61_extensions(app) -> None:
                 response={
                     "screened_order_count": result["screened_order_count"],
                     "anomaly_candidate_count": result["anomaly_candidate_count"],
+                    "risk_order_count": result["risk_order_count"],
+                    "information_gap_order_count": result["information_gap_order_count"],
                     "count": result["count"],
                 },
                 status="SUCCESS",

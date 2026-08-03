@@ -153,8 +153,11 @@ function bindShell(){
 function updateProfile(){const op=currentOperator();$('#profileName').textContent=op.name;$('#profileRole').textContent=op.role;$('#profileAvatar').textContent=op.name.slice(0,1);$$('[data-route="manage"]').forEach(el=>el.hidden=op.user_id!=='MANAGER-1');const settingsLabel=$('[data-route="settings"] span');if(settingsLabel)settingsLabel.textContent=op.user_id==='MANAGER-1'?'设置与连接':'身份与设置';document.body.dataset.role=op.user_id==='MANAGER-1'?'manager':'operator'}
 function updateHealth(h,error=''){
   const dot=$('#sidebarLiveDot');dot.className='live-dot';
-  if(!h){dot.classList.add('bad');$('#sidebarStatus').textContent='服务连接失败';$('#sidebarStatusDetail').textContent=error||'请查看Render日志';return}
-  const ready=h.coze?.ready;dot.classList.toggle('warn',!ready);$('#sidebarStatus').textContent=ready?'自动化已连接':'网站已连接';$('#sidebarStatusDetail').textContent=ready?`系统 v${h.version}`:'部分自动化配置未完成'
+  if(!h){dot.classList.add('bad');$('#sidebarStatus').textContent='后端服务异常';$('#sidebarStatusDetail').textContent=error||'请查看Railway部署日志';return}
+  const agentConfigured=!!h.agent?.configured;
+  dot.classList.toggle('warn',!agentConfigured);
+  $('#sidebarStatus').textContent='后端服务正常';
+  $('#sidebarStatusDetail').textContent=`v${h.version} · Coze Agent${agentConfigured?'已配置':'未配置'}`;
 }
 function updateBadges(todayCount,reviewCount,agentCount=null){if(todayCount!=null){$('#todayBadge').hidden=!todayCount;$('#todayBadge').textContent=todayCount}if(reviewCount!=null){$('#reviewBadge').hidden=!reviewCount;$('#reviewBadge').textContent=reviewCount}if(agentCount!=null&&$('#agentBadge')){$('#agentBadge').hidden=!agentCount;$('#agentBadge').textContent=agentCount}}
 async function renderRoute(resetSearch=true,preserveSearchFocus=false){
@@ -261,33 +264,90 @@ function fieldLabel(name){return({packaging_method:'包装方式',requested_deli
 const anomalyLabels={SUPPLIER_COMMITMENT_OVERDUE:'供应商承诺超时',CUSTOMER_CONFIRMATION_BLOCKING:'客户确认阻塞',DELIVERY_RISK:'交期风险',LOGISTICS_EXCEPTION:'物流异常',INFORMATION_GAP:'信息不足'};
 const anomalyStatusLabels={ANOMALY_CANDIDATE:'异常候选',PENDING_CONFIRMATION:'待确认',CONFIRMED:'已确认',REJECTED:'已驳回',RESOLVED:'已解决'};
 function severityBadge(v='LOW'){const map={CRITICAL:'严重',HIGH:'高',MEDIUM:'中',LOW:'低'};return `<span class="risk-badge ${v==='CRITICAL'?'critical':v.toLowerCase()}">${map[v]||v}</span>`}
-function agentCandidateCard(c){const evidence=c.evidence||safeJson(c.evidence_json,[]),missing=c.missing_information||safeJson(c.missing_information_json,[]);return `<article class="agent-candidate-card"><div class="agent-candidate-head"><div><span class="agent-rank">${esc(c.rank||'')}</span><strong>${esc(c.order_no||c.order_id)} · ${esc(anomalyLabels[c.anomaly_type]||c.anomaly_type)}</strong><small>${esc(c.customer_name||'')}</small></div>${severityBadge(c.severity)}</div><p class="agent-action">${esc(c.recommended_action||'待补充处置建议')}</p><div class="evidence-list">${evidence.slice(0,4).map(x=>`<span>${esc(x)}</span>`).join('')||'<span>暂无证据摘要</span>'}</div>${missing.length?`<div class="missing-note">仍需补充：${esc(missing.join('、'))}</div>`:''}<footer><span class="status ${esc(c.status)}">${esc(anomalyStatusLabels[c.status]||c.status)}</span><div class="button-row">${['ANOMALY_CANDIDATE','PENDING_CONFIRMATION'].includes(c.status)?`<button class="btn small primary" data-anomaly-confirm="${esc(c.candidate_id)}">确认异常</button><button class="btn small" data-anomaly-reject="${esc(c.candidate_id)}">驳回</button>`:''}${c.status==='CONFIRMED'?`<button class="btn small" data-anomaly-resolve="${esc(c.candidate_id)}">标记解决</button>`:''}<button class="btn small soft" data-go="orders/${esc(c.order_id)}">查看订单</button></div></footer></article>`}
+function agentCandidateCard(c){
+  const evidence=c.evidence||safeJson(c.evidence_json,[]),missing=c.missing_information||safeJson(c.missing_information_json,[]);
+  const secondary=(c.secondary_anomaly_types||[]).map(x=>anomalyLabels[x]||x);
+  return `<article class="agent-candidate-card"><div class="agent-candidate-head"><div><span class="agent-rank">${esc(c.rank||'')}</span><strong>${esc(c.order_no||c.order_id)} · ${esc(anomalyLabels[c.primary_anomaly_type||c.anomaly_type]||c.primary_anomaly_type||c.anomaly_type)}</strong><small>${esc(c.customer_name||'')}${c.order_anomaly_count>1?` · 共${Number(c.order_anomaly_count)}类异常`:''}</small></div>${severityBadge(c.severity)}</div>${secondary.length?`<div class="secondary-anomalies">次要异常：${secondary.map(esc).join('、')}</div>`:''}<p class="agent-action">${esc(c.recommended_action||'待补充处置建议')}</p><div class="evidence-list">${evidence.slice(0,4).map(x=>`<span>${esc(x)}</span>`).join('')||'<span>暂无证据摘要</span>'}</div>${missing.length?`<div class="missing-note">仍需补充：${esc(missing.join('、'))}</div>`:''}<footer><span class="status ${esc(c.status)}">${esc(anomalyStatusLabels[c.status]||c.status||'待确认')}</span><div class="button-row">${['ANOMALY_CANDIDATE','PENDING_CONFIRMATION'].includes(c.status)?`<button class="btn small primary" data-anomaly-confirm="${esc(c.candidate_id)}">确认异常</button><button class="btn small" data-anomaly-reject="${esc(c.candidate_id)}">驳回</button>`:''}${c.status==='CONFIRMED'?`<button class="btn small" data-anomaly-resolve="${esc(c.candidate_id)}">标记解决</button>`:''}<button class="btn small soft" data-go="orders/${esc(c.order_id)}">查看订单</button></div></footer></article>`
+}
+function agentConnectionCard(label,state,detail,tone='green'){return `<div class="agent-connection-card ${esc(tone)}"><span>${esc(label)}</span><strong>${esc(state)}</strong><small>${esc(detail)}</small></div>`}
+function agentRunTrace(run,calls=[]){
+  if(!run)return emptyState('还没有运行轨迹','启动一次Coze Agent诊断或规则巡检后，这里会显示可审计步骤。');
+  const result=run.result||{},mode=result.execution_mode||(/RULE/.test(run.trigger_type||'')?'RULE_INSPECTION':'COZE_AGENT');
+  const labels={start_agent_run:'创建Agent运行',diagnose_priority_orders:'调用组合诊断技能',deterministic_rule_inspection:'执行确定性规则巡检',create_task_draft:'创建任务草稿',create_approval_request:'创建人工审批',complete_agent_run:'完成Agent运行'};
+  const steps=calls.map((c,i)=>`<li><b>${i+1}</b><div><strong>${esc(labels[c.tool_name]||c.tool_name)}</strong><small>${esc(c.status||'')}${c.duration_ms!=null?` · ${Number(c.duration_ms)}ms`:''}</small>${c.response?.task_draft_id?`<code>task_draft_id: ${esc(c.response.task_draft_id)}</code>`:''}${c.response?.approval_id?`<code>approval_id: ${esc(c.response.approval_id)}</code>`:''}</div></li>`).join('');
+  return `<div class="agent-trace-head"><div><span>${mode==='COZE_AGENT'?'Coze Agent运行':'规则巡检运行'}</span><strong>${esc(run.run_id)}</strong></div><div><span>停止原因</span><strong>${esc(run.stop_reason||run.status||'运行中')}</strong></div><div><span>耗时</span><strong>${run.duration_ms==null?'—':`${Number(run.duration_ms)}ms`}</strong></div></div><ol class="agent-trace-list">${steps||'<li><b>1</b><div><strong>运行记录已创建</strong><small>暂无工具调用明细</small></div></li>'}</ol>`
+}
+
 async function pageAgent(root){
   const role=currentUser()==='MANAGER-1'?'manager':'operator';
-  const data=await api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`);
+  const [data,status]=await Promise.all([
+    api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`),
+    api('/api/agent/status')
+  ]);
   updateBadges(null,null,data.summary.candidate_count);
   const latest=data.reports?.[0]?.report||null;
   const latestItems=latest?.top_items||[];
-  root.innerHTML=`<div class="page-stack"><section class="agent-hero"><div><span>FLOWORDER AGENT · HUMAN IN THE LOOP</span><h2>让Agent先查证据，再由人确认业务异常</h2><p>默认检查本人负责且未来14天内交期的活跃订单；承诺超时、高风险新消息和物流异常会越过时间窗口进入候选。</p></div><div class="button-row"><button class="btn primary" id="runAgentInspection">立即巡检</button><button class="btn" id="showAgentPolicy">查看自治边界</button></div></section><section class="panel agent-chat-panel"><div class="panel-head"><div><h2>向FlowOrder Agent发起目标</h2><p>网站与Coze使用同一个已发布Agent；未配置Bot ID时仍可使用本地规则巡检。</p></div></div><div class="agent-chat-box"><textarea id="agentQuestion" rows="3">帮我检查今天最需要处理的订单，返回最多7笔，并说明证据、缺失信息和建议动作。</textarea><button class="btn primary" id="askAgent">让Agent诊断</button></div><div id="agentAnswer" class="agent-answer" hidden></div></section><section class="metric-grid">${metric('异常候选',data.summary.candidate_count,'red','alert','需要人工确认')}${metric('严重异常',data.summary.critical_count,'amber','alert','优先复核')}${metric('待审批动作',data.summary.pending_approval_count,'blue','review','尚未正式执行')}${metric('巡检报告',data.summary.report_count,'green','chart','每天8:30')}</section>${latest?`<section class="panel"><div class="panel-head"><div><h2>最近一次巡检 Top ${latestItems.length}</h2><p>${esc(latest.generated_at||'')} · 筛选${Number(latest.screened_order_count||0)}笔订单 · 发现${Number(latest.anomaly_candidate_count||0)}个候选</p></div><span class="status">人工确认后才生效</span></div><div class="agent-candidate-grid">${latestItems.map(agentCandidateCard).join('')||emptyState('本次未发现异常候选','Agent不会为了凑满Top 7而制造异常。')}</div></section>`:''}<section class="panel"><div class="panel-head"><div><h2>全部异常候选</h2><p>Agent可自主检索、诊断和排序；正式异常、任务、写回与外部发送均需要人工审批。</p></div></div><div class="agent-candidate-grid">${data.candidates.map(agentCandidateCard).join('')||emptyState('还没有异常候选','运行一次巡检，或在Coze中向FlowOrder Agent发起诊断。')}</div></section><section class="panel"><div class="panel-head"><div><h2>待审批动作</h2><p>高风险动作要求主管审批；首版不会自动发送客户或工厂消息。</p></div></div><div class="approval-list">${data.approvals.filter(x=>x.status==='PENDING').map(a=>`<article><div><strong>${esc(a.action_type)}</strong><small>${esc(a.order_no||a.order_id||'')}</small></div><span class="status NEEDS_CONFIRMATION">${esc(a.required_role==='manager'?'需要主管':'需要人工')}</span></article>`).join('')||emptyState('当前没有待审批动作','Agent生成的正式动作会进入这里。')}</div></section></div>`;
+  const latestGaps=latest?.information_gaps||[];
+  const cozeConfigured=!!status.coze_agent?.configured;
+  const scheduleConfigured=!!status.daily_schedule?.configured;
+  const latestRun=data.latest_run;
+  const latestCalls=data.latest_tool_calls||[];
+  const maxCalls=Number(status.limits?.max_tool_calls||8),maxSeconds=Number(status.limits?.max_duration_seconds||120);
+  const currentMetrics=latest?[
+    ['扫描订单',Number(latest.screened_order_count||0),'green','orders','本次运行'],
+    ['风险订单',Number(latest.risk_order_count??latestItems.length),'red','alert','最多7笔不同订单'],
+    ['异常信号',Number((latest.anomaly_signal_count??latest.anomaly_candidate_count) || 0),'amber','alert','同一订单可含多信号'],
+    ['信息缺口',Number(latest.information_gap_order_count??latestGaps.length),'blue','review','单独展示，不进风险榜']
+  ]:[['扫描订单',0,'green','orders','尚未运行'],['风险订单',0,'red','alert','尚未运行'],['异常信号',0,'amber','alert','尚未运行'],['信息缺口',0,'blue','review','尚未运行']];
+  root.innerHTML=`<div class="page-stack">
+    <section class="agent-hero"><div><span>FLOWORDER AGENT · HUMAN IN THE LOOP</span><h2>Agent理解目标、选择技能，确定性规则与人工审批共同兜底</h2><p>支持跨订单异常巡检、单订单证据解释和批量进展解析。Coze Agent与规则巡检是两种明确模式，不会静默互相冒充。</p></div><div class="agent-mode-chip ${cozeConfigured?'online':'offline'}"><i></i><div><small>当前Agent模式</small><strong>${cozeConfigured?'Coze Agent已配置':'规则巡检可用'}</strong></div></div></section>
+    <section class="agent-connection-grid">
+      ${agentConnectionCard('后端服务','正常',`FlowOrder v${status.version}`,'green')}
+      ${agentConnectionCard('Coze Agent',cozeConfigured?'已配置':'未配置',cozeConfigured?'可启动动态工具编排':'需配置Token与Bot ID',''+(cozeConfigured?'green':'amber'))}
+      ${agentConnectionCard('定时巡检',scheduleConfigured?'接口已配置':'未配置',scheduleConfigured?'计划每天08:30；需外部调度器触发':'手动规则巡检仍可使用',scheduleConfigured?'green':'blue')}
+    </section>
+    <section class="panel agent-chat-panel"><div class="panel-head"><div><h2>向FlowOrder Agent发起业务目标</h2><p>用户只描述目标；Top N、审批边界和禁止自动发送等约束由系统配置执行。</p></div><button class="btn" id="showAgentPolicy">查看自治边界</button></div>
+      <div class="agent-goal-layout"><div><textarea id="agentQuestion" rows="3">检查我未来14天内最需要处理的订单。</textarea><div class="agent-shortcuts"><button type="button" data-agent-prompt="检查我未来14天内最需要处理的订单。">近期风险巡检</button><button type="button" data-agent-prompt="解释最高优先级订单为什么需要先处理。">解释排序原因</button><button type="button" data-agent-prompt="检查是否存在已经超过承诺回复时间的事项。">检查超时承诺</button></div></div>
+        <div class="agent-options"><label><span>巡检范围</span><select id="agentDueDays"><option value="7">未来7天</option><option value="14" selected>未来14天</option><option value="30">未来30天</option></select></label><label><span>最多返回</span><select id="agentTopN"><option value="3">3笔</option><option value="5">5笔</option><option value="7" selected>7笔</option></select></label><label class="agent-check"><input type="checkbox" id="agentCreateTask" checked><span>为最高优先级生成任务草稿</span></label><label class="agent-check"><input type="checkbox" id="agentCreateApproval" checked><span>需要正式动作时创建审批</span></label></div></div>
+      <div class="button-row agent-run-buttons"><button class="btn primary" id="askAgent" ${cozeConfigured?'':'disabled'}>启动Agent诊断</button><button class="btn" id="runAgentInspection">仅运行规则巡检</button><span class="agent-mode-help">${cozeConfigured?'Agent会动态选择组合工具或原子工具。':'Coze未配置，Agent按钮已禁用；规则巡检不会被标记为Agent结果。'}</span></div><div id="agentAnswer" class="agent-answer" hidden></div>
+    </section>
+    <section><div class="section-label-row"><div><h2>本次运行</h2><p>${latest?`${esc(latest.generated_at||'')} · ${latest.execution_mode==='RULE_INSPECTION'?'规则巡检':'Agent诊断'}`:'尚无巡检结果'}</p></div></div><div class="metric-grid">${currentMetrics.map(x=>metric(...x)).join('')}</div></section>
+    <section class="panel"><div class="panel-head"><div><h2>可审计执行轨迹</h2><p>展示目标路由、工具调用、真实ID与停止原因，不展示模型私有推理。</p></div>${latestRun?`<span class="status">${/RULE/.test(latestRun.trigger_type||'')?'规则模式':'Agent模式'}</span>`:''}</div><div class="panel-body">${agentRunTrace(latestRun,latestCalls)}</div></section>
+    ${latest?`<section class="panel"><div class="panel-head"><div><h2>最近一次风险订单 Top ${latestItems.length}</h2><p>筛选${Number(latest.screened_order_count||0)}笔 · ${Number((latest.anomaly_signal_count??latest.anomaly_candidate_count) || 0)}个异常信号 · 不足7笔不补齐</p></div><span class="status">人工确认后才生效</span></div><div class="agent-candidate-grid">${latestItems.map(agentCandidateCard).join('')||emptyState('本次没有真实风险订单','系统不会用信息缺口凑满Top 7。')}</div></section>`:''}
+    ${latestGaps.length?`<section class="panel information-gap-panel"><div class="panel-head"><div><h2>本次信息缺口</h2><p>这些订单需要补充事实，但不属于风险Top 7。</p></div><span class="tag">${latestGaps.length}笔</span></div><div class="information-gap-list">${latestGaps.map(g=>`<article><div><strong>${esc(g.order_no||g.order_id)}</strong><small>${esc((g.missing_information||[]).join('、')||'缺少动态信息')}</small></div><button class="btn small soft" data-go="orders/${esc(g.order_id)}">补充信息</button></article>`).join('')}</div></section>`:''}
+    <section><div class="section-label-row"><div><h2>历史累计</h2><p>历史存量与本次运行分开统计，避免把累计候选误认为本次Top 7。</p></div></div><div class="metric-grid">${metric('累计风险候选',data.summary.candidate_count,'red','alert','待确认或处理中')}${metric('累计信息缺口',data.summary.information_gap_count,'amber','review','不进入风险榜')}${metric('待审批动作',data.summary.pending_approval_count,'blue','review','尚未正式执行')}${metric('巡检报告',data.summary.report_count,'green','chart','历史报告数')}</div></section>
+    <section class="panel"><div class="panel-head"><div><h2>历史风险候选</h2><p>正式异常、任务、写回与外部发送仍受人工审批控制。</p></div></div><div class="agent-candidate-grid">${data.candidates.map(agentCandidateCard).join('')||emptyState('还没有风险候选','启动Agent诊断或规则巡检后，真实风险会出现在这里。')}</div></section>
+    <section class="panel"><div class="panel-head"><div><h2>待审批动作</h2><p>高风险动作必须等待人工；系统不会自动发送客户或工厂消息。</p></div></div><div class="approval-list">${data.approvals.filter(x=>x.status==='PENDING').map(a=>`<article><div><strong>${esc(a.action_type)}</strong><small>${esc(a.order_no||a.order_id||'')} · ${esc(a.approval_id)}</small></div><span class="status NEEDS_CONFIRMATION">${esc(a.required_role==='manager'?'需要主管':'需要人工')}</span></article>`).join('')||emptyState('当前没有待审批动作','Agent生成的正式动作会进入这里。')}</div></section>
+  </div>`;
+  $$('[data-agent-prompt]',root).forEach(b=>b.onclick=()=>{$('#agentQuestion',root).value=b.dataset.agentPrompt});
   $('#askAgent',root).onclick=async()=>{
     const b=$('#askAgent',root),q=$('#agentQuestion',root).value.trim(),box=$('#agentAnswer',root);
     if(!q)return toast('请输入诊断目标','error');
-    b.disabled=true;b.textContent='Agent正在调用工具…';box.hidden=false;
-    box.innerHTML='<div class="loading-state compact"><span></span><p>正在检索订单、消息、等待和依赖证据…</p></div>';
+    b.disabled=true;b.textContent='Agent正在选择工具…';box.hidden=false;
+    box.innerHTML='<div class="loading-state compact"><span></span><p>正在理解目标、选择工具并检索业务证据…</p></div>';
     try{
-      const r=await api('/api/agent/chat',{method:'POST',body:JSON.stringify({question:q,current_user_id:currentUser(),current_role:role}),timeoutMs:90000});
-      box.innerHTML=`<strong>Agent诊断结果</strong><pre>${esc(r.answer||'Agent未返回文本结果')}</pre><small>耗时 ${Number(r.duration_ms||0)/1000}s${r.conversation_id?' · 已保留Coze会话':''}</small>`;
+      const payload={question:q,current_user_id:currentUser(),current_role:role,due_within_days:Number($('#agentDueDays',root).value),top_n:Number($('#agentTopN',root).value),create_task_draft:$('#agentCreateTask',root).checked,create_approval_request:$('#agentCreateApproval',root).checked};
+      const r=await api('/api/agent/chat',{method:'POST',body:JSON.stringify(payload),timeoutMs:(maxSeconds+20)*1000});
+      const runId=r.run?.run_id||'';
+      box.innerHTML=`<strong>Coze Agent诊断结果</strong><pre>${esc(r.answer||'Agent未返回文本结果')}</pre><small>耗时 ${(Number(r.duration_ms||0)/1000).toFixed(1)}s${runId?` · run_id: ${esc(runId)}`:''}${r.conversation_id?' · 已保留Coze会话':''}</small><p class="agent-no-fallback">本结果来自Coze Agent；如调用失败，系统不会静默替换成规则巡检结果。</p>`;
+      toast('Agent运行完成，可刷新查看执行轨迹','success');
     }catch(e){
-      box.innerHTML=`<strong>暂未连接Coze Agent</strong><p>${esc(e.message)}</p><p>你仍可点击“立即巡检”使用确定性规则完成异常候选生成。</p>`;
+      box.innerHTML=`<strong>Coze Agent调用未完成</strong><p>${esc(e.message)}</p><p>本次没有自动切换为规则结果。需要兜底时，请明确点击“仅运行规则巡检”。</p>`;
       toast(e.message,'error');
-    }finally{b.disabled=false;b.textContent='让Agent诊断'}
+    }finally{b.disabled=!cozeConfigured;b.textContent='启动Agent诊断'}
   };
-  $('#runAgentInspection',root).onclick=async()=>{const b=$('#runAgentInspection',root);b.disabled=true;b.textContent='正在筛选与诊断…';try{await api('/api/agent/inspection/run',{method:'POST',body:JSON.stringify({current_user_id:currentUser(),current_role:role,due_within_days:14,top_n:7,goal:'检查今天最需要处理的订单',trigger_type:'MANUAL'}),timeoutMs:60000});toast('巡检完成，异常仍需人工确认','success');renderRoute(false)}catch(e){toast(e.message,'error')}finally{b.disabled=false;b.textContent='立即巡检'}};
-  $('#showAgentPolicy',root).onclick=()=>openInfoModal('Agent自治边界',`<div class="page-stack"><div class="boundary-note"><strong>Agent可以自主完成</strong><p>读取订单、查询消息与等待、识别异常候选、补充证据、排序、追问、生成任务与沟通草稿。</p></div><div class="boundary-note danger"><strong>必须人工确认</strong><p>确认正式异常、创建正式任务、修改订单字段、记录已联系、发送消息、接受延期、费用赔偿责任和高风险放行。</p></div><p>单次最多8次工具调用，最长分析60秒；证据不足、处于有效等待、工具失败或达到预算时必须停止。</p></div>`);
+  $('#runAgentInspection',root).onclick=async()=>{
+    const b=$('#runAgentInspection',root),days=Number($('#agentDueDays',root).value),topN=Number($('#agentTopN',root).value);
+    b.disabled=true;b.textContent='规则巡检中…';
+    try{await api('/api/agent/inspection/run',{method:'POST',body:JSON.stringify({current_user_id:currentUser(),current_role:role,due_within_days:days,top_n:topN,goal:`规则巡检未来${days}天订单`,trigger_type:'MANUAL_RULE'}),timeoutMs:120000});cache={operators:cache.operators};toast('规则巡检完成；结果已明确标记为规则模式','success');renderRoute(false)}catch(e){toast(e.message,'error')}finally{b.disabled=false;b.textContent='仅运行规则巡检'}
+  };
+  $('#showAgentPolicy',root).onclick=()=>openInfoModal('Agent自治边界',`<div class="page-stack"><div class="boundary-note"><strong>Agent自主完成</strong><p>理解开放目标、选择组合或原子工具、根据结果追问/停止、生成任务草稿与审批请求。</p></div><div class="boundary-note"><strong>后端确定性规则</strong><p>日期比较、权限、去重、同订单异常聚合、信息缺口过滤、Top N与幂等写入。</p></div><div class="boundary-note danger"><strong>人工承担业务责任</strong><p>正式修改订单、接受延期、费用赔偿、外发消息和高风险放行。</p></div><p>运行预算由后端返回：最多${maxCalls}次工具调用、${maxSeconds}秒；达到预算、证据不足或需要审批时停止。</p></div>`);
   $$('[data-anomaly-confirm]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyConfirm,'CONFIRM'));
   $$('[data-anomaly-reject]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyReject,'REJECT'));
   $$('[data-anomaly-resolve]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyResolve,'RESOLVE'));
+  bindRouteButtons(root);
 }
+
 async function decideAnomaly(id,decision){try{await api(`/api/agent/candidates/${encodeURIComponent(id)}/decision`,{method:'POST',body:JSON.stringify({decision,operator_id:currentUser(),current_role:currentUser()==='MANAGER-1'?'manager':'operator'})});toast(decision==='CONFIRM'?'异常已由人工确认':decision==='REJECT'?'候选已驳回':'异常已标记解决','success');renderRoute(false)}catch(e){toast(e.message,'error')}}
 function openInfoModal(title,html){openModal({eyebrow:'AGENT POLICY',title,subtitle:'受控型Agent不会绕过人工责任边界',body:html,actions:'<button class="btn primary" data-close-modal>知道了</button>'});$$('[data-close-modal]',$('#modal')).forEach(b=>b.onclick=closeModal)}
 

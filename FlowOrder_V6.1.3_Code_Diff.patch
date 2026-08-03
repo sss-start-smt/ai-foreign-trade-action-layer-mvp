@@ -1,0 +1,2032 @@
+diff --git a/CHANGELOG_V6.md b/CHANGELOG_V6.md
+index 940b1a5..dd61950 100644
+--- a/CHANGELOG_V6.md
++++ b/CHANGELOG_V6.md
+@@ -1,3 +1,27 @@
++# Changelog V6.1.3
++
++## Fixed
++
++- 日期型供应商完工承诺在承诺当天被误判为逾期；
++- `INFORMATION_GAP`进入风险Top 7并用于凑数；
++- 同一订单多种异常在榜单中重复占位；
++- Agent页面把历史累计候选与本次巡检结果混为一谈；
++- Coze Agent与本地规则巡检状态表达冲突；
++- 系统提示词中的60秒预算与后端120秒配置不一致。
++
++## Added
++
++- Coze Agent、规则巡检、后端服务和定时接口分层状态；
++- 本次运行的扫描订单、风险订单、异常信号和信息缺口口径；
++- 可审计运行轨迹、任务草稿ID、审批ID与停止原因；
++- 5条V6.1.3回归测试。
++
++## Behavior
++
++- 保留原10个原子工具＋2个组合工具＋Coze Agent编排；
++- 规则巡检不再静默冒充Agent结果；
++- 真实风险不足7笔时如实返回。
++
+ # Changelog V6.0
+ 
+ ## Added
+diff --git a/PATCH_FILES_V6.1.3.txt b/PATCH_FILES_V6.1.3.txt
+new file mode 100644
+index 0000000..50bb040
+--- /dev/null
++++ b/PATCH_FILES_V6.1.3.txt
+@@ -0,0 +1,15 @@
++agent_api.py
++v61_extensions.py
++main.py
++static/app.js
++static/styles.css
++static/index.html
++coze/AGENT_SYSTEM_PROMPT_V6_1.md
++coze/floworder_agent_plugin_openapi_12tools_railway.json
++coze/floworder_agent_plugin_openapi_2tools_addon_railway.json
++README.md
++CHANGELOG_V6.md
++V6.1.3_RELEASE_NOTES.md
++PATCH_FILES_V6.1.3.txt
++docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md
++tests/test_v613_regressions.py
+diff --git a/README.md b/README.md
+index 7a1d6e7..1f56147 100644
+--- a/README.md
++++ b/README.md
+@@ -1,20 +1,37 @@
+-# AI外贸跟单行动系统 V5.0
+-
+-## 核心流程
+-
+-1. 新建订单或通过Excel/CSV导入订单。
+-2. 在消息接入页录入客户/工厂原始沟通，调用FT01/FT02生成候选。
+-3. 在AI确认页人工确认字段、风险和行动候选，再通过FT03写回。
+-4. FT04根据交期、风险、等待状态和承诺回复时间生成行动队列。
+-5. 在任务或订单上下文中调用FT05转任务，或调用FT06生成受控沟通草稿。
+-6. 草稿人工确认、复制并记录触达，任务进入等待；到期未回复后重新进入行动队列。
+-
+-## 页面
+-
+-- 今日行动：基于真实任务状态排序，不读取页面文字猜测上下文。
+-- 全部任务：筛选、查看、转交、升级、完成和沟通执行。
+-- 订单中心：新建、编辑、导入任意订单，并查看任务、风险、消息和历史事件。
+-- 消息接入：录入任意客户/工厂消息，不要求固定模板。
+-- AI确认：审核模型候选，未经确认不修改正式订单。
+-- 管理看板：工作负载、风险分布、等待超时和工作流状态。
+-- 设置与连接：选择操作人、检查Coze连接、管理密钥和测试数据。
++# FlowOrder AI外贸跟单行动系统 V6.1.3
++
++FlowOrder 是面向外贸订单执行人员的受控型订单异常诊断 Agent。系统保留“原子工具＋组合技能＋Agent编排”的结构：Coze Agent负责理解目标、选择工具和决定下一步；FastAPI负责确定性规则、权限、去重与持久化；正式业务动作由人工审批。
++
++## V6.1.3核心能力
++
++1. 跨订单异常巡检：最多返回7笔不同的真实风险订单，不足不补齐。
++2. 同订单多异常聚合：保留主要异常、次要异常和完整证据。
++3. 信息缺口单独展示：`INFORMATION_GAP`不进入风险Top N。
++4. 日期语义修复：日期型工厂承诺在当天尚未逾期；带具体时间的回复承诺按精确时间判断。
++5. 双模式明确区分：Coze Agent诊断与确定性规则巡检不再静默混用。
++6. 可审计轨迹：展示运行ID、工具调用、任务草稿ID、审批ID和停止原因。
++7. Human-in-the-loop：正式任务、订单修改、外发消息和高风险动作仍需人工确认。
++
++## 主要页面
++
++- 异常诊断：Agent目标输入、模式状态、执行轨迹、本次结果与历史累计。
++- 今日行动：根据任务、风险与等待窗口排序。
++- 订单中心：订单事实、进展、承诺、任务与沟通记录。
++- 消息接入与人工确认：AI生成候选，确认后再写回。
++- 全部任务与审批：处理任务、等待和高风险动作。
++
++## 部署
++
++Railway启动命令：
++
++```bash
++uvicorn main:app --host 0.0.0.0 --port $PORT
++```
++
++推荐持久化配置：
++
++```text
++DB_PATH=/data/action_layer.db
++```
++
++详细步骤见：`docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md`。
+diff --git a/V6.1.3_RELEASE_NOTES.md b/V6.1.3_RELEASE_NOTES.md
+new file mode 100644
+index 0000000..883aceb
+--- /dev/null
++++ b/V6.1.3_RELEASE_NOTES.md
+@@ -0,0 +1,34 @@
++# FlowOrder V6.1.3 发布说明
++
++## 发布目标
++
++在不改变Agent整体结构的前提下，修复V6.1.2确定性规则和页面表达问题。
++
++## 核心修复
++
++1. 日期型供应商承诺当天不算逾期。
++2. 信息缺口退出风险Top 7。
++3. 同订单多异常聚合为一笔订单。
++4. 风险不足7笔时不补齐。
++5. Coze Agent和规则巡检明确分离，不静默降级。
++6. 本次结果与历史累计分开。
++7. 新增运行轨迹、草稿ID、审批ID和停止原因。
++8. 时间预算由后端运行接口返回，不在提示词中写死60秒。
++
++## 保留结构
++
++- 10个原子工具；
++- 2个组合工具；
++- Coze Agent目标理解和工具编排；
++- FastAPI确定性规则与持久化；
++- Human-in-the-loop审批。
++
++## 自动验证
++
++```text
++Python语法检查：通过
++JavaScript语法检查：通过
++自动测试：36项通过
++```
++
++浏览器视觉与真实Coze调用必须在部署后按操作手册完成线上验收。
+diff --git a/agent_api.py b/agent_api.py
+index acf7a60..4d12bb5 100644
+--- a/agent_api.py
++++ b/agent_api.py
+@@ -83,6 +83,26 @@ def parse_dt(value: Any) -> datetime | None:
+     return parsed.astimezone(CN_TZ)
+ 
+ 
++def is_date_only_value(value: Any) -> bool:
++    """Return True when a business deadline contains a calendar date but no time."""
++    text = str(value or "").strip()
++    return bool(text and len(text) == 10 and text[4] == "-" and text[7] == "-")
++
++
++def deadline_is_overdue(value: Any, current: datetime) -> bool:
++    """Compare date-only commitments by calendar date and timestamps by exact time.
++
++    A supplier commitment such as ``2026-08-03`` remains valid for the whole day.
++    A promised reply such as ``2026-08-03T15:00:00+08:00`` becomes overdue after 15:00.
++    """
++    parsed = parse_dt(value)
++    if not parsed:
++        return False
++    if is_date_only_value(value):
++        return parsed.date() < current.date()
++    return parsed < current
++
++
+ def normalize_owner(value: Any) -> str | None:
+     text = str(value or "").strip()
+     if not text or text in {"待分配", "未分配", "-", "—"}:
+@@ -276,7 +296,7 @@ def list_candidate_orders_logic(conn: sqlite3.Connection, payload: dict[str, Any
+         reasons: list[str] = []
+         if in_window:
+             reasons.append(f"客户交期在未来{due_days}天内")
+-        if supplier_commitment and supplier_commitment < current and float(order.get("current_progress") or 0) < 1:
++        if deadline_is_overdue(order.get("latest_supplier_commitment"), current) and float(order.get("current_progress") or 0) < 1:
+             reasons.append("供应商完工承诺已过期")
+         if overdue_waiting:
+             reasons.append(f"{overdue_waiting}项等待承诺已超时")
+@@ -409,11 +429,12 @@ def build_anomaly_logic(conn: sqlite3.Connection, payload: dict[str, Any], persi
+     # 1) Supplier commitment overdue.
+     if "SUPPLIER_COMMITMENT_OVERDUE" in requested_types:
+         commitment = parse_dt(order.get("latest_supplier_commitment"))
+-        overdue_tasks = [t for t in ctx["open_tasks"] if parse_dt(t.get("promised_reply_at")) and parse_dt(t.get("promised_reply_at")) < current]
+-        if (commitment and commitment < current and float(order.get("current_progress") or 0) < 1) or overdue_tasks:
++        commitment_overdue = deadline_is_overdue(order.get("latest_supplier_commitment"), current)
++        overdue_tasks = [t for t in ctx["open_tasks"] if deadline_is_overdue(t.get("promised_reply_at"), current)]
++        if (commitment_overdue and float(order.get("current_progress") or 0) < 1) or overdue_tasks:
+             evidence = []
+             score = 60.0
+-            if commitment and commitment < current:
++            if commitment_overdue and commitment:
+                 evidence.append(f"供应商完工承诺{order.get('latest_supplier_commitment')}已过期")
+                 score += min(25, max(1, (current.date()-commitment.date()).days)*5)
+             for task in overdue_tasks[:3]:
+@@ -521,6 +542,77 @@ def rank_candidates_logic(items: list[dict[str, Any]], top_n: int = 7) -> list[d
+     return ranked[:top_n]
+ 
+ 
++def aggregate_order_candidates(items: list[dict[str, Any]], top_n: int = 7) -> dict[str, Any]:
++    """Separate information gaps and aggregate real risk signals by unique order."""
++    top_n = max(1, min(int(top_n or 7), 7))
++    information_gap_items = [dict(x) for x in items if x.get("anomaly_type") == "INFORMATION_GAP"]
++    risk_items = [dict(x) for x in items if x.get("anomaly_type") != "INFORMATION_GAP"]
++    ranked_candidates = rank_candidates_logic(risk_items, max(1, len(risk_items))) if risk_items else []
++
++    grouped: dict[str, list[dict[str, Any]]] = {}
++    order_sequence: list[str] = []
++    for item in ranked_candidates:
++        key = str(item.get("order_id") or item.get("order_no") or item.get("candidate_id") or "")
++        if key not in grouped:
++            grouped[key] = []
++            order_sequence.append(key)
++        grouped[key].append(item)
++
++    aggregated_orders: list[dict[str, Any]] = []
++    for key in order_sequence:
++        anomalies = grouped[key]
++        primary = dict(anomalies[0])
++        anomaly_types: list[str] = []
++        combined_evidence: list[str] = []
++        combined_missing: list[str] = []
++        combined_actions: list[str] = []
++        for anomaly in anomalies:
++            anomaly_type = str(anomaly.get("anomaly_type") or "")
++            if anomaly_type and anomaly_type not in anomaly_types:
++                anomaly_types.append(anomaly_type)
++            for evidence in anomaly.get("evidence") or []:
++                text = str(evidence).strip()
++                if text and text not in combined_evidence:
++                    combined_evidence.append(text)
++            for missing in anomaly.get("missing_information") or []:
++                text = str(missing).strip()
++                if text and text not in combined_missing:
++                    combined_missing.append(text)
++            action = str(anomaly.get("recommended_action") or "").strip()
++            if action and action not in combined_actions:
++                combined_actions.append(action)
++        bonus = min(10, max(0, len(anomalies) - 1) * 5)
++        primary["priority_score"] = round(float(primary.get("priority_score") or 0) + bonus, 2)
++        primary["primary_anomaly_type"] = primary.get("anomaly_type")
++        primary["order_anomaly_count"] = len(anomalies)
++        primary["anomaly_types"] = anomaly_types
++        primary["secondary_anomaly_types"] = anomaly_types[1:]
++        primary["evidence"] = combined_evidence
++        primary["missing_information"] = combined_missing
++        primary["recommended_action"] = "；".join(combined_actions)
++        primary["approval_required"] = any(bool(x.get("approval_required")) for x in anomalies)
++        primary["priority_reasons"] = combined_evidence[:3] + ([f"同一订单共识别{len(anomalies)}类异常"] if len(anomalies) > 1 else [])
++        aggregated_orders.append(primary)
++
++    aggregated_orders.sort(key=lambda x: (-float(x.get("priority_score") or 0), str(x.get("order_no") or "")))
++    selected = aggregated_orders[:top_n]
++    for index, item in enumerate(selected, 1):
++        item["rank"] = index
++
++    gap_by_order: dict[str, dict[str, Any]] = {}
++    for gap in information_gap_items:
++        key = str(gap.get("order_id") or gap.get("order_no") or gap.get("candidate_id") or "")
++        if key not in gap_by_order:
++            gap_by_order[key] = gap
++    return {
++        "risk_items": selected,
++        "risk_signal_count": len(risk_items),
++        "risk_order_count": len(aggregated_orders),
++        "information_gaps": list(gap_by_order.values()),
++        "information_gap_order_count": len(gap_by_order),
++    }
++
++
+ def create_approval_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+     a = actor(payload)
+     action_type = str(payload.get("action_type") or "").strip().upper()
+@@ -604,59 +696,68 @@ def _commit_approved_action(conn: sqlite3.Connection, approval: dict[str, Any],
+ 
+ 
+ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
++    """Run the deterministic fallback inspection without pretending it is Coze Agent."""
+     a = actor(payload)
+     run_id = str(payload.get("run_id") or new_id("AGR"))
+-    trigger_type = str(payload.get("trigger_type") or "MANUAL").upper()
++    trigger_type = str(payload.get("trigger_type") or "MANUAL_RULE").upper()
+     started = time.perf_counter()
+     conn.execute(
+         """INSERT OR IGNORE INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
+            max_tool_calls,max_duration_seconds,started_at,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+         (run_id, a["organization_id"], a["current_user_id"], a["current_role"],
+-         payload.get("goal") or "检查今天最需要处理的订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
++         payload.get("goal") or "规则巡检近期订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
+     )
+     screened = list_candidate_orders_logic(conn, {**payload, **a, "limit": 50})
+     all_candidates: list[dict[str, Any]] = []
+     for order in screened["items"]:
+         result = build_anomaly_logic(conn, {**payload, **a, "run_id": run_id, "order_id": order["order_id"]}, persist=True)
+         all_candidates.extend(result["items"])
+-    ranked = rank_candidates_logic(all_candidates, max(1, min(int(payload.get("top_n") or 7), 20)))
++    aggregated = aggregate_order_candidates(all_candidates, int(payload.get("top_n") or 7))
++    ranked = aggregated["risk_items"]
++    information_gaps = aggregated["information_gaps"]
+     report_id = new_id("RPT")
+     report = {
+         "report_id": report_id, "run_id": run_id, "generated_at": iso(), "scope": screened["scope"],
+-        "screened_order_count": screened["count"], "anomaly_candidate_count": len(all_candidates),
+-        "top_items": ranked, "summary": {
++        "execution_mode": "RULE_INSPECTION",
++        "screened_order_count": screened["count"],
++        "anomaly_candidate_count": aggregated["risk_signal_count"],
++        "anomaly_signal_count": aggregated["risk_signal_count"],
++        "risk_order_count": len(ranked),
++        "information_gap_order_count": aggregated["information_gap_order_count"],
++        "top_items": ranked, "information_gaps": information_gaps,
++        "summary": {
+             "critical": sum(1 for x in ranked if x.get("severity") == "CRITICAL"),
+             "high": sum(1 for x in ranked if x.get("severity") == "HIGH"),
+-            "needs_information": sum(1 for x in ranked if x.get("anomaly_type") == "INFORMATION_GAP"),
++            "needs_information": aggregated["information_gap_order_count"],
+         },
+         "human_confirmation_required": True,
++        "selection_strategy": {"not_padded": True, "unit": "unique_order", "max_items": 7},
+     }
+     duration_ms = int((time.perf_counter() - started) * 1000)
+     conn.execute(
+         """INSERT INTO daily_inspection_reports(report_id,run_id,organization_id,current_user_id,inspection_date,timezone,
+-           scope_json,report_json,status,created_at)
+-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
++           scope_json,report_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+         (report_id, run_id, a["organization_id"], a["current_user_id"], now_cn().date().isoformat(), "Asia/Shanghai",
+          json.dumps(screened["scope"], ensure_ascii=False), json.dumps(report, ensure_ascii=False), "COMPLETED", iso()),
+     )
+     conn.execute(
+-        "UPDATE agent_runs SET status='COMPLETED',result_json=?,stop_reason='DIAGNOSIS_COMPLETED',duration_ms=?,completed_at=? WHERE run_id=?",
++        "UPDATE agent_runs SET status='COMPLETED',result_json=?,stop_reason='RULE_DIAGNOSIS_COMPLETED',duration_ms=?,completed_at=? WHERE run_id=?",
+         (json.dumps(report, ensure_ascii=False), duration_ms, iso(), run_id),
+     )
+-    audit_event(conn, "agent_run", run_id, "AGENT_INSPECTION_COMPLETED", report, a["current_user_id"])
+-    track_event(
+-        conn, "priority_diagnosis_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
+-        user_role=a["current_role"], run_id=run_id, source="website_inspection",
+-        properties={"screened_order_count": screened["count"], "anomaly_candidate_count": len(all_candidates),
+-                    "top_count": len(ranked), "duration_ms": duration_ms},
+-    )
+-    track_event(
+-        conn, "agent_run_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
+-        user_role=a["current_role"], run_id=run_id, source="website_inspection",
+-        properties={"status": "COMPLETED", "stop_reason": "DIAGNOSIS_COMPLETED", "duration_ms": duration_ms,
+-                    "final_response_generated": True},
+-    )
++    log_tool_call(conn, run_id=run_id, tool_name="deterministic_rule_inspection",
++                  request={"due_within_days": payload.get("due_within_days", 14), "top_n": payload.get("top_n", 7)},
++                  response={"screened_order_count": screened["count"], "risk_order_count": len(ranked),
++                            "anomaly_signal_count": aggregated["risk_signal_count"],
++                            "information_gap_order_count": aggregated["information_gap_order_count"]},
++                  status="SUCCESS", duration_ms=duration_ms)
++    audit_event(conn, "agent_run", run_id, "RULE_INSPECTION_COMPLETED", report, a["current_user_id"])
++    track_event(conn, "priority_diagnosis_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
++                user_role=a["current_role"], run_id=run_id, source="website_rule_inspection",
++                properties={"screened_order_count": screened["count"], "risk_order_count": len(ranked),
++                            "anomaly_signal_count": aggregated["risk_signal_count"],
++                            "information_gap_order_count": aggregated["information_gap_order_count"],
++                            "duration_ms": duration_ms})
+     return report
+ 
+ 
+@@ -665,13 +766,26 @@ def register_agent_api(app) -> None:
+ 
+     @router.get("/api/agent/status")
+     def agent_status() -> dict[str, Any]:
++        coze = coze_agent_status()
++        with db() as conn:
++            last_agent_run = conn.execute(
++                """SELECT run_id,status,trigger_type,created_at,completed_at FROM agent_runs
++                   WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
++            ).fetchone()
+         return {
+-            "version": "6.1.2",
++            "version": "6.1.3",
+             "agent_name": "FlowOrder订单异常诊断Agent",
++            "backend": {"online": True, "version": "6.1.3"},
++            "coze_agent": {
++                "configured": coze["configured"],
++                "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
++                "last_verified_run": dict(last_agent_run) if last_agent_run else None,
++            },
++            "rule_inspection": {"available": True, "silent_fallback": False},
+             "tool_auth_configured": bool(AGENT_API_KEY),
+             "cron_auth_configured": bool(CRON_API_KEY or AGENT_API_KEY),
+-            "coze_agent_configured": coze_agent_status()["configured"],
+-            "daily_schedule": {"timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
++            "coze_agent_configured": coze["configured"],
++            "daily_schedule": {"configured": bool(CRON_API_KEY or AGENT_API_KEY), "scheduler_verified": False, "timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
+             "limits": {"max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS, "top_n": 7},
+             "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
+             "analytics_enabled": True,
+@@ -765,6 +879,9 @@ def register_agent_api(app) -> None:
+                 "evidence": body.get("evidence") or [], "status": "DRAFT", "requires_approval": True,
+             }
+             audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
++            log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_task_draft",
++                          request={"order_id": order["order_id"], "title": task["title"]},
++                          response={"task_draft_id": draft_id, "status": "DRAFT"}, status="SUCCESS", duration_ms=0)
+             track_event(
+                 conn, "task_draft_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                 user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool",
+@@ -812,6 +929,11 @@ def register_agent_api(app) -> None:
+             enforce_run_budget(conn, body.get("run_id"))
+             result = create_approval_logic(conn, body)
+             a = actor(body)
++            log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_approval_request",
++                          request={"order_id": body.get("order_id"), "action_type": body.get("action_type")},
++                          response={"approval_id": result.get("approval_id"), "status": result.get("status"),
++                                    "duplicate_skipped": bool(result.get("duplicate_skipped"))},
++                          status="SUCCESS", duration_ms=0)
+             track_event(
+                 conn, "approval_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                 user_role=a["current_role"], order_id=body.get("order_id"), run_id=body.get("run_id"), source="agent_tool",
+@@ -863,12 +985,18 @@ def register_agent_api(app) -> None:
+             scope_sql, params = _order_scope_sql(a)
+             cands = [dict(r) for r in conn.execute(
+                 f"""SELECT a.*,o.order_no,o.customer_name,o.owner FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id
+-                    WHERE {scope_sql.replace('owner','o.owner')} ORDER BY a.created_at DESC LIMIT 100""", params)]
++                    WHERE {scope_sql.replace('owner','o.owner')} ORDER BY a.created_at DESC LIMIT 150""", params)]
+             approvals = [dict(r) for r in conn.execute(
+                 f"""SELECT p.*,o.order_no,o.customer_name FROM approval_requests p LEFT JOIN orders o ON o.order_id=p.order_id
+                     WHERE ({scope_sql.replace('owner','o.owner')}) OR p.requested_by=? ORDER BY p.created_at DESC LIMIT 50""", [*params, current_user_id])]
+             reports = [dict(r) for r in conn.execute(
+                 "SELECT * FROM daily_inspection_reports WHERE current_user_id=? ORDER BY created_at DESC LIMIT 10", (current_user_id,))]
++            latest_run_row = conn.execute(
++                "SELECT * FROM agent_runs WHERE current_user_id=? ORDER BY created_at DESC LIMIT 1", (current_user_id,)
++            ).fetchone()
++            calls = [dict(r) for r in conn.execute(
++                "SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (latest_run_row["run_id"],)
++            )] if latest_run_row else []
+         for item in cands:
+             item["evidence"] = safe_json(item.pop("evidence_json"), [])
+             item["missing_information"] = safe_json(item.pop("missing_information_json"), [])
+@@ -877,13 +1005,26 @@ def register_agent_api(app) -> None:
+         for item in reports:
+             item["report"] = safe_json(item.pop("report_json"), {})
+             item["scope"] = safe_json(item.pop("scope_json"), {})
++        latest_run = dict(latest_run_row) if latest_run_row else None
++        if latest_run:
++            latest_run["result"] = safe_json(latest_run.pop("result_json"), {})
++        for call in calls:
++            call["request"] = safe_json(call.pop("request_json"), {})
++            call["response"] = safe_json(call.pop("response_json"), {})
++        risk_candidates = [x for x in cands if x.get("anomaly_type") != "INFORMATION_GAP"]
++        information_gaps = [x for x in cands if x.get("anomaly_type") == "INFORMATION_GAP"]
++        active_statuses = {"ANOMALY_CANDIDATE", "PENDING_CONFIRMATION"}
+         return {
+             "summary": {
+-                "candidate_count": sum(1 for x in cands if x["status"] in {"ANOMALY_CANDIDATE", "PENDING_CONFIRMATION"}),
+-                "critical_count": sum(1 for x in cands if x["severity"] == "CRITICAL" and x["status"] != "RESOLVED"),
++                "candidate_count": sum(1 for x in risk_candidates if x["status"] in active_statuses),
++                "information_gap_count": sum(1 for x in information_gaps if x["status"] in active_statuses),
++                "critical_count": sum(1 for x in risk_candidates if x["severity"] == "CRITICAL" and x["status"] != "RESOLVED"),
+                 "pending_approval_count": sum(1 for x in approvals if x["status"] == "PENDING"),
+                 "report_count": len(reports),
+-            }, "candidates": cands, "approvals": approvals, "reports": reports,
++            },
++            "candidates": risk_candidates, "information_gaps": information_gaps,
++            "approvals": approvals, "reports": reports,
++            "latest_run": latest_run, "latest_tool_calls": calls,
+         }
+ 
+     @router.post("/api/agent/chat")
+@@ -899,15 +1040,23 @@ def register_agent_api(app) -> None:
+             "current_user_id": user_id,
+             "current_role": role,
+             "allowed_owner_ids": body.get("allowed_owner_ids") or [user_id],
+-            "default_due_within_days": 14,
+-            "default_top_n": 7,
++            "default_due_within_days": max(1, min(int(body.get("due_within_days") or 14), 90)),
++            "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
++            "create_task_draft": bool(body.get("create_task_draft", True)),
++            "create_approval_request": bool(body.get("create_approval_request", True)),
+         }
++        started_at = iso()
+         try:
+             result = run_agent_chat(user_id=user_id, question=question, parameters=parameters,
+                                     conversation_id=body.get("conversation_id"), timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS)
+         except RuntimeError as exc:
+             raise HTTPException(503, str(exc)) from exc
+-        return result
++        with db() as conn:
++            latest = conn.execute(
++                "SELECT run_id,status,stop_reason,created_at,completed_at FROM agent_runs WHERE current_user_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 1",
++                (user_id, started_at),
++            ).fetchone()
++        return {**result, "execution_mode": "COZE_AGENT", "run": dict(latest) if latest else None}
+ 
+     @router.post("/api/agent/inspection/run")
+     def run_inspection(payload: AnyPayload) -> dict[str, Any]:
+@@ -983,9 +1132,16 @@ def register_agent_api(app) -> None:
+                 raise HTTPException(403, "无权查看该运行轨迹")
+             calls = [dict(r) for r in conn.execute("SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (run_id,))]
+         result = dict(run); result["result"] = safe_json(result.pop("result_json"), {})
++        task_draft_ids: list[str] = []
++        approval_ids: list[str] = []
+         for call in calls:
+             call["request"] = safe_json(call.pop("request_json"), {})
+             call["response"] = safe_json(call.pop("response_json"), {})
+-        return {"run": result, "tool_calls": calls}
++            if call.get("response", {}).get("task_draft_id"):
++                task_draft_ids.append(call["response"]["task_draft_id"])
++            if call.get("response", {}).get("approval_id"):
++                approval_ids.append(call["response"]["approval_id"])
++        return {"run": result, "tool_calls": calls, "task_draft_ids": task_draft_ids,
++                "approval_ids": approval_ids, "stop_reason": result.get("stop_reason")}
+ 
+     app.include_router(router)
+diff --git a/coze/AGENT_SYSTEM_PROMPT_V6_1.md b/coze/AGENT_SYSTEM_PROMPT_V6_1.md
+index 40661cb..93cde4d 100644
+--- a/coze/AGENT_SYSTEM_PROMPT_V6_1.md
++++ b/coze/AGENT_SYSTEM_PROMPT_V6_1.md
+@@ -16,7 +16,7 @@
+ - `current_role`：`operator`或`manager`
+ - `allowed_owner_ids`：额外授权负责人ID
+ - 默认诊断范围：未来14天
+-- 默认最多返回：7个真实异常候选，不足7个不补齐
++- 默认最多返回：7笔不同的真实风险订单，不足7笔不补齐；信息缺口单独展示，不进入风险榜
+ 
+ 普通跟单人员只分析本人负责的订单；主管可以分析团队订单。无权限时停止，不得绕过。
+ 
+@@ -26,7 +26,7 @@
+ 
+ 用户要求“检查最需要处理的订单”“扫描未来14天”“返回Top 7”时：
+ 
+-1. 调用`start_agent_run`并保存`run_id`；
++1. 调用`start_agent_run`并保存`run_id`；后续所有工具都必须传入同一个`run_id`；
+ 2. **优先只调用一次`diagnose_priority_orders`**，不要逐笔循环调用`list_candidate_orders`、`get_order_diagnostic_context`、`build_anomaly_candidate`和`rank_anomaly_candidates`；
+ 3. 对最高优先级异常需要形成行动时，调用`create_task_draft`；
+ 4. 需要正式动作时调用`create_approval_request`；
+@@ -42,7 +42,7 @@
+ 
+ 用户粘贴一段包含多笔订单进展的文字时：
+ 
+-1. 调用`start_agent_run`；
++1. 调用`start_agent_run`并保存`run_id`；后续所有工具都必须传入同一个`run_id`；
+ 2. 调用`parse_bulk_order_updates`，原样传入用户文本；
+ 3. 展示匹配到的订单、字段候选、置信度和高风险字段；
+ 4. 明确说明**尚未写回**；
+@@ -59,7 +59,7 @@
+ - `CUSTOMER_CONFIRMATION_BLOCKING`
+ - `DELIVERY_RISK`
+ - `LOGISTICS_EXCEPTION`
+-- `INFORMATION_GAP`
++- `INFORMATION_GAP`（只作为补充信息清单，不进入风险Top 7）
+ 
+ ## 自治边界
+ 
+@@ -71,7 +71,7 @@
+ 
+ ## 调用预算
+ 
+-单次运行最多8次工具、60秒。组合工具内部批量处理不按逐笔工具调用计数。
++严格遵守`start_agent_run`返回的`max_tool_calls`和`max_duration_seconds`；不要在提示词中假定固定时长。组合工具内部批量处理不按逐笔工具调用计数。
+ 
+ 达到以下任一条件停止：结果充分、无异常、需要补信息、需要人工审批、工具失败、预算到达。
+ 
+@@ -88,7 +88,7 @@
+ ### 今日订单异常诊断
+ 
+ - 分析范围：本人/团队、未来14天、已筛选X笔
+-- 发现：X个真实异常候选
++- 发现：X笔真实风险订单、Y个异常信号、Z笔信息缺口
+ 
+ 每一项包含：
+ 
+@@ -108,3 +108,11 @@
+ - `approval_id`
+ - 审批角色
+ - “尚未正式执行”
++
++
++## V6.1.3结果口径
++
++- `items`中的每个元素必须代表一笔不同订单；同一订单的其他异常放入`secondary_anomaly_types`。
++- `INFORMATION_GAP`不得用于凑满Top 7，不得表述为严重异常。
++- 日期型供应商完工承诺在承诺当天尚未逾期；带具体时分的回复承诺按精确时间判断。
++- 网站规则巡检是明确的降级能力，不得冒充Coze Agent运行结果。
+diff --git a/coze/floworder_agent_plugin_openapi_12tools_railway.json b/coze/floworder_agent_plugin_openapi_12tools_railway.json
+index 6d1dd27..b81c001 100644
+--- a/coze/floworder_agent_plugin_openapi_12tools_railway.json
++++ b/coze/floworder_agent_plugin_openapi_12tools_railway.json
+@@ -2,8 +2,8 @@
+   "openapi": "3.0.0",
+   "info": {
+     "title": "FlowOrder Agent Tools V6.1",
+-    "version": "1.1.0",
+-    "description": "FlowOrder订单异常诊断Agent的12个工具。新增批量自然语言更新解析和Top7组合诊断。插件固定Header配置X-FlowOrder-Agent-Key。"
++    "version": "6.1.3",
++    "description": "FlowOrder订单异常诊断Agent的12个工具。新增批量自然语言更新解析和Top 7笔不同风险订单组合诊断。插件固定Header配置X-FlowOrder-Agent-Key。 V6.1.3将信息缺口单独返回，并按订单聚合多异常。"
+   },
+   "servers": [
+     {
+@@ -1099,8 +1099,8 @@
+     "/api/agent/tools/priority-orders/diagnose": {
+       "post": {
+         "operationId": "diagnose_priority_orders",
+-        "summary": "一次完成Top7订单异常诊断",
+-        "description": "组合工具：在一次调用内完成候选池筛选、证据读取、异常生成和Top7排序，不为凑数制造异常。",
++        "summary": "一次完成Top 7笔不同风险订单诊断",
++        "description": "组合工具：一次完成候选筛选、证据读取、异常生成、同订单聚合和Top N排序；信息缺口单独返回，不用于凑数。",
+         "requestBody": {
+           "required": true,
+           "content": {
+@@ -1150,7 +1150,7 @@
+                     "minimum": 1,
+                     "maximum": 7,
+                     "default": 7,
+-                    "description": "最多返回7个异常候选"
++                    "description": "最多返回7笔不同的真实风险订单；不足不补齐"
+                   },
+                   "scan_limit": {
+                     "type": "integer",
+diff --git a/coze/floworder_agent_plugin_openapi_2tools_addon_railway.json b/coze/floworder_agent_plugin_openapi_2tools_addon_railway.json
+index ffff334..c84bf81 100644
+--- a/coze/floworder_agent_plugin_openapi_2tools_addon_railway.json
++++ b/coze/floworder_agent_plugin_openapi_2tools_addon_railway.json
+@@ -2,8 +2,8 @@
+   "openapi": "3.0.0",
+   "info": {
+     "title": "FlowOrder V6.1 Composite Tools",
+-    "version": "1.1.0",
+-    "description": "FlowOrder新增的两个组合工具：批量自然语言更新解析、Top7优先订单诊断。与原10工具插件并行使用。"
++    "version": "6.1.3",
++    "description": "FlowOrder新增的两个组合工具：批量自然语言更新解析、Top 7笔不同风险订单优先订单诊断。与原10工具插件并行使用。 V6.1.3将信息缺口单独返回，并按订单聚合多异常。"
+   },
+   "servers": [
+     {
+@@ -105,8 +105,8 @@
+     "/api/agent/tools/priority-orders/diagnose": {
+       "post": {
+         "operationId": "diagnose_priority_orders",
+-        "summary": "一次完成Top7订单异常诊断",
+-        "description": "组合工具：在一次调用内完成候选池筛选、证据读取、异常生成和Top7排序，不为凑数制造异常。",
++        "summary": "一次完成Top 7笔不同风险订单诊断",
++        "description": "组合工具：一次完成候选筛选、证据读取、异常生成、同订单聚合和Top N排序；信息缺口单独返回，不用于凑数。",
+         "requestBody": {
+           "required": true,
+           "content": {
+@@ -156,7 +156,7 @@
+                     "minimum": 1,
+                     "maximum": 7,
+                     "default": 7,
+-                    "description": "最多返回7个异常候选"
++                    "description": "最多返回7笔不同的真实风险订单；不足不补齐"
+                   },
+                   "scan_limit": {
+                     "type": "integer",
+diff --git a/docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md b/docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md
+new file mode 100644
+index 0000000..8da7727
+--- /dev/null
++++ b/docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md
+@@ -0,0 +1,911 @@
++# FlowOrder V6.1.3 部署、Coze联调与验收操作手册
++
++> 基线：当前线上 V6.1.2 代码仓库  
++> 目标版本：V6.1.3  
++> 原则：保留“10个原子工具＋2个组合工具＋Coze Agent编排”，只修确定性规则、状态表达、结果口径和可审计性。
++
++---
++
++## 一、本轮优化到底改了什么
++
++### 1. 业务规则修复
++
++- 日期型供应商完工承诺按“自然日”判断：承诺当天尚未逾期，第二天才算逾期。
++- 带具体时分的承诺回复时间仍按精确时间判断。
++- 同一订单的多种异常聚合为一笔订单结果，最多返回7笔不同订单。
++- `INFORMATION_GAP`单独统计，不进入风险榜，不用于凑满Top 7。
++- 真实风险只有5笔时只返回5笔。
++
++### 2. Agent页面优化
++
++- 明确区分：后端服务、Coze Agent、定时巡检接口。
++- Coze Agent未配置时，Agent按钮禁用；规则巡检仍可手动执行。
++- Agent调用失败后不再静默替换成规则结果。
++- 用户输入框只写业务目标，系统约束改为可视化设置。
++- “本次运行”和“历史累计”分开统计。
++- 新增可审计轨迹：运行ID、工具调用、任务草稿ID、审批ID、停止原因。
++
++### 3. Agent架构保持不变
++
++保留：
++
++```text
++用户开放目标
++→ Coze Agent理解意图
++→ 选择组合工具或原子工具
++→ 根据结果决定追问、停止、生成任务或发起审批
++→ 人工确认正式动作
++```
++
++没有把Agent改成普通规则系统，也没有删除原子工具。
++
++---
++
++# 二、部署前必须做的备份
++
++## 步骤1：记录当前线上版本
++
++1. 浏览器打开：
++
++```text
++https://你的Railway域名/health
++```
++
++2. 截图保存，确认当前显示：
++
++```json
++{
++  "status": "ok",
++  "version": "6.1.2"
++}
++```
++
++3. 再打开：
++
++```text
++https://你的Railway域名/api/v61/status
++```
++
++保存截图。
++
++## 步骤2：GitHub创建备份分支
++
++1. 打开当前Railway实际部署的GitHub仓库。
++2. 点击分支下拉框。
++3. 输入：
++
++```text
++backup-before-v6.1.3
++```
++
++4. 选择“Create branch from main”。
++5. 确认备份分支已经出现。
++6. 切回Railway当前部署分支，一般为`main`。
++
++## 步骤3：备份Coze配置
++
++在Coze中分别保存：
++
++1. 当前Agent“人设与回复逻辑”全文；
++2. 当前已发布Agent的Bot ID；
++3. 当前插件列表截图；
++4. 当前12个工具名称截图；
++5. 插件鉴权Header配置截图；
++6. 当前Agent发布版本截图。
++
++不要把Token或密钥复制进普通文档、GitHub或聊天记录。
++
++## 步骤4：备份Railway变量与持久卷
++
++在Railway项目中：
++
++1. 打开 Variables；
++2. 截图变量名称，不要暴露变量值；
++3. 确认存在持久卷挂载：
++
++```text
++/data
++```
++
++4. 确认变量：
++
++```text
++DB_PATH=/data/action_layer.db
++```
++
++5. 记录当前Deployment ID和提交哈希。
++
++---
++
++# 三、上传V6.1.3补丁到GitHub
++
++## 推荐方式：使用增量补丁
++
++解压：
++
++```text
++FlowOrder_V6.1.3_Incremental_Patch.zip
++```
++
++把压缩包中的文件保持原目录覆盖到仓库根目录。
++
++需要覆盖的主要文件：
++
++```text
++agent_api.py
++v61_extensions.py
++main.py
++static/app.js
++static/styles.css
++static/index.html
++coze/AGENT_SYSTEM_PROMPT_V6_1.md
++coze/floworder_agent_plugin_openapi_12tools_railway.json
++coze/floworder_agent_plugin_openapi_2tools_addon_railway.json
++README.md
++CHANGELOG_V6.md
++tests/test_v613_regressions.py
++docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md
++```
++
++## GitHub网页上传的详细方法
++
++1. 进入仓库根目录。
++2. 点击`Add file`。
++3. 点击`Upload files`。
++4. 将补丁中根目录文件拖入对应目录。
++5. 对`static/`、`coze/`、`tests/`、`docs/`内的文件，必须进入对应目录后再上传，不能全部放在仓库根目录。
++6. Commit message填写：
++
++```text
++fix: release FlowOrder v6.1.3 agent diagnosis clarity and rule regressions
++```
++
++7. 提交到Railway当前部署分支。
++
++## 更安全的本地Git方法
++
++```bash
++git checkout main
++git pull
++git checkout -b release/v6.1.3
++# 覆盖补丁文件
++git add .
++git commit -m "fix: release FlowOrder v6.1.3"
++git push origin release/v6.1.3
++```
++
++先让Railway预览环境验证，再合并到`main`。
++
++---
++
++# 四、Railway第一次部署：先验证后端和规则巡检
++
++## 步骤1：等待自动部署
++
++Railway日志中应看到类似：
++
++```text
++Application startup complete
++Uvicorn running on 0.0.0.0
++```
++
++不应出现：
++
++```text
++SyntaxError
++ModuleNotFoundError
++sqlite3.OperationalError
++```
++
++## 步骤2：检查健康接口
++
++打开：
++
++```text
++https://你的Railway域名/health
++```
++
++期望：
++
++```json
++{
++  "status": "ok",
++  "version": "6.1.3",
++  "storage": {
++    "on_persistent_path": true
++  },
++  "agent": {
++    "configured": false
++  }
++}
++```
++
++Agent尚未配置时，`configured:false`是正常结果。
++
++## 步骤3：检查Agent状态接口
++
++打开：
++
++```text
++https://你的Railway域名/api/agent/status
++```
++
++至少应包含：
++
++```json
++{
++  "version": "6.1.3",
++  "backend": {"online": true},
++  "coze_agent": {"configured": false},
++  "rule_inspection": {
++    "available": true,
++    "silent_fallback": false
++  },
++  "limits": {
++    "max_tool_calls": 8,
++    "max_duration_seconds": 120,
++    "top_n": 7
++  }
++}
++```
++
++## 步骤4：检查V6.1扩展接口
++
++打开：
++
++```text
++https://你的Railway域名/api/v61/status
++```
++
++期望：
++
++```json
++{
++  "version": "6.1.3",
++  "new_agent_tools": [
++    "parse_bulk_order_updates",
++    "diagnose_priority_orders"
++  ]
++}
++```
++
++## 步骤5：强制刷新网页
++
++Windows：
++
++```text
++Ctrl + F5
++```
++
++Mac：
++
++```text
++Command + Shift + R
++```
++
++网页左下角应显示：
++
++```text
++后端服务正常
++v6.1.3 · Coze Agent未配置
++```
++
++不能再显示含义模糊的“自动化已连接”。
++
++---
++
++# 五、先测试“规则巡检模式”
++
++这一阶段故意不连接Coze，目的是先证明确定性规则已经修好。
++
++## 步骤1：进入异常诊断页
++
++左侧点击：
++
++```text
++异常诊断
++```
++
++页面顶部应显示三张状态卡：
++
++```text
++后端服务：正常
++Coze Agent：未配置
++定时巡检：未配置或接口已配置
++```
++
++“启动Agent诊断”按钮应禁用；“仅运行规则巡检”应可点击。
++
++## 步骤2：运行规则巡检
++
++保持：
++
++```text
++巡检范围：未来14天
++最多返回：7笔
++```
++
++点击：
++
++```text
++仅运行规则巡检
++```
++
++期望：
++
++1. 页面明确提示这是规则巡检；
++2. 本次运行显示扫描订单数；
++3. 风险订单数最多7笔；
++4. 异常信号数可以大于风险订单数；
++5. 信息缺口单独显示；
++6. 执行轨迹中出现：
++
++```text
++deterministic_rule_inspection
++```
++
++7. 停止原因应为：
++
++```text
++RULE_DIAGNOSIS_COMPLETED
++```
++
++---
++
++# 六、V6.1.2遗留问题专项回归
++
++## 用例A：日期型承诺当天不算逾期
++
++### 准备数据
++
++找一笔未完成订单，设置：
++
++```text
++工厂完成承诺：今天
++当前进度：45%
++```
++
++例如当前日期为2026-08-03：
++
++```text
++工厂完成承诺：2026-08-03
++```
++
++### 执行
++
++运行规则巡检。
++
++### 正确结果
++
++订单可能因为交期风险进入榜单，但证据中不能出现：
++
++```text
++供应商完工承诺2026-08-03已过期
++```
++
++### 反向测试
++
++把承诺改成昨天：
++
++```text
++2026-08-02
++```
++
++重新巡检，证据中应出现供应商承诺已过期。
++
++---
++
++## 用例B：具体时间的回复承诺仍按时分判断
++
++准备一个等待任务：
++
++```text
++承诺回复时间：今天15:00
++当前时间：今天16:00以后
++```
++
++正确结果：应识别为承诺回复超时。
++
++如果当前时间为14:00，则不能报超时。
++
++---
++
++## 用例C：同一订单多异常只占一个排名
++
++准备一笔订单同时满足：
++
++```text
++客户交期临近或已超期
++供应商承诺已过期
++当前进度偏低
++```
++
++正确结果：
++
++```text
++订单在Top榜只出现一次
++主要异常：一项
++次要异常：至少一项
++共识别2类或更多异常
++```
++
++不能在Top榜中重复出现同一订单号。
++
++---
++
++## 用例D：信息缺口不进入风险Top 7
++
++准备一笔订单：
++
++```text
++客户交期约10天后
++当前进度约90%
++当前节点为空
++没有承诺超时
++没有高风险任务
++```
++
++正确结果：
++
++```text
++该订单出现在“信息缺口”区域
++不出现在“风险订单Top N”区域
++```
++
++---
++
++## 用例E：不足7笔不补齐
++
++让当前可见真实风险订单少于7笔。
++
++正确结果：
++
++```text
++真实风险5笔 → 返回5笔
++真实风险2笔 → 返回2笔
++真实风险0笔 → 返回0笔
++```
++
++不能加入信息缺口或低价值记录凑满7笔。
++
++---
++
++# 七、更新Coze Agent系统提示词
++
++后端规则测试通过后，再连接Coze。
++
++## 步骤1：打开Coze Agent
++
++1. 进入当前FlowOrder Agent；
++2. 打开“人设与回复逻辑”；
++3. 全选旧内容并复制到备份文档；
++4. 打开补丁文件：
++
++```text
++coze/AGENT_SYSTEM_PROMPT_V6_1.md
++```
++
++5. 复制全文覆盖到Coze。
++
++## 步骤2：检查关键条款
++
++确认新提示词包含：
++
++```text
++后续所有工具必须传同一个run_id
++INFORMATION_GAP不进入风险Top 7
++严格遵守start_agent_run返回的工具次数和时间预算
++真实风险不足7笔不补齐
++日期型承诺当天尚未逾期
++规则巡检不得冒充Coze Agent结果
++```
++
++## 步骤3：不要同时保留两套冲突规则
++
++删除旧提示词中以下固定表述：
++
++```text
++最长分析60秒
++返回7个异常候选
++信息缺口可进入Top 7
++```
++
++最终时间预算以`start_agent_run`返回值为准。
++
++---
++
++# 八、Coze插件处理方式
++
++## 推荐方案：现有12工具插件正常时不要重建
++
++如果当前12个工具已经能成功调用：
++
++- 不删除插件；
++- 不重复导入；
++- 不修改operationId；
++- 不新建同名工具。
++
++V6.1.3接口路径和主要请求结构没有变化，现有插件可以继续调用。
++
++## 需要重建插件的情况
++
++只有出现以下问题才重建：
++
++```text
++插件只有10个工具
++组合工具不存在
++插件服务域名已变
++工具返回始终为空对象
++鉴权Header无法传递
++```
++
++### 重建步骤
++
++1. 先删除旧的重复插件，避免同名工具冲突；
++2. 使用：
++
++```text
++coze/floworder_agent_plugin_openapi_12tools_railway.json
++```
++
++3. 打开JSON，确认`servers.url`等于当前Railway公网域名；
++4. 如果域名不同，先修改JSON中的URL；
++5. 导入后确认共12个工具；
++6. 配置固定Header：
++
++```text
++X-FlowOrder-Agent-Key
++```
++
++值必须与Railway中的：
++
++```text
++FLOWORDER_AGENT_API_KEY
++```
++
++一致；
++7. 不要把真实密钥写进GitHub文件；
++8. 分别测试：
++
++```text
++start_agent_run
++diagnose_priority_orders
++create_task_draft
++create_approval_request
++complete_agent_run
++```
++
++---
++
++# 九、发布Coze Agent并连接Railway
++
++## 步骤1：发布Agent
++
++1. 保存提示词；
++2. 确认插件已绑定；
++3. 点击发布；
++4. 选择允许API调用；
++5. 记录正式Bot ID。
++
++## 步骤2：准备Coze API Token
++
++在Coze官方控制台创建可调用Agent的Token。
++
++不要：
++
++- 写进代码；
++- 上传GitHub；
++- 发到聊天；
++- 放进截图。
++
++## 步骤3：Railway配置变量
++
++在Railway Variables中设置：
++
++```text
++COZE_API_TOKEN=<真实Token>
++COZE_AGENT_BOT_ID=<正式Bot ID>
++COZE_API_BASE=https://api.coze.cn
++FLOWORDER_AGENT_API_KEY=<插件调用后端的密钥>
++FLOWORDER_CRON_API_KEY=<定时巡检接口密钥>
++FLOWORDER_AGENT_MAX_TOOL_CALLS=8
++FLOWORDER_AGENT_MAX_DURATION_SECONDS=120
++COZE_AGENT_TIMEOUT_SECONDS=120
++DB_PATH=/data/action_layer.db
++```
++
++变量名必须完全一致。
++
++## 步骤4：重新部署
++
++保存变量后Railway会重新部署。
++
++部署完成后打开：
++
++```text
++/api/agent/status
++```
++
++期望：
++
++```json
++"coze_agent": {
++  "configured": true,
++  "state": "CONFIGURED"
++}
++```
++
++网页应显示：
++
++```text
++Coze Agent：已配置
++```
++
++注意：“已配置”表示凭证和Bot ID存在；真正连通仍需执行一次Agent诊断验证。
++
++---
++
++# 十、Agent模式端到端验收
++
++## 步骤1：发起业务目标
++
++在异常诊断页输入：
++
++```text
++检查我未来14天内最需要处理的订单。
++```
++
++设置：
++
++```text
++最多返回：7笔
++生成任务草稿：开启
++需要正式动作时创建审批：开启
++```
++
++点击：
++
++```text
++启动Agent诊断
++```
++
++## 步骤2：检查最终回答
++
++回答应包含：
++
++```text
++分析范围
++扫描订单数
++真实风险订单数
++异常信号数
++信息缺口数
++每笔订单证据
++建议动作
++是否需要人工确认
++```
++
++如果创建了任务和审批，还应返回：
++
++```text
++task_draft_id
++approval_id
++```
++
++没有真实ID时，不能声称已经创建。
++
++## 步骤3：刷新查看执行轨迹
++
++点击浏览器刷新，重新进入异常诊断页。
++
++轨迹应尽量出现：
++
++```text
++start_agent_run
++diagnose_priority_orders
++create_task_draft
++create_approval_request
++complete_agent_run
++```
++
++至少要有：
++
++```text
++run_id
++工具调用记录
++停止原因
++```
++
++任务草稿和审批调用成功时，轨迹中应显示真实ID。
++
++## 步骤4：验证不静默降级
++
++临时清空或填错`COZE_AGENT_BOT_ID`，重新部署后点击Agent按钮。
++
++正确结果：
++
++```text
++Agent按钮禁用，或明确提示Coze未配置
++```
++
++不能自动展示规则巡检结果并冒充Agent回答。
++
++恢复正确变量后重新部署。
++
++---
++
++# 十一、任务草稿和审批验收
++
++## 任务草稿
++
++Agent可生成草稿，但不能直接创建正式任务。
++
++检查：
++
++```text
++task_draft_id存在
++正式任务数量未自动增加
++```
++
++## 审批请求
++
++检查：
++
++```text
++approval_id存在
++状态为PENDING
++页面显示待人工或待主管
++```
++
++正式订单字段、外发消息、延期、费用和赔偿仍不可自动执行。
++
++---
++
++# 十二、数据持久化验收
++
++1. 新建一笔测试订单；
++2. 运行一次规则巡检；
++3. 记录`run_id`和报告数量；
++4. 在Railway手动Redeploy；
++5. 部署完成后重新打开网站；
++6. 检查订单仍存在；
++7. 检查巡检报告仍存在；
++8. `/health`中确认：
++
++```json
++"on_persistent_path": true
++```
++
++如果数据丢失，先停止后续验收，检查：
++
++```text
++Volume是否挂载/data
++DB_PATH是否为/data/action_layer.db
++```
++
++---
++
++# 十三、最终冻结标准
++
++只有同时满足以下条件才创建正式Tag：
++
++- `/health`显示V6.1.3；
++- 36项自动测试通过；
++- 日期当天不误报；
++- 信息缺口不进风险榜；
++- 同订单多异常只出现一次；
++- 不足7笔不补齐；
++- 规则巡检明确标记为规则模式；
++- Coze Agent明确标记为Agent模式；
++- Agent失败不静默降级；
++- 真实`task_draft_id`和`approval_id`可追溯；
++- 重部署后数据保留；
++- 页面无阻断性错误。
++
++创建Tag：
++
++```text
++v6.1.3-job-portfolio
++```
++
++Release说明可使用`CHANGELOG_V6.md`中的V6.1.3部分。
++
++---
++
++# 十四、出现问题时怎么定位
++
++## 页面仍显示V6.1.2
++
++1. 检查GitHub提交是否在Railway部署分支；
++2. 检查Railway最新Deployment提交哈希；
++3. 强制刷新；
++4. 查看`static/index.html`是否引用：
++
++```text
++app.js?v=6.1.3
++styles.css?v=6.1.3
++```
++
++## Agent显示未配置
++
++检查Railway变量名：
++
++```text
++COZE_API_TOKEN
++COZE_AGENT_BOT_ID
++```
++
++检查变量值是否含多余引号或空格。
++
++## Agent返回401
++
++检查Coze插件Header：
++
++```text
++X-FlowOrder-Agent-Key
++```
++
++是否和Railway变量`FLOWORDER_AGENT_API_KEY`一致。
++
++## Agent超时
++
++1. 确认优先调用`diagnose_priority_orders`；
++2. 不要逐笔循环调用四个原子诊断工具；
++3. 确认所有工具传同一个`run_id`；
++4. 检查Railway冷启动；
++5. 检查`COZE_AGENT_TIMEOUT_SECONDS=120`；
++6. 查看运行轨迹中最后成功工具。
++
++## 审批已创建但Agent没返回ID
++
++1. 用`run_id`查看：
++
++```text
++/api/agent/runs/<run_id>/trace?current_user_id=USER-1&current_role=operator
++```
++
++2. 检查`approval_ids`；
++3. 检查网站待审批列表；
++4. 不要重复点击创建，审批接口有幂等保护。
++
++---
++
++# 十五、回滚方法
++
++## GitHub回滚
++
++切回：
++
++```text
++backup-before-v6.1.3
++```
++
++或Revert V6.1.3提交。
++
++## Railway回滚
++
++在Deployments中选择V6.1.2最后成功部署，点击Redeploy。
++
++## Coze回滚
++
++1. 恢复备份的旧提示词；
++2. 重新发布；
++3. 不需要删除数据库；
++4. 不要更换Agent工具密钥，除非怀疑密钥泄露。
++
++V6.1.3没有破坏性数据库迁移，代码回滚不需要清空SQLite。
++
++---
++
++# 十六、建议保存的求职证据
++
++- V6.1.2当天承诺误报截图；
++- V6.1.3当天承诺不误报截图；
++- 同订单多异常聚合截图；
++- 信息缺口独立区域截图；
++- Agent/规则双模式状态截图；
++- Agent可审计轨迹截图；
++- `task_draft_id`和`approval_id`截图；
++- 36项自动测试通过记录；
++- 数据重部署后保留证据。
++
++这组材料可以直接用于说明：你不是为了Agent标签增加模型调用，而是在保留目标理解和动态编排的同时，用确定性规则修复业务一致性问题。
+diff --git a/main.py b/main.py
+index 0deb25e..face633 100644
+--- a/main.py
++++ b/main.py
+@@ -35,7 +35,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
+ API_KEY = os.getenv("APP_API_KEY", "").strip()
+ CN_TZ = timezone(timedelta(hours=8))
+ 
+-app = FastAPI(title="AI外贸跟单行动系统", version="6.1.2")
++app = FastAPI(title="AI外贸跟单行动系统", version="6.1.3")
+ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+ register_excel_import_patch(app)
+ register_communication_workflows_patch(app)
+@@ -1855,7 +1855,8 @@ def home() -> FileResponse:
+ @app.get("/health")
+ def health() -> dict[str, Any]:
+     init_db()
+-    return {"status": "ok", "version": "6.1.2", "db": str(DB_PATH), "storage": storage_status(), "coze": coze_status()}
++    return {"status": "ok", "version": "6.1.3", "db": str(DB_PATH), "storage": storage_status(),
++            "coze": coze_status(), "agent": agent_api.coze_agent_status()}
+ 
+ 
+ @app.get("/api/system/storage")
+diff --git a/static/app.js b/static/app.js
+index 9894bd4..055a309 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -153,8 +153,11 @@ function bindShell(){
+ function updateProfile(){const op=currentOperator();$('#profileName').textContent=op.name;$('#profileRole').textContent=op.role;$('#profileAvatar').textContent=op.name.slice(0,1);$$('[data-route="manage"]').forEach(el=>el.hidden=op.user_id!=='MANAGER-1');const settingsLabel=$('[data-route="settings"] span');if(settingsLabel)settingsLabel.textContent=op.user_id==='MANAGER-1'?'设置与连接':'身份与设置';document.body.dataset.role=op.user_id==='MANAGER-1'?'manager':'operator'}
+ function updateHealth(h,error=''){
+   const dot=$('#sidebarLiveDot');dot.className='live-dot';
+-  if(!h){dot.classList.add('bad');$('#sidebarStatus').textContent='服务连接失败';$('#sidebarStatusDetail').textContent=error||'请查看Render日志';return}
+-  const ready=h.coze?.ready;dot.classList.toggle('warn',!ready);$('#sidebarStatus').textContent=ready?'自动化已连接':'网站已连接';$('#sidebarStatusDetail').textContent=ready?`系统 v${h.version}`:'部分自动化配置未完成'
++  if(!h){dot.classList.add('bad');$('#sidebarStatus').textContent='后端服务异常';$('#sidebarStatusDetail').textContent=error||'请查看Railway部署日志';return}
++  const agentConfigured=!!h.agent?.configured;
++  dot.classList.toggle('warn',!agentConfigured);
++  $('#sidebarStatus').textContent='后端服务正常';
++  $('#sidebarStatusDetail').textContent=`v${h.version} · Coze Agent${agentConfigured?'已配置':'未配置'}`;
+ }
+ function updateBadges(todayCount,reviewCount,agentCount=null){if(todayCount!=null){$('#todayBadge').hidden=!todayCount;$('#todayBadge').textContent=todayCount}if(reviewCount!=null){$('#reviewBadge').hidden=!reviewCount;$('#reviewBadge').textContent=reviewCount}if(agentCount!=null&&$('#agentBadge')){$('#agentBadge').hidden=!agentCount;$('#agentBadge').textContent=agentCount}}
+ async function renderRoute(resetSearch=true,preserveSearchFocus=false){
+@@ -261,33 +264,90 @@ function fieldLabel(name){return({packaging_method:'包装方式',requested_deli
+ const anomalyLabels={SUPPLIER_COMMITMENT_OVERDUE:'供应商承诺超时',CUSTOMER_CONFIRMATION_BLOCKING:'客户确认阻塞',DELIVERY_RISK:'交期风险',LOGISTICS_EXCEPTION:'物流异常',INFORMATION_GAP:'信息不足'};
+ const anomalyStatusLabels={ANOMALY_CANDIDATE:'异常候选',PENDING_CONFIRMATION:'待确认',CONFIRMED:'已确认',REJECTED:'已驳回',RESOLVED:'已解决'};
+ function severityBadge(v='LOW'){const map={CRITICAL:'严重',HIGH:'高',MEDIUM:'中',LOW:'低'};return `<span class="risk-badge ${v==='CRITICAL'?'critical':v.toLowerCase()}">${map[v]||v}</span>`}
+-function agentCandidateCard(c){const evidence=c.evidence||safeJson(c.evidence_json,[]),missing=c.missing_information||safeJson(c.missing_information_json,[]);return `<article class="agent-candidate-card"><div class="agent-candidate-head"><div><span class="agent-rank">${esc(c.rank||'')}</span><strong>${esc(c.order_no||c.order_id)} · ${esc(anomalyLabels[c.anomaly_type]||c.anomaly_type)}</strong><small>${esc(c.customer_name||'')}</small></div>${severityBadge(c.severity)}</div><p class="agent-action">${esc(c.recommended_action||'待补充处置建议')}</p><div class="evidence-list">${evidence.slice(0,4).map(x=>`<span>${esc(x)}</span>`).join('')||'<span>暂无证据摘要</span>'}</div>${missing.length?`<div class="missing-note">仍需补充：${esc(missing.join('、'))}</div>`:''}<footer><span class="status ${esc(c.status)}">${esc(anomalyStatusLabels[c.status]||c.status)}</span><div class="button-row">${['ANOMALY_CANDIDATE','PENDING_CONFIRMATION'].includes(c.status)?`<button class="btn small primary" data-anomaly-confirm="${esc(c.candidate_id)}">确认异常</button><button class="btn small" data-anomaly-reject="${esc(c.candidate_id)}">驳回</button>`:''}${c.status==='CONFIRMED'?`<button class="btn small" data-anomaly-resolve="${esc(c.candidate_id)}">标记解决</button>`:''}<button class="btn small soft" data-go="orders/${esc(c.order_id)}">查看订单</button></div></footer></article>`}
++function agentCandidateCard(c){
++  const evidence=c.evidence||safeJson(c.evidence_json,[]),missing=c.missing_information||safeJson(c.missing_information_json,[]);
++  const secondary=(c.secondary_anomaly_types||[]).map(x=>anomalyLabels[x]||x);
++  return `<article class="agent-candidate-card"><div class="agent-candidate-head"><div><span class="agent-rank">${esc(c.rank||'')}</span><strong>${esc(c.order_no||c.order_id)} · ${esc(anomalyLabels[c.primary_anomaly_type||c.anomaly_type]||c.primary_anomaly_type||c.anomaly_type)}</strong><small>${esc(c.customer_name||'')}${c.order_anomaly_count>1?` · 共${Number(c.order_anomaly_count)}类异常`:''}</small></div>${severityBadge(c.severity)}</div>${secondary.length?`<div class="secondary-anomalies">次要异常：${secondary.map(esc).join('、')}</div>`:''}<p class="agent-action">${esc(c.recommended_action||'待补充处置建议')}</p><div class="evidence-list">${evidence.slice(0,4).map(x=>`<span>${esc(x)}</span>`).join('')||'<span>暂无证据摘要</span>'}</div>${missing.length?`<div class="missing-note">仍需补充：${esc(missing.join('、'))}</div>`:''}<footer><span class="status ${esc(c.status)}">${esc(anomalyStatusLabels[c.status]||c.status||'待确认')}</span><div class="button-row">${['ANOMALY_CANDIDATE','PENDING_CONFIRMATION'].includes(c.status)?`<button class="btn small primary" data-anomaly-confirm="${esc(c.candidate_id)}">确认异常</button><button class="btn small" data-anomaly-reject="${esc(c.candidate_id)}">驳回</button>`:''}${c.status==='CONFIRMED'?`<button class="btn small" data-anomaly-resolve="${esc(c.candidate_id)}">标记解决</button>`:''}<button class="btn small soft" data-go="orders/${esc(c.order_id)}">查看订单</button></div></footer></article>`
++}
++function agentConnectionCard(label,state,detail,tone='green'){return `<div class="agent-connection-card ${esc(tone)}"><span>${esc(label)}</span><strong>${esc(state)}</strong><small>${esc(detail)}</small></div>`}
++function agentRunTrace(run,calls=[]){
++  if(!run)return emptyState('还没有运行轨迹','启动一次Coze Agent诊断或规则巡检后，这里会显示可审计步骤。');
++  const result=run.result||{},mode=result.execution_mode||(/RULE/.test(run.trigger_type||'')?'RULE_INSPECTION':'COZE_AGENT');
++  const labels={start_agent_run:'创建Agent运行',diagnose_priority_orders:'调用组合诊断技能',deterministic_rule_inspection:'执行确定性规则巡检',create_task_draft:'创建任务草稿',create_approval_request:'创建人工审批',complete_agent_run:'完成Agent运行'};
++  const steps=calls.map((c,i)=>`<li><b>${i+1}</b><div><strong>${esc(labels[c.tool_name]||c.tool_name)}</strong><small>${esc(c.status||'')}${c.duration_ms!=null?` · ${Number(c.duration_ms)}ms`:''}</small>${c.response?.task_draft_id?`<code>task_draft_id: ${esc(c.response.task_draft_id)}</code>`:''}${c.response?.approval_id?`<code>approval_id: ${esc(c.response.approval_id)}</code>`:''}</div></li>`).join('');
++  return `<div class="agent-trace-head"><div><span>${mode==='COZE_AGENT'?'Coze Agent运行':'规则巡检运行'}</span><strong>${esc(run.run_id)}</strong></div><div><span>停止原因</span><strong>${esc(run.stop_reason||run.status||'运行中')}</strong></div><div><span>耗时</span><strong>${run.duration_ms==null?'—':`${Number(run.duration_ms)}ms`}</strong></div></div><ol class="agent-trace-list">${steps||'<li><b>1</b><div><strong>运行记录已创建</strong><small>暂无工具调用明细</small></div></li>'}</ol>`
++}
++
+ async function pageAgent(root){
+   const role=currentUser()==='MANAGER-1'?'manager':'operator';
+-  const data=await api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`);
++  const [data,status]=await Promise.all([
++    api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`),
++    api('/api/agent/status')
++  ]);
+   updateBadges(null,null,data.summary.candidate_count);
+   const latest=data.reports?.[0]?.report||null;
+   const latestItems=latest?.top_items||[];
+-  root.innerHTML=`<div class="page-stack"><section class="agent-hero"><div><span>FLOWORDER AGENT · HUMAN IN THE LOOP</span><h2>让Agent先查证据，再由人确认业务异常</h2><p>默认检查本人负责且未来14天内交期的活跃订单；承诺超时、高风险新消息和物流异常会越过时间窗口进入候选。</p></div><div class="button-row"><button class="btn primary" id="runAgentInspection">立即巡检</button><button class="btn" id="showAgentPolicy">查看自治边界</button></div></section><section class="panel agent-chat-panel"><div class="panel-head"><div><h2>向FlowOrder Agent发起目标</h2><p>网站与Coze使用同一个已发布Agent；未配置Bot ID时仍可使用本地规则巡检。</p></div></div><div class="agent-chat-box"><textarea id="agentQuestion" rows="3">帮我检查今天最需要处理的订单，返回最多7笔，并说明证据、缺失信息和建议动作。</textarea><button class="btn primary" id="askAgent">让Agent诊断</button></div><div id="agentAnswer" class="agent-answer" hidden></div></section><section class="metric-grid">${metric('异常候选',data.summary.candidate_count,'red','alert','需要人工确认')}${metric('严重异常',data.summary.critical_count,'amber','alert','优先复核')}${metric('待审批动作',data.summary.pending_approval_count,'blue','review','尚未正式执行')}${metric('巡检报告',data.summary.report_count,'green','chart','每天8:30')}</section>${latest?`<section class="panel"><div class="panel-head"><div><h2>最近一次巡检 Top ${latestItems.length}</h2><p>${esc(latest.generated_at||'')} · 筛选${Number(latest.screened_order_count||0)}笔订单 · 发现${Number(latest.anomaly_candidate_count||0)}个候选</p></div><span class="status">人工确认后才生效</span></div><div class="agent-candidate-grid">${latestItems.map(agentCandidateCard).join('')||emptyState('本次未发现异常候选','Agent不会为了凑满Top 7而制造异常。')}</div></section>`:''}<section class="panel"><div class="panel-head"><div><h2>全部异常候选</h2><p>Agent可自主检索、诊断和排序；正式异常、任务、写回与外部发送均需要人工审批。</p></div></div><div class="agent-candidate-grid">${data.candidates.map(agentCandidateCard).join('')||emptyState('还没有异常候选','运行一次巡检，或在Coze中向FlowOrder Agent发起诊断。')}</div></section><section class="panel"><div class="panel-head"><div><h2>待审批动作</h2><p>高风险动作要求主管审批；首版不会自动发送客户或工厂消息。</p></div></div><div class="approval-list">${data.approvals.filter(x=>x.status==='PENDING').map(a=>`<article><div><strong>${esc(a.action_type)}</strong><small>${esc(a.order_no||a.order_id||'')}</small></div><span class="status NEEDS_CONFIRMATION">${esc(a.required_role==='manager'?'需要主管':'需要人工')}</span></article>`).join('')||emptyState('当前没有待审批动作','Agent生成的正式动作会进入这里。')}</div></section></div>`;
++  const latestGaps=latest?.information_gaps||[];
++  const cozeConfigured=!!status.coze_agent?.configured;
++  const scheduleConfigured=!!status.daily_schedule?.configured;
++  const latestRun=data.latest_run;
++  const latestCalls=data.latest_tool_calls||[];
++  const maxCalls=Number(status.limits?.max_tool_calls||8),maxSeconds=Number(status.limits?.max_duration_seconds||120);
++  const currentMetrics=latest?[
++    ['扫描订单',Number(latest.screened_order_count||0),'green','orders','本次运行'],
++    ['风险订单',Number(latest.risk_order_count??latestItems.length),'red','alert','最多7笔不同订单'],
++    ['异常信号',Number((latest.anomaly_signal_count??latest.anomaly_candidate_count) || 0),'amber','alert','同一订单可含多信号'],
++    ['信息缺口',Number(latest.information_gap_order_count??latestGaps.length),'blue','review','单独展示，不进风险榜']
++  ]:[['扫描订单',0,'green','orders','尚未运行'],['风险订单',0,'red','alert','尚未运行'],['异常信号',0,'amber','alert','尚未运行'],['信息缺口',0,'blue','review','尚未运行']];
++  root.innerHTML=`<div class="page-stack">
++    <section class="agent-hero"><div><span>FLOWORDER AGENT · HUMAN IN THE LOOP</span><h2>Agent理解目标、选择技能，确定性规则与人工审批共同兜底</h2><p>支持跨订单异常巡检、单订单证据解释和批量进展解析。Coze Agent与规则巡检是两种明确模式，不会静默互相冒充。</p></div><div class="agent-mode-chip ${cozeConfigured?'online':'offline'}"><i></i><div><small>当前Agent模式</small><strong>${cozeConfigured?'Coze Agent已配置':'规则巡检可用'}</strong></div></div></section>
++    <section class="agent-connection-grid">
++      ${agentConnectionCard('后端服务','正常',`FlowOrder v${status.version}`,'green')}
++      ${agentConnectionCard('Coze Agent',cozeConfigured?'已配置':'未配置',cozeConfigured?'可启动动态工具编排':'需配置Token与Bot ID',''+(cozeConfigured?'green':'amber'))}
++      ${agentConnectionCard('定时巡检',scheduleConfigured?'接口已配置':'未配置',scheduleConfigured?'计划每天08:30；需外部调度器触发':'手动规则巡检仍可使用',scheduleConfigured?'green':'blue')}
++    </section>
++    <section class="panel agent-chat-panel"><div class="panel-head"><div><h2>向FlowOrder Agent发起业务目标</h2><p>用户只描述目标；Top N、审批边界和禁止自动发送等约束由系统配置执行。</p></div><button class="btn" id="showAgentPolicy">查看自治边界</button></div>
++      <div class="agent-goal-layout"><div><textarea id="agentQuestion" rows="3">检查我未来14天内最需要处理的订单。</textarea><div class="agent-shortcuts"><button type="button" data-agent-prompt="检查我未来14天内最需要处理的订单。">近期风险巡检</button><button type="button" data-agent-prompt="解释最高优先级订单为什么需要先处理。">解释排序原因</button><button type="button" data-agent-prompt="检查是否存在已经超过承诺回复时间的事项。">检查超时承诺</button></div></div>
++        <div class="agent-options"><label><span>巡检范围</span><select id="agentDueDays"><option value="7">未来7天</option><option value="14" selected>未来14天</option><option value="30">未来30天</option></select></label><label><span>最多返回</span><select id="agentTopN"><option value="3">3笔</option><option value="5">5笔</option><option value="7" selected>7笔</option></select></label><label class="agent-check"><input type="checkbox" id="agentCreateTask" checked><span>为最高优先级生成任务草稿</span></label><label class="agent-check"><input type="checkbox" id="agentCreateApproval" checked><span>需要正式动作时创建审批</span></label></div></div>
++      <div class="button-row agent-run-buttons"><button class="btn primary" id="askAgent" ${cozeConfigured?'':'disabled'}>启动Agent诊断</button><button class="btn" id="runAgentInspection">仅运行规则巡检</button><span class="agent-mode-help">${cozeConfigured?'Agent会动态选择组合工具或原子工具。':'Coze未配置，Agent按钮已禁用；规则巡检不会被标记为Agent结果。'}</span></div><div id="agentAnswer" class="agent-answer" hidden></div>
++    </section>
++    <section><div class="section-label-row"><div><h2>本次运行</h2><p>${latest?`${esc(latest.generated_at||'')} · ${latest.execution_mode==='RULE_INSPECTION'?'规则巡检':'Agent诊断'}`:'尚无巡检结果'}</p></div></div><div class="metric-grid">${currentMetrics.map(x=>metric(...x)).join('')}</div></section>
++    <section class="panel"><div class="panel-head"><div><h2>可审计执行轨迹</h2><p>展示目标路由、工具调用、真实ID与停止原因，不展示模型私有推理。</p></div>${latestRun?`<span class="status">${/RULE/.test(latestRun.trigger_type||'')?'规则模式':'Agent模式'}</span>`:''}</div><div class="panel-body">${agentRunTrace(latestRun,latestCalls)}</div></section>
++    ${latest?`<section class="panel"><div class="panel-head"><div><h2>最近一次风险订单 Top ${latestItems.length}</h2><p>筛选${Number(latest.screened_order_count||0)}笔 · ${Number((latest.anomaly_signal_count??latest.anomaly_candidate_count) || 0)}个异常信号 · 不足7笔不补齐</p></div><span class="status">人工确认后才生效</span></div><div class="agent-candidate-grid">${latestItems.map(agentCandidateCard).join('')||emptyState('本次没有真实风险订单','系统不会用信息缺口凑满Top 7。')}</div></section>`:''}
++    ${latestGaps.length?`<section class="panel information-gap-panel"><div class="panel-head"><div><h2>本次信息缺口</h2><p>这些订单需要补充事实，但不属于风险Top 7。</p></div><span class="tag">${latestGaps.length}笔</span></div><div class="information-gap-list">${latestGaps.map(g=>`<article><div><strong>${esc(g.order_no||g.order_id)}</strong><small>${esc((g.missing_information||[]).join('、')||'缺少动态信息')}</small></div><button class="btn small soft" data-go="orders/${esc(g.order_id)}">补充信息</button></article>`).join('')}</div></section>`:''}
++    <section><div class="section-label-row"><div><h2>历史累计</h2><p>历史存量与本次运行分开统计，避免把累计候选误认为本次Top 7。</p></div></div><div class="metric-grid">${metric('累计风险候选',data.summary.candidate_count,'red','alert','待确认或处理中')}${metric('累计信息缺口',data.summary.information_gap_count,'amber','review','不进入风险榜')}${metric('待审批动作',data.summary.pending_approval_count,'blue','review','尚未正式执行')}${metric('巡检报告',data.summary.report_count,'green','chart','历史报告数')}</div></section>
++    <section class="panel"><div class="panel-head"><div><h2>历史风险候选</h2><p>正式异常、任务、写回与外部发送仍受人工审批控制。</p></div></div><div class="agent-candidate-grid">${data.candidates.map(agentCandidateCard).join('')||emptyState('还没有风险候选','启动Agent诊断或规则巡检后，真实风险会出现在这里。')}</div></section>
++    <section class="panel"><div class="panel-head"><div><h2>待审批动作</h2><p>高风险动作必须等待人工；系统不会自动发送客户或工厂消息。</p></div></div><div class="approval-list">${data.approvals.filter(x=>x.status==='PENDING').map(a=>`<article><div><strong>${esc(a.action_type)}</strong><small>${esc(a.order_no||a.order_id||'')} · ${esc(a.approval_id)}</small></div><span class="status NEEDS_CONFIRMATION">${esc(a.required_role==='manager'?'需要主管':'需要人工')}</span></article>`).join('')||emptyState('当前没有待审批动作','Agent生成的正式动作会进入这里。')}</div></section>
++  </div>`;
++  $$('[data-agent-prompt]',root).forEach(b=>b.onclick=()=>{$('#agentQuestion',root).value=b.dataset.agentPrompt});
+   $('#askAgent',root).onclick=async()=>{
+     const b=$('#askAgent',root),q=$('#agentQuestion',root).value.trim(),box=$('#agentAnswer',root);
+     if(!q)return toast('请输入诊断目标','error');
+-    b.disabled=true;b.textContent='Agent正在调用工具…';box.hidden=false;
+-    box.innerHTML='<div class="loading-state compact"><span></span><p>正在检索订单、消息、等待和依赖证据…</p></div>';
++    b.disabled=true;b.textContent='Agent正在选择工具…';box.hidden=false;
++    box.innerHTML='<div class="loading-state compact"><span></span><p>正在理解目标、选择工具并检索业务证据…</p></div>';
+     try{
+-      const r=await api('/api/agent/chat',{method:'POST',body:JSON.stringify({question:q,current_user_id:currentUser(),current_role:role}),timeoutMs:90000});
+-      box.innerHTML=`<strong>Agent诊断结果</strong><pre>${esc(r.answer||'Agent未返回文本结果')}</pre><small>耗时 ${Number(r.duration_ms||0)/1000}s${r.conversation_id?' · 已保留Coze会话':''}</small>`;
++      const payload={question:q,current_user_id:currentUser(),current_role:role,due_within_days:Number($('#agentDueDays',root).value),top_n:Number($('#agentTopN',root).value),create_task_draft:$('#agentCreateTask',root).checked,create_approval_request:$('#agentCreateApproval',root).checked};
++      const r=await api('/api/agent/chat',{method:'POST',body:JSON.stringify(payload),timeoutMs:(maxSeconds+20)*1000});
++      const runId=r.run?.run_id||'';
++      box.innerHTML=`<strong>Coze Agent诊断结果</strong><pre>${esc(r.answer||'Agent未返回文本结果')}</pre><small>耗时 ${(Number(r.duration_ms||0)/1000).toFixed(1)}s${runId?` · run_id: ${esc(runId)}`:''}${r.conversation_id?' · 已保留Coze会话':''}</small><p class="agent-no-fallback">本结果来自Coze Agent；如调用失败，系统不会静默替换成规则巡检结果。</p>`;
++      toast('Agent运行完成，可刷新查看执行轨迹','success');
+     }catch(e){
+-      box.innerHTML=`<strong>暂未连接Coze Agent</strong><p>${esc(e.message)}</p><p>你仍可点击“立即巡检”使用确定性规则完成异常候选生成。</p>`;
++      box.innerHTML=`<strong>Coze Agent调用未完成</strong><p>${esc(e.message)}</p><p>本次没有自动切换为规则结果。需要兜底时，请明确点击“仅运行规则巡检”。</p>`;
+       toast(e.message,'error');
+-    }finally{b.disabled=false;b.textContent='让Agent诊断'}
++    }finally{b.disabled=!cozeConfigured;b.textContent='启动Agent诊断'}
+   };
+-  $('#runAgentInspection',root).onclick=async()=>{const b=$('#runAgentInspection',root);b.disabled=true;b.textContent='正在筛选与诊断…';try{await api('/api/agent/inspection/run',{method:'POST',body:JSON.stringify({current_user_id:currentUser(),current_role:role,due_within_days:14,top_n:7,goal:'检查今天最需要处理的订单',trigger_type:'MANUAL'}),timeoutMs:60000});toast('巡检完成，异常仍需人工确认','success');renderRoute(false)}catch(e){toast(e.message,'error')}finally{b.disabled=false;b.textContent='立即巡检'}};
+-  $('#showAgentPolicy',root).onclick=()=>openInfoModal('Agent自治边界',`<div class="page-stack"><div class="boundary-note"><strong>Agent可以自主完成</strong><p>读取订单、查询消息与等待、识别异常候选、补充证据、排序、追问、生成任务与沟通草稿。</p></div><div class="boundary-note danger"><strong>必须人工确认</strong><p>确认正式异常、创建正式任务、修改订单字段、记录已联系、发送消息、接受延期、费用赔偿责任和高风险放行。</p></div><p>单次最多8次工具调用，最长分析60秒；证据不足、处于有效等待、工具失败或达到预算时必须停止。</p></div>`);
++  $('#runAgentInspection',root).onclick=async()=>{
++    const b=$('#runAgentInspection',root),days=Number($('#agentDueDays',root).value),topN=Number($('#agentTopN',root).value);
++    b.disabled=true;b.textContent='规则巡检中…';
++    try{await api('/api/agent/inspection/run',{method:'POST',body:JSON.stringify({current_user_id:currentUser(),current_role:role,due_within_days:days,top_n:topN,goal:`规则巡检未来${days}天订单`,trigger_type:'MANUAL_RULE'}),timeoutMs:120000});cache={operators:cache.operators};toast('规则巡检完成；结果已明确标记为规则模式','success');renderRoute(false)}catch(e){toast(e.message,'error')}finally{b.disabled=false;b.textContent='仅运行规则巡检'}
++  };
++  $('#showAgentPolicy',root).onclick=()=>openInfoModal('Agent自治边界',`<div class="page-stack"><div class="boundary-note"><strong>Agent自主完成</strong><p>理解开放目标、选择组合或原子工具、根据结果追问/停止、生成任务草稿与审批请求。</p></div><div class="boundary-note"><strong>后端确定性规则</strong><p>日期比较、权限、去重、同订单异常聚合、信息缺口过滤、Top N与幂等写入。</p></div><div class="boundary-note danger"><strong>人工承担业务责任</strong><p>正式修改订单、接受延期、费用赔偿、外发消息和高风险放行。</p></div><p>运行预算由后端返回：最多${maxCalls}次工具调用、${maxSeconds}秒；达到预算、证据不足或需要审批时停止。</p></div>`);
+   $$('[data-anomaly-confirm]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyConfirm,'CONFIRM'));
+   $$('[data-anomaly-reject]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyReject,'REJECT'));
+   $$('[data-anomaly-resolve]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyResolve,'RESOLVE'));
++  bindRouteButtons(root);
+ }
++
+ async function decideAnomaly(id,decision){try{await api(`/api/agent/candidates/${encodeURIComponent(id)}/decision`,{method:'POST',body:JSON.stringify({decision,operator_id:currentUser(),current_role:currentUser()==='MANAGER-1'?'manager':'operator'})});toast(decision==='CONFIRM'?'异常已由人工确认':decision==='REJECT'?'候选已驳回':'异常已标记解决','success');renderRoute(false)}catch(e){toast(e.message,'error')}}
+ function openInfoModal(title,html){openModal({eyebrow:'AGENT POLICY',title,subtitle:'受控型Agent不会绕过人工责任边界',body:html,actions:'<button class="btn primary" data-close-modal>知道了</button>'});$$('[data-close-modal]',$('#modal')).forEach(b=>b.onclick=closeModal)}
+ 
+diff --git a/static/index.html b/static/index.html
+index c46dc10..e9fbfea 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -6,7 +6,7 @@
+   <meta name="theme-color" content="#092923" />
+   <meta name="color-scheme" content="light" />
+   <title>AI外贸跟单行动系统</title>
+-  <link rel="stylesheet" href="/static/styles.css?v=6.0.0" />
++  <link rel="stylesheet" href="/static/styles.css?v=6.1.3" />
+ </head>
+ <body>
+   <div class="app-shell">
+@@ -94,6 +94,6 @@
+   </dialog>
+ 
+   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+-  <script src="/static/app.js?v=6.0.0"></script>
++  <script src="/static/app.js?v=6.1.3"></script>
+ </body>
+ </html>
+diff --git a/static/styles.css b/static/styles.css
+index f55b09b..d004fc4 100644
+--- a/static/styles.css
++++ b/static/styles.css
+@@ -473,3 +473,13 @@ svg{display:block;width:1em;height:1em}
+ @media(max-width:900px){.agent-hero{align-items:flex-start;flex-direction:column}.agent-candidate-grid{grid-template-columns:1fr}.agent-candidate-card footer{align-items:flex-start;flex-direction:column}.agent-hero h2{font-size:23px}}
+ .agent-chat-box{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}.agent-chat-box textarea{width:100%;resize:vertical;min-height:84px;border:1px solid var(--line,#dbe5e2);border-radius:14px;padding:14px;font:inherit;line-height:1.6}.agent-answer{margin-top:14px;padding:16px;border-radius:14px;background:#f5f9f7;border:1px solid #dbe5e2}.agent-answer pre{white-space:pre-wrap;word-break:break-word;font:inherit;line-height:1.75;margin:10px 0}.loading-state.compact{min-height:80px}.agent-answer small{color:#70807b}@media(max-width:700px){.agent-chat-box{grid-template-columns:1fr}.agent-chat-box .btn{width:100%}}
+ .agent-chat-box{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}.agent-chat-box textarea{width:100%;resize:vertical;min-height:84px;border:1px solid var(--line,#dbe5e2);border-radius:14px;padding:14px;font:inherit;line-height:1.6}.agent-answer{margin-top:14px;padding:16px;border-radius:14px;background:#f5f9f7;border:1px solid #dbe5e2}.agent-answer pre{white-space:pre-wrap;word-break:break-word;font:inherit;line-height:1.75;margin:10px 0}.loading-state.compact{min-height:80px}.agent-answer small{color:#70807b}@media(max-width:700px){.agent-chat-box{grid-template-columns:1fr}.agent-chat-box .btn{width:100%}}
++
++
++/* FlowOrder Agent V6.1.3 clarity and trace */
++.agent-mode-chip{display:flex;align-items:center;gap:11px;padding:12px 15px;border:1px solid rgba(255,255,255,.22);border-radius:14px;background:rgba(255,255,255,.1);min-width:190px}.agent-mode-chip i{width:10px;height:10px;border-radius:50%;background:#7bd1a7;box-shadow:0 0 0 5px rgba(123,209,167,.15)}.agent-mode-chip.offline i{background:#e2b25f;box-shadow:0 0 0 5px rgba(226,178,95,.15)}.agent-mode-chip div{display:flex;flex-direction:column;gap:2px}.agent-mode-chip small{color:rgba(255,255,255,.68);font-size:10px}.agent-mode-chip strong{font-size:13px}
++.agent-connection-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.agent-connection-card{padding:15px 17px;border:1px solid var(--line);border-radius:15px;background:#fff;display:grid;gap:4px}.agent-connection-card span{font-size:10px;font-weight:800;color:var(--muted)}.agent-connection-card strong{font-size:14px;color:var(--forest)}.agent-connection-card small{font-size:10px;color:var(--muted);line-height:1.45}.agent-connection-card.green{border-left:4px solid #5aa382}.agent-connection-card.amber{border-left:4px solid #c89543}.agent-connection-card.blue{border-left:4px solid #648eb5}
++.agent-goal-layout{display:grid;grid-template-columns:minmax(0,1.8fr) minmax(240px,.8fr);gap:16px}.agent-goal-layout textarea{width:100%;min-height:94px;border:1px solid var(--line);border-radius:14px;padding:14px;font:inherit;line-height:1.65;resize:vertical}.agent-shortcuts{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.agent-shortcuts button{border:1px solid var(--line);background:var(--surface-2);color:var(--forest);border-radius:999px;padding:6px 10px;font-size:9px;font-weight:800;cursor:pointer}.agent-options{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:13px;border:1px solid var(--line);border-radius:14px;background:var(--surface-2)}.agent-options label{display:grid;gap:5px}.agent-options label>span{font-size:9px;font-weight:800;color:var(--muted)}.agent-options select{border:1px solid var(--line);border-radius:9px;background:#fff;padding:8px;color:var(--forest);font-size:10px}.agent-options .agent-check{grid-column:1/-1;display:flex;align-items:flex-start;gap:8px}.agent-options .agent-check input{margin-top:2px}.agent-options .agent-check span{font-size:10px;color:var(--forest);font-weight:700;line-height:1.45}.agent-run-buttons{margin-top:14px;align-items:center}.agent-mode-help{font-size:10px;color:var(--muted);line-height:1.5}.agent-no-fallback{padding-top:9px;border-top:1px solid var(--line);font-size:10px;color:var(--muted)}
++.section-label-row{display:flex;justify-content:space-between;align-items:flex-end;margin:2px 2px 10px}.section-label-row h2{margin:0;color:var(--forest);font-size:16px}.section-label-row p{margin:3px 0 0;color:var(--muted);font-size:10px}.secondary-anomalies{padding:7px 9px;border-radius:9px;background:#fff5e6;color:#7b591b;font-size:10px}.information-gap-panel{border-left:4px solid #c89543}.information-gap-list{display:grid;gap:9px}.information-gap-list article{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--line);border-radius:12px}.information-gap-list article div{display:flex;flex-direction:column;gap:4px}.information-gap-list small{color:var(--muted)}
++.agent-trace-head{display:grid;grid-template-columns:1.3fr 1fr .7fr;gap:10px;margin-bottom:14px}.agent-trace-head>div{padding:11px 12px;border-radius:11px;background:var(--surface-2);display:grid;gap:3px}.agent-trace-head span{font-size:9px;color:var(--muted);font-weight:800}.agent-trace-head strong{font-size:11px;color:var(--forest);word-break:break-all}.agent-trace-list{list-style:none;padding:0;margin:0;display:grid;gap:8px}.agent-trace-list li{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:flex-start}.agent-trace-list li>b{width:26px;height:26px;border-radius:8px;background:var(--forest);color:#fff;display:grid;place-items:center;font-size:10px}.agent-trace-list li>div{padding:9px 12px;border:1px solid var(--line);border-radius:11px;display:grid;gap:3px}.agent-trace-list strong{font-size:11px}.agent-trace-list small{font-size:9px;color:var(--muted)}.agent-trace-list code{font-size:9px;color:#51665f;background:#f1f5f3;padding:4px 6px;border-radius:6px;word-break:break-all}
++@media(max-width:900px){.agent-connection-grid{grid-template-columns:1fr}.agent-goal-layout{grid-template-columns:1fr}.agent-options{grid-template-columns:1fr 1fr}.agent-trace-head{grid-template-columns:1fr}}
++@media(max-width:620px){.agent-options{grid-template-columns:1fr}.agent-options .agent-check{grid-column:1}.agent-run-buttons .btn{width:100%}.information-gap-list article{align-items:flex-start;flex-direction:column}}
+diff --git a/tests/test_v613_regressions.py b/tests/test_v613_regressions.py
+new file mode 100644
+index 0000000..f704708
+--- /dev/null
++++ b/tests/test_v613_regressions.py
+@@ -0,0 +1,142 @@
++import os
++from pathlib import Path
++
++os.environ.setdefault("DB_PATH", str(Path(__file__).parent / "test_action_layer.db"))
++os.environ.setdefault("APP_API_KEY", "test-key")
++os.environ.setdefault("SEED_DEMO_DATA", "true")
++
++from fastapi.testclient import TestClient
++
++import agent_api
++from main import app, db, init_db
++
++client = TestClient(app)
++HEADERS = {"X-FlowOrder-Agent-Key": "agent-test-key"}
++
++
++def setup_function():
++    agent_api.AGENT_API_KEY = "agent-test-key"
++    init_db()
++    assert client.post("/api/reset").status_code == 200
++    assert client.post("/api/demo/seed").status_code == 200
++
++
++def test_date_only_supplier_commitment_is_not_overdue_during_same_day():
++    with db() as conn:
++        conn.execute(
++            "UPDATE orders SET latest_supplier_commitment=?,current_progress=? WHERE order_id=?",
++            ("2026-08-03", 0.45, "ORD-1001"),
++        )
++        conn.commit()
++    response = client.post(
++        "/api/agent/tools/anomalies/build",
++        headers=HEADERS,
++        json={
++            "current_user_id": "USER-1",
++            "current_role": "operator",
++            "order_id": "ORD-1001",
++            "current_time": "2026-08-03T16:30:00+08:00",
++            "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
++        },
++    )
++    assert response.status_code == 200, response.text
++    assert response.json()["count"] == 0
++
++
++def test_date_only_supplier_commitment_becomes_overdue_next_day():
++    with db() as conn:
++        conn.execute(
++            "UPDATE orders SET latest_supplier_commitment=?,current_progress=? WHERE order_id=?",
++            ("2026-08-03", 0.45, "ORD-1001"),
++        )
++        conn.commit()
++    response = client.post(
++        "/api/agent/tools/anomalies/build",
++        headers=HEADERS,
++        json={
++            "current_user_id": "USER-1",
++            "current_role": "operator",
++            "order_id": "ORD-1001",
++            "current_time": "2026-08-04T00:01:00+08:00",
++            "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
++        },
++    )
++    assert response.status_code == 200, response.text
++    assert response.json()["count"] == 1
++    assert response.json()["items"][0]["anomaly_type"] == "SUPPLIER_COMMITMENT_OVERDUE"
++
++
++def test_information_gap_is_separated_and_never_pads_risk_top_n():
++    items = [
++        {
++            "candidate_id": "C1",
++            "order_id": "O1",
++            "order_no": "PO-1",
++            "anomaly_type": "DELIVERY_RISK",
++            "severity": "HIGH",
++            "score": 80,
++            "evidence": ["交期临近"],
++            "missing_information": [],
++            "recommended_action": "确认生产进度",
++        },
++        {
++            "candidate_id": "C2",
++            "order_id": "O1",
++            "order_no": "PO-1",
++            "anomaly_type": "SUPPLIER_COMMITMENT_OVERDUE",
++            "severity": "HIGH",
++            "score": 70,
++            "evidence": ["工厂承诺已过期"],
++            "missing_information": [],
++            "recommended_action": "联系工厂",
++        },
++        {
++            "candidate_id": "C3",
++            "order_id": "O2",
++            "order_no": "PO-2",
++            "anomaly_type": "INFORMATION_GAP",
++            "severity": "LOW",
++            "score": 20,
++            "evidence": [],
++            "missing_information": ["当前进度"],
++            "recommended_action": "补充信息",
++        },
++    ]
++    result = agent_api.aggregate_order_candidates(items, top_n=7)
++    assert len(result["risk_items"]) == 1
++    assert result["risk_items"][0]["order_id"] == "O1"
++    assert result["risk_items"][0]["order_anomaly_count"] == 2
++    assert result["risk_items"][0]["secondary_anomaly_types"] == ["SUPPLIER_COMMITMENT_OVERDUE"]
++    assert result["information_gap_order_count"] == 1
++    assert result["information_gaps"][0]["order_id"] == "O2"
++
++
++def test_rule_inspection_is_explicitly_labeled_and_reports_separate_counts():
++    response = client.post(
++        "/api/agent/inspection/run",
++        json={
++            "current_user_id": "USER-1",
++            "current_role": "operator",
++            "due_within_days": 60,
++            "top_n": 7,
++            "trigger_type": "MANUAL_RULE",
++        },
++    )
++    assert response.status_code == 200, response.text
++    data = response.json()
++    assert data["execution_mode"] == "RULE_INSPECTION"
++    assert data["selection_strategy"]["not_padded"] is True
++    assert data["risk_order_count"] == len(data["top_items"])
++    assert "information_gap_order_count" in data
++    assert all(item.get("anomaly_type") != "INFORMATION_GAP" for item in data["top_items"])
++
++
++def test_status_exposes_backend_agent_and_rule_modes_separately():
++    response = client.get("/api/agent/status")
++    assert response.status_code == 200
++    data = response.json()
++    assert data["version"] == "6.1.3"
++    assert data["backend"]["online"] is True
++    assert data["rule_inspection"]["available"] is True
++    assert data["rule_inspection"]["silent_fallback"] is False
++    assert "coze_agent" in data
+diff --git a/v61_extensions.py b/v61_extensions.py
+index bd66a9c..b6aa622 100644
+--- a/v61_extensions.py
++++ b/v61_extensions.py
+@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
+ import agent_api
+ from analytics import build_analytics_summary, ensure_analytics_schema, track_event
+ 
+-VERSION = "6.1.2"
++VERSION = "6.1.3"
+ 
+ SAFE_ORDER_FIELDS = {
+     "current_progress",
+@@ -708,74 +708,26 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
+             persist=bool(payload.get("persist_candidates", True)),
+         )
+         all_candidates.extend(result["items"])
+-    # 先对全部异常候选排序，再按订单聚合，确保Top N表示Top N笔不同订单。
+-    ranked_candidates = agent_api.rank_candidates_logic(all_candidates, max(1, len(all_candidates)))
+-    grouped: dict[str, list[dict[str, Any]]] = {}
+-    order_sequence: list[str] = []
+-    for item in ranked_candidates:
+-        order_key = str(item.get("order_id") or item.get("order_no") or item.get("candidate_id") or "")
+-        if order_key not in grouped:
+-            grouped[order_key] = []
+-            order_sequence.append(order_key)
+-        grouped[order_key].append(item)
+-
+-    aggregated_orders: list[dict[str, Any]] = []
+-    for order_key in order_sequence:
+-        anomalies = grouped[order_key]
+-        primary = dict(anomalies[0])
+-        anomaly_types: list[str] = []
+-        combined_evidence: list[str] = []
+-        combined_missing: list[str] = []
+-        combined_actions: list[str] = []
+-        for anomaly in anomalies:
+-            anomaly_type = str(anomaly.get("anomaly_type") or "")
+-            if anomaly_type and anomaly_type not in anomaly_types:
+-                anomaly_types.append(anomaly_type)
+-            for evidence in anomaly.get("evidence") or []:
+-                text = str(evidence)
+-                if text and text not in combined_evidence:
+-                    combined_evidence.append(text)
+-            for missing in anomaly.get("missing_information") or []:
+-                text = str(missing)
+-                if text and text not in combined_missing:
+-                    combined_missing.append(text)
+-            action = str(anomaly.get("recommended_action") or "").strip()
+-            if action and action not in combined_actions:
+-                combined_actions.append(action)
+-
+-        multi_anomaly_bonus = min(10, max(0, len(anomalies) - 1) * 5)
+-        primary["priority_score"] = round(float(primary.get("priority_score") or 0) + multi_anomaly_bonus, 2)
+-        primary["order_anomaly_count"] = len(anomalies)
+-        primary["anomaly_types"] = anomaly_types
+-        primary["secondary_anomaly_types"] = anomaly_types[1:]
+-        primary["evidence"] = combined_evidence
+-        primary["missing_information"] = combined_missing
+-        primary["recommended_action"] = "；".join(combined_actions)
+-        primary["approval_required"] = any(bool(x.get("approval_required")) for x in anomalies)
+-        primary["priority_reasons"] = (
+-            combined_evidence[:3]
+-            + ([f"同一订单共识别{len(anomalies)}类异常"] if len(anomalies) > 1 else [])
+-        )
+-        aggregated_orders.append(primary)
+-
+-    aggregated_orders.sort(
+-        key=lambda x: (-float(x.get("priority_score") or 0), str(x.get("order_no") or ""))
+-    )
+-    ranked = aggregated_orders[:top_n]
+-    for index, item in enumerate(ranked, 1):
+-        item["rank"] = index
++    # V6.1.3: information gaps are reported separately and never pad the risk Top N.
++    aggregated = agent_api.aggregate_order_candidates(all_candidates, top_n)
++    ranked = aggregated["risk_items"]
++    information_gaps = aggregated["information_gaps"]
+ 
+     duration_ms = int((time.perf_counter() - started) * 1000)
+     result = {
+         "scope": screened["scope"],
+         "due_within_days": due_days,
+         "screened_order_count": screened["count"],
+-        "anomaly_candidate_count": len(all_candidates),
++        "anomaly_candidate_count": aggregated["risk_signal_count"],
++        "anomaly_signal_count": aggregated["risk_signal_count"],
++        "risk_order_count": len(ranked),
++        "information_gap_order_count": aggregated["information_gap_order_count"],
++        "information_gaps": information_gaps,
+         "count": len(ranked),
+         "items": ranked,
+         "selection_strategy": {
+             "candidate_pool": "当前用户有权限的活跃订单，满足未来时间窗口或承诺超时、高风险任务、客户确认阻塞、高风险消息、物流异常任一条件",
+-            "ranking": "先按异常基础分、严重程度和信息缺口计算候选分；再按订单聚合，多异常订单加分；同分按订单号稳定排序",
++            "ranking": "先过滤信息缺口，再按异常基础分与严重程度排序；同订单异常聚合，多异常订单加分；同分按订单号稳定排序",
+             "not_padded": True,
+             "max_items": 7,
+             "unit": "unique_order",
+@@ -793,7 +745,9 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
+         source=str(payload.get("source") or "agent_tool"),
+         properties={
+             "screened_order_count": screened["count"],
+-            "anomaly_candidate_count": len(all_candidates),
++            "anomaly_candidate_count": aggregated["risk_signal_count"],
++            "risk_order_count": len(ranked),
++            "information_gap_order_count": aggregated["information_gap_order_count"],
+             "top_count": len(ranked),
+             "duration_ms": duration_ms,
+         },
+@@ -873,6 +827,8 @@ def register_v61_extensions(app) -> None:
+                 response={
+                     "screened_order_count": result["screened_order_count"],
+                     "anomaly_candidate_count": result["anomaly_candidate_count"],
++                    "risk_order_count": result["risk_order_count"],
++                    "information_gap_order_count": result["information_gap_order_count"],
+                     "count": result["count"],
+                 },
+                 status="SUCCESS",

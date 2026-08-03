@@ -83,6 +83,26 @@ def parse_dt(value: Any) -> datetime | None:
     return parsed.astimezone(CN_TZ)
 
 
+def is_date_only_value(value: Any) -> bool:
+    """Return True when a business deadline contains a calendar date but no time."""
+    text = str(value or "").strip()
+    return bool(text and len(text) == 10 and text[4] == "-" and text[7] == "-")
+
+
+def deadline_is_overdue(value: Any, current: datetime) -> bool:
+    """Compare date-only commitments by calendar date and timestamps by exact time.
+
+    A supplier commitment such as ``2026-08-03`` remains valid for the whole day.
+    A promised reply such as ``2026-08-03T15:00:00+08:00`` becomes overdue after 15:00.
+    """
+    parsed = parse_dt(value)
+    if not parsed:
+        return False
+    if is_date_only_value(value):
+        return parsed.date() < current.date()
+    return parsed < current
+
+
 def normalize_owner(value: Any) -> str | None:
     text = str(value or "").strip()
     if not text or text in {"待分配", "未分配", "-", "—"}:
@@ -276,7 +296,7 @@ def list_candidate_orders_logic(conn: sqlite3.Connection, payload: dict[str, Any
         reasons: list[str] = []
         if in_window:
             reasons.append(f"客户交期在未来{due_days}天内")
-        if supplier_commitment and supplier_commitment < current and float(order.get("current_progress") or 0) < 1:
+        if deadline_is_overdue(order.get("latest_supplier_commitment"), current) and float(order.get("current_progress") or 0) < 1:
             reasons.append("供应商完工承诺已过期")
         if overdue_waiting:
             reasons.append(f"{overdue_waiting}项等待承诺已超时")
@@ -409,11 +429,12 @@ def build_anomaly_logic(conn: sqlite3.Connection, payload: dict[str, Any], persi
     # 1) Supplier commitment overdue.
     if "SUPPLIER_COMMITMENT_OVERDUE" in requested_types:
         commitment = parse_dt(order.get("latest_supplier_commitment"))
-        overdue_tasks = [t for t in ctx["open_tasks"] if parse_dt(t.get("promised_reply_at")) and parse_dt(t.get("promised_reply_at")) < current]
-        if (commitment and commitment < current and float(order.get("current_progress") or 0) < 1) or overdue_tasks:
+        commitment_overdue = deadline_is_overdue(order.get("latest_supplier_commitment"), current)
+        overdue_tasks = [t for t in ctx["open_tasks"] if deadline_is_overdue(t.get("promised_reply_at"), current)]
+        if (commitment_overdue and float(order.get("current_progress") or 0) < 1) or overdue_tasks:
             evidence = []
             score = 60.0
-            if commitment and commitment < current:
+            if commitment_overdue and commitment:
                 evidence.append(f"供应商完工承诺{order.get('latest_supplier_commitment')}已过期")
                 score += min(25, max(1, (current.date()-commitment.date()).days)*5)
             for task in overdue_tasks[:3]:
@@ -521,6 +542,77 @@ def rank_candidates_logic(items: list[dict[str, Any]], top_n: int = 7) -> list[d
     return ranked[:top_n]
 
 
+def aggregate_order_candidates(items: list[dict[str, Any]], top_n: int = 7) -> dict[str, Any]:
+    """Separate information gaps and aggregate real risk signals by unique order."""
+    top_n = max(1, min(int(top_n or 7), 7))
+    information_gap_items = [dict(x) for x in items if x.get("anomaly_type") == "INFORMATION_GAP"]
+    risk_items = [dict(x) for x in items if x.get("anomaly_type") != "INFORMATION_GAP"]
+    ranked_candidates = rank_candidates_logic(risk_items, max(1, len(risk_items))) if risk_items else []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order_sequence: list[str] = []
+    for item in ranked_candidates:
+        key = str(item.get("order_id") or item.get("order_no") or item.get("candidate_id") or "")
+        if key not in grouped:
+            grouped[key] = []
+            order_sequence.append(key)
+        grouped[key].append(item)
+
+    aggregated_orders: list[dict[str, Any]] = []
+    for key in order_sequence:
+        anomalies = grouped[key]
+        primary = dict(anomalies[0])
+        anomaly_types: list[str] = []
+        combined_evidence: list[str] = []
+        combined_missing: list[str] = []
+        combined_actions: list[str] = []
+        for anomaly in anomalies:
+            anomaly_type = str(anomaly.get("anomaly_type") or "")
+            if anomaly_type and anomaly_type not in anomaly_types:
+                anomaly_types.append(anomaly_type)
+            for evidence in anomaly.get("evidence") or []:
+                text = str(evidence).strip()
+                if text and text not in combined_evidence:
+                    combined_evidence.append(text)
+            for missing in anomaly.get("missing_information") or []:
+                text = str(missing).strip()
+                if text and text not in combined_missing:
+                    combined_missing.append(text)
+            action = str(anomaly.get("recommended_action") or "").strip()
+            if action and action not in combined_actions:
+                combined_actions.append(action)
+        bonus = min(10, max(0, len(anomalies) - 1) * 5)
+        primary["priority_score"] = round(float(primary.get("priority_score") or 0) + bonus, 2)
+        primary["primary_anomaly_type"] = primary.get("anomaly_type")
+        primary["order_anomaly_count"] = len(anomalies)
+        primary["anomaly_types"] = anomaly_types
+        primary["secondary_anomaly_types"] = anomaly_types[1:]
+        primary["evidence"] = combined_evidence
+        primary["missing_information"] = combined_missing
+        primary["recommended_action"] = "；".join(combined_actions)
+        primary["approval_required"] = any(bool(x.get("approval_required")) for x in anomalies)
+        primary["priority_reasons"] = combined_evidence[:3] + ([f"同一订单共识别{len(anomalies)}类异常"] if len(anomalies) > 1 else [])
+        aggregated_orders.append(primary)
+
+    aggregated_orders.sort(key=lambda x: (-float(x.get("priority_score") or 0), str(x.get("order_no") or "")))
+    selected = aggregated_orders[:top_n]
+    for index, item in enumerate(selected, 1):
+        item["rank"] = index
+
+    gap_by_order: dict[str, dict[str, Any]] = {}
+    for gap in information_gap_items:
+        key = str(gap.get("order_id") or gap.get("order_no") or gap.get("candidate_id") or "")
+        if key not in gap_by_order:
+            gap_by_order[key] = gap
+    return {
+        "risk_items": selected,
+        "risk_signal_count": len(risk_items),
+        "risk_order_count": len(aggregated_orders),
+        "information_gaps": list(gap_by_order.values()),
+        "information_gap_order_count": len(gap_by_order),
+    }
+
+
 def create_approval_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
     a = actor(payload)
     action_type = str(payload.get("action_type") or "").strip().upper()
@@ -604,59 +696,68 @@ def _commit_approved_action(conn: sqlite3.Connection, approval: dict[str, Any], 
 
 
 def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the deterministic fallback inspection without pretending it is Coze Agent."""
     a = actor(payload)
     run_id = str(payload.get("run_id") or new_id("AGR"))
-    trigger_type = str(payload.get("trigger_type") or "MANUAL").upper()
+    trigger_type = str(payload.get("trigger_type") or "MANUAL_RULE").upper()
     started = time.perf_counter()
     conn.execute(
         """INSERT OR IGNORE INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
            max_tool_calls,max_duration_seconds,started_at,created_at)
            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (run_id, a["organization_id"], a["current_user_id"], a["current_role"],
-         payload.get("goal") or "检查今天最需要处理的订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
+         payload.get("goal") or "规则巡检近期订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
     )
     screened = list_candidate_orders_logic(conn, {**payload, **a, "limit": 50})
     all_candidates: list[dict[str, Any]] = []
     for order in screened["items"]:
         result = build_anomaly_logic(conn, {**payload, **a, "run_id": run_id, "order_id": order["order_id"]}, persist=True)
         all_candidates.extend(result["items"])
-    ranked = rank_candidates_logic(all_candidates, max(1, min(int(payload.get("top_n") or 7), 20)))
+    aggregated = aggregate_order_candidates(all_candidates, int(payload.get("top_n") or 7))
+    ranked = aggregated["risk_items"]
+    information_gaps = aggregated["information_gaps"]
     report_id = new_id("RPT")
     report = {
         "report_id": report_id, "run_id": run_id, "generated_at": iso(), "scope": screened["scope"],
-        "screened_order_count": screened["count"], "anomaly_candidate_count": len(all_candidates),
-        "top_items": ranked, "summary": {
+        "execution_mode": "RULE_INSPECTION",
+        "screened_order_count": screened["count"],
+        "anomaly_candidate_count": aggregated["risk_signal_count"],
+        "anomaly_signal_count": aggregated["risk_signal_count"],
+        "risk_order_count": len(ranked),
+        "information_gap_order_count": aggregated["information_gap_order_count"],
+        "top_items": ranked, "information_gaps": information_gaps,
+        "summary": {
             "critical": sum(1 for x in ranked if x.get("severity") == "CRITICAL"),
             "high": sum(1 for x in ranked if x.get("severity") == "HIGH"),
-            "needs_information": sum(1 for x in ranked if x.get("anomaly_type") == "INFORMATION_GAP"),
+            "needs_information": aggregated["information_gap_order_count"],
         },
         "human_confirmation_required": True,
+        "selection_strategy": {"not_padded": True, "unit": "unique_order", "max_items": 7},
     }
     duration_ms = int((time.perf_counter() - started) * 1000)
     conn.execute(
         """INSERT INTO daily_inspection_reports(report_id,run_id,organization_id,current_user_id,inspection_date,timezone,
-           scope_json,report_json,status,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+           scope_json,report_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (report_id, run_id, a["organization_id"], a["current_user_id"], now_cn().date().isoformat(), "Asia/Shanghai",
          json.dumps(screened["scope"], ensure_ascii=False), json.dumps(report, ensure_ascii=False), "COMPLETED", iso()),
     )
     conn.execute(
-        "UPDATE agent_runs SET status='COMPLETED',result_json=?,stop_reason='DIAGNOSIS_COMPLETED',duration_ms=?,completed_at=? WHERE run_id=?",
+        "UPDATE agent_runs SET status='COMPLETED',result_json=?,stop_reason='RULE_DIAGNOSIS_COMPLETED',duration_ms=?,completed_at=? WHERE run_id=?",
         (json.dumps(report, ensure_ascii=False), duration_ms, iso(), run_id),
     )
-    audit_event(conn, "agent_run", run_id, "AGENT_INSPECTION_COMPLETED", report, a["current_user_id"])
-    track_event(
-        conn, "priority_diagnosis_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
-        user_role=a["current_role"], run_id=run_id, source="website_inspection",
-        properties={"screened_order_count": screened["count"], "anomaly_candidate_count": len(all_candidates),
-                    "top_count": len(ranked), "duration_ms": duration_ms},
-    )
-    track_event(
-        conn, "agent_run_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
-        user_role=a["current_role"], run_id=run_id, source="website_inspection",
-        properties={"status": "COMPLETED", "stop_reason": "DIAGNOSIS_COMPLETED", "duration_ms": duration_ms,
-                    "final_response_generated": True},
-    )
+    log_tool_call(conn, run_id=run_id, tool_name="deterministic_rule_inspection",
+                  request={"due_within_days": payload.get("due_within_days", 14), "top_n": payload.get("top_n", 7)},
+                  response={"screened_order_count": screened["count"], "risk_order_count": len(ranked),
+                            "anomaly_signal_count": aggregated["risk_signal_count"],
+                            "information_gap_order_count": aggregated["information_gap_order_count"]},
+                  status="SUCCESS", duration_ms=duration_ms)
+    audit_event(conn, "agent_run", run_id, "RULE_INSPECTION_COMPLETED", report, a["current_user_id"])
+    track_event(conn, "priority_diagnosis_completed", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                user_role=a["current_role"], run_id=run_id, source="website_rule_inspection",
+                properties={"screened_order_count": screened["count"], "risk_order_count": len(ranked),
+                            "anomaly_signal_count": aggregated["risk_signal_count"],
+                            "information_gap_order_count": aggregated["information_gap_order_count"],
+                            "duration_ms": duration_ms})
     return report
 
 
@@ -665,13 +766,26 @@ def register_agent_api(app) -> None:
 
     @router.get("/api/agent/status")
     def agent_status() -> dict[str, Any]:
+        coze = coze_agent_status()
+        with db() as conn:
+            last_agent_run = conn.execute(
+                """SELECT run_id,status,trigger_type,created_at,completed_at FROM agent_runs
+                   WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
         return {
-            "version": "6.1.2",
+            "version": "6.1.3",
             "agent_name": "FlowOrder订单异常诊断Agent",
+            "backend": {"online": True, "version": "6.1.3"},
+            "coze_agent": {
+                "configured": coze["configured"],
+                "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
+                "last_verified_run": dict(last_agent_run) if last_agent_run else None,
+            },
+            "rule_inspection": {"available": True, "silent_fallback": False},
             "tool_auth_configured": bool(AGENT_API_KEY),
             "cron_auth_configured": bool(CRON_API_KEY or AGENT_API_KEY),
-            "coze_agent_configured": coze_agent_status()["configured"],
-            "daily_schedule": {"timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
+            "coze_agent_configured": coze["configured"],
+            "daily_schedule": {"configured": bool(CRON_API_KEY or AGENT_API_KEY), "scheduler_verified": False, "timezone": "Asia/Shanghai", "time": "08:30", "days": "DAILY"},
             "limits": {"max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS, "top_n": 7},
             "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
             "analytics_enabled": True,
@@ -765,6 +879,9 @@ def register_agent_api(app) -> None:
                 "evidence": body.get("evidence") or [], "status": "DRAFT", "requires_approval": True,
             }
             audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
+            log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_task_draft",
+                          request={"order_id": order["order_id"], "title": task["title"]},
+                          response={"task_draft_id": draft_id, "status": "DRAFT"}, status="SUCCESS", duration_ms=0)
             track_event(
                 conn, "task_draft_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
                 user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool",
@@ -812,6 +929,11 @@ def register_agent_api(app) -> None:
             enforce_run_budget(conn, body.get("run_id"))
             result = create_approval_logic(conn, body)
             a = actor(body)
+            log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_approval_request",
+                          request={"order_id": body.get("order_id"), "action_type": body.get("action_type")},
+                          response={"approval_id": result.get("approval_id"), "status": result.get("status"),
+                                    "duplicate_skipped": bool(result.get("duplicate_skipped"))},
+                          status="SUCCESS", duration_ms=0)
             track_event(
                 conn, "approval_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
                 user_role=a["current_role"], order_id=body.get("order_id"), run_id=body.get("run_id"), source="agent_tool",
@@ -863,12 +985,18 @@ def register_agent_api(app) -> None:
             scope_sql, params = _order_scope_sql(a)
             cands = [dict(r) for r in conn.execute(
                 f"""SELECT a.*,o.order_no,o.customer_name,o.owner FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id
-                    WHERE {scope_sql.replace('owner','o.owner')} ORDER BY a.created_at DESC LIMIT 100""", params)]
+                    WHERE {scope_sql.replace('owner','o.owner')} ORDER BY a.created_at DESC LIMIT 150""", params)]
             approvals = [dict(r) for r in conn.execute(
                 f"""SELECT p.*,o.order_no,o.customer_name FROM approval_requests p LEFT JOIN orders o ON o.order_id=p.order_id
                     WHERE ({scope_sql.replace('owner','o.owner')}) OR p.requested_by=? ORDER BY p.created_at DESC LIMIT 50""", [*params, current_user_id])]
             reports = [dict(r) for r in conn.execute(
                 "SELECT * FROM daily_inspection_reports WHERE current_user_id=? ORDER BY created_at DESC LIMIT 10", (current_user_id,))]
+            latest_run_row = conn.execute(
+                "SELECT * FROM agent_runs WHERE current_user_id=? ORDER BY created_at DESC LIMIT 1", (current_user_id,)
+            ).fetchone()
+            calls = [dict(r) for r in conn.execute(
+                "SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (latest_run_row["run_id"],)
+            )] if latest_run_row else []
         for item in cands:
             item["evidence"] = safe_json(item.pop("evidence_json"), [])
             item["missing_information"] = safe_json(item.pop("missing_information_json"), [])
@@ -877,13 +1005,26 @@ def register_agent_api(app) -> None:
         for item in reports:
             item["report"] = safe_json(item.pop("report_json"), {})
             item["scope"] = safe_json(item.pop("scope_json"), {})
+        latest_run = dict(latest_run_row) if latest_run_row else None
+        if latest_run:
+            latest_run["result"] = safe_json(latest_run.pop("result_json"), {})
+        for call in calls:
+            call["request"] = safe_json(call.pop("request_json"), {})
+            call["response"] = safe_json(call.pop("response_json"), {})
+        risk_candidates = [x for x in cands if x.get("anomaly_type") != "INFORMATION_GAP"]
+        information_gaps = [x for x in cands if x.get("anomaly_type") == "INFORMATION_GAP"]
+        active_statuses = {"ANOMALY_CANDIDATE", "PENDING_CONFIRMATION"}
         return {
             "summary": {
-                "candidate_count": sum(1 for x in cands if x["status"] in {"ANOMALY_CANDIDATE", "PENDING_CONFIRMATION"}),
-                "critical_count": sum(1 for x in cands if x["severity"] == "CRITICAL" and x["status"] != "RESOLVED"),
+                "candidate_count": sum(1 for x in risk_candidates if x["status"] in active_statuses),
+                "information_gap_count": sum(1 for x in information_gaps if x["status"] in active_statuses),
+                "critical_count": sum(1 for x in risk_candidates if x["severity"] == "CRITICAL" and x["status"] != "RESOLVED"),
                 "pending_approval_count": sum(1 for x in approvals if x["status"] == "PENDING"),
                 "report_count": len(reports),
-            }, "candidates": cands, "approvals": approvals, "reports": reports,
+            },
+            "candidates": risk_candidates, "information_gaps": information_gaps,
+            "approvals": approvals, "reports": reports,
+            "latest_run": latest_run, "latest_tool_calls": calls,
         }
 
     @router.post("/api/agent/chat")
@@ -899,15 +1040,23 @@ def register_agent_api(app) -> None:
             "current_user_id": user_id,
             "current_role": role,
             "allowed_owner_ids": body.get("allowed_owner_ids") or [user_id],
-            "default_due_within_days": 14,
-            "default_top_n": 7,
+            "default_due_within_days": max(1, min(int(body.get("due_within_days") or 14), 90)),
+            "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
+            "create_task_draft": bool(body.get("create_task_draft", True)),
+            "create_approval_request": bool(body.get("create_approval_request", True)),
         }
+        started_at = iso()
         try:
             result = run_agent_chat(user_id=user_id, question=question, parameters=parameters,
                                     conversation_id=body.get("conversation_id"), timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS)
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
-        return result
+        with db() as conn:
+            latest = conn.execute(
+                "SELECT run_id,status,stop_reason,created_at,completed_at FROM agent_runs WHERE current_user_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 1",
+                (user_id, started_at),
+            ).fetchone()
+        return {**result, "execution_mode": "COZE_AGENT", "run": dict(latest) if latest else None}
 
     @router.post("/api/agent/inspection/run")
     def run_inspection(payload: AnyPayload) -> dict[str, Any]:
@@ -983,9 +1132,16 @@ def register_agent_api(app) -> None:
                 raise HTTPException(403, "无权查看该运行轨迹")
             calls = [dict(r) for r in conn.execute("SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (run_id,))]
         result = dict(run); result["result"] = safe_json(result.pop("result_json"), {})
+        task_draft_ids: list[str] = []
+        approval_ids: list[str] = []
         for call in calls:
             call["request"] = safe_json(call.pop("request_json"), {})
             call["response"] = safe_json(call.pop("response_json"), {})
-        return {"run": result, "tool_calls": calls}
+            if call.get("response", {}).get("task_draft_id"):
+                task_draft_ids.append(call["response"]["task_draft_id"])
+            if call.get("response", {}).get("approval_id"):
+                approval_ids.append(call["response"]["approval_id"])
+        return {"run": result, "tool_calls": calls, "task_draft_ids": task_draft_ids,
+                "approval_ids": approval_ids, "stop_reason": result.get("stop_reason")}
 
     app.include_router(router)

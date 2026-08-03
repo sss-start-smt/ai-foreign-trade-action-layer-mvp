@@ -2,8 +2,8 @@
   "openapi": "3.0.0",
   "info": {
     "title": "FlowOrder Agent Tools V6.1",
-    "version": "1.1.0",
-    "description": "FlowOrder订单异常诊断Agent的12个工具。新增批量自然语言更新解析和Top7组合诊断。插件固定Header配置X-FlowOrder-Agent-Key。"
+    "version": "6.1.3",
+    "description": "FlowOrder订单异常诊断Agent的12个工具。新增批量自然语言更新解析和Top 7笔不同风险订单组合诊断。插件固定Header配置X-FlowOrder-Agent-Key。 V6.1.3将信息缺口单独返回，并按订单聚合多异常。"
   },
   "servers": [
     {
@@ -1099,8 +1099,8 @@
     "/api/agent/tools/priority-orders/diagnose": {
       "post": {
         "operationId": "diagnose_priority_orders",
-        "summary": "一次完成Top7订单异常诊断",
-        "description": "组合工具：在一次调用内完成候选池筛选、证据读取、异常生成和Top7排序，不为凑数制造异常。",
+        "summary": "一次完成Top 7笔不同风险订单诊断",
+        "description": "组合工具：一次完成候选筛选、证据读取、异常生成、同订单聚合和Top N排序；信息缺口单独返回，不用于凑数。",
         "requestBody": {
           "required": true,
           "content": {
@@ -1150,7 +1150,7 @@
                     "minimum": 1,
                     "maximum": 7,
                     "default": 7,
-                    "description": "最多返回7个异常候选"
+                    "description": "最多返回7笔不同的真实风险订单；不足不补齐"
                   },
                   "scan_limit": {
                     "type": "integer",
