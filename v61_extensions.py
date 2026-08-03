@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 import agent_api
 from analytics import build_analytics_summary, ensure_analytics_schema, track_event
 
-VERSION = "6.1.0"
+VERSION = "6.1.1"
 
 SAFE_ORDER_FIELDS = {
     "current_progress",
@@ -69,6 +69,20 @@ def _safe_json(value: Any, fallback: Any) -> Any:
         return json.loads(str(value or ""))
     except (TypeError, ValueError, json.JSONDecodeError):
         return fallback
+
+
+def _value_text(field_name: str, value: Any) -> str:
+    """Return a Coze-safe string without changing the typed value used for writeback."""
+    if value is None:
+        return ""
+    if field_name == "current_progress" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        percent = float(value) * 100
+        return f"{percent:g}%"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
 
 
 def ensure_v61_schema(conn) -> None:
@@ -428,6 +442,7 @@ def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bo
                 "field_label": FIELD_LABELS.get(field_name, field_name),
                 "old_value": old_value,
                 "new_value": update["new_value"],
+                "new_value_text": _value_text(field_name, update["new_value"]),
                 "confidence": update["confidence"],
                 "risk_level": update["risk_level"],
                 "requires_approval": bool(update["requires_approval"]),
@@ -838,6 +853,7 @@ def register_v61_extensions(app) -> None:
         for item in items:
             item["old_value"] = _safe_json(item.pop("old_value_json"), None)
             item["new_value"] = _safe_json(item.pop("new_value_json"), None)
+            item["new_value_text"] = _value_text(item.get("field_name") or "", item["new_value"])
             item["edited_value"] = _safe_json(item.pop("edited_value_json"), None)
         result = dict(batch)
         result["summary"] = _safe_json(result.pop("summary_json"), {})

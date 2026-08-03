@@ -663,7 +663,7 @@ def register_agent_api(app) -> None:
     @router.get("/api/agent/status")
     def agent_status() -> dict[str, Any]:
         return {
-            "version": "6.1.0",
+            "version": "6.1.1",
             "agent_name": "FlowOrder订单异常诊断Agent",
             "tool_auth_configured": bool(AGENT_API_KEY),
             "cron_auth_configured": bool(CRON_API_KEY or AGENT_API_KEY),
