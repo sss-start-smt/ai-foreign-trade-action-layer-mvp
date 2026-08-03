@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 import agent_api
 from analytics import build_analytics_summary, ensure_analytics_schema, track_event
 
-VERSION = "6.1.3.1"
+VERSION = "6.1.3.2"
 
 SAFE_ORDER_FIELDS = {
     "current_progress",

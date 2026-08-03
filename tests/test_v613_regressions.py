@@ -135,7 +135,7 @@ def test_status_exposes_backend_agent_and_rule_modes_separately():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.1"
+    assert data["version"] == "6.1.3.2"
     assert data["backend"]["online"] is True
     assert data["rule_inspection"]["available"] is True
     assert data["rule_inspection"]["silent_fallback"] is False
