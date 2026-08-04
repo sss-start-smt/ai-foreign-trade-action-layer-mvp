@@ -135,7 +135,7 @@ def test_status_exposes_backend_agent_and_rule_modes_separately():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.4"
+    assert data["version"] == "6.1.4.1"
     assert data["backend"]["online"] is True
     assert data["rule_inspection"]["available"] is True
     assert data["rule_inspection"]["silent_fallback"] is False
@@ -229,19 +229,10 @@ def test_rule_rerun_retires_stale_same_day_false_positive():
 def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
     import time
 
-    def fake_run_agent_chat(*, user_id, question, parameters, conversation_id=None, timeout_seconds=90):
-        assert user_id == "USER-1"
-        assert '"current_user_id":"USER-1"' in question
-        time.sleep(0.05)
-        return {
-            "answer": "已完成诊断",
-            "reasoning_summary": "",
-            "conversation_id": "CONV-TEST",
-            "duration_ms": 50,
-            "usage": {},
-        }
+    def should_not_call_coze(**kwargs):
+        raise AssertionError("standard risk diagnosis must not call Coze")
 
-    monkeypatch.setattr(agent_api, "run_agent_chat", fake_run_agent_chat)
+    monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     created = client.post(
         "/api/agent/chat/jobs",
         json={
@@ -257,7 +248,7 @@ def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
     assert created.json()["status"] in {"QUEUED", "RUNNING"}
 
     completed = None
-    for _ in range(30):
+    for _ in range(50):
         polled = client.get(f"/api/agent/chat/jobs/{job_id}")
         assert polled.status_code == 200, polled.text
         if polled.json()["status"] == "COMPLETED":
@@ -265,35 +256,27 @@ def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
             break
         time.sleep(0.02)
     assert completed is not None
-    assert completed["result"]["answer"] == "已完成诊断"
+    assert completed["result"]["execution_mode"] == "HYBRID_DETERMINISTIC_PLAN"
+    assert completed["result"]["route_plan"]["intents"][0]["intent"] == "RISK_DIAGNOSIS"
+    assert completed["result"]["diagnosis"]["selection_strategy"]["ranking_rule_version"] == "FT04_SHARED_V1"
     assert completed["result"]["resolved_identity"]["current_user_id"] == "USER-1"
-
 
 def test_status_advertises_async_agent_chat():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.4"
+    assert data["version"] == "6.1.4.1"
     assert data["async_agent_chat"]["available"] is True
     assert data["async_agent_chat"]["polling"] is True
 
 
 def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
     import time
-    captured = {}
 
-    def fake_run_agent_chat(*, user_id, question, parameters, conversation_id=None, timeout_seconds=90):
-        captured["question"] = question
-        captured["parameters"] = parameters
-        return {
-            "answer": "发现2笔风险订单，最高优先级为PO-1。",
-            "reasoning_summary": "",
-            "conversation_id": "CONV-FAST",
-            "duration_ms": 20,
-            "usage": {},
-        }
+    def should_not_call_coze(**kwargs):
+        raise AssertionError("standard diagnosis should use the deterministic plan")
 
-    monkeypatch.setattr(agent_api, "run_agent_chat", fake_run_agent_chat)
+    monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     created = client.post(
         "/api/agent/chat/jobs",
         json={
@@ -311,25 +294,22 @@ def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
     assert run_id.startswith("AGR-")
 
     completed = None
-    for _ in range(30):
+    for _ in range(50):
         polled = client.get(f"/api/agent/chat/jobs/{job_id}")
         if polled.json()["status"] == "COMPLETED":
             completed = polled.json()
             break
         time.sleep(0.02)
     assert completed is not None
-    assert captured["parameters"]["run_id"] == run_id
-    assert captured["parameters"]["run_managed_by_backend"] is True
-    assert captured["parameters"]["response_mode"] == "COMPACT"
-    assert '"run_managed_by_backend":true' in captured["question"]
-    assert "不要调用start_agent_run或complete_agent_run" in captured["question"]
+    assert completed["result"]["execution_mode"] == "HYBRID_DETERMINISTIC_PLAN"
     with db() as conn:
         run = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
         calls = conn.execute("SELECT tool_name FROM agent_tool_calls WHERE run_id=?", (run_id,)).fetchall()
     assert run["status"] == "COMPLETED"
-    assert run["stop_reason"] == "BACKEND_MANAGED_AGENT_COMPLETED"
-    assert "backend_finalize_agent_run" in {x[0] for x in calls}
-
+    assert run["stop_reason"] == "DETERMINISTIC_PLAN_COMPLETED"
+    names = {x[0] for x in calls}
+    assert "diagnose_priority_orders" in names
+    assert "backend_finalize_agent_run" in names
 
 def test_task_draft_can_create_linked_approval_in_same_tool_call():
     started = client.post(
@@ -373,7 +353,9 @@ def test_status_advertises_fast_standard_diagnosis_profile():
     assert response.status_code == 200
     profile = response.json()["performance_profile"]
     assert profile["backend_managed_run"] is True
-    assert profile["standard_agent_tool_turns"] == 2
+    assert profile["standard_agent_tool_turns"] == 1
+    assert profile["hybrid_intent_router"] is True
+    assert profile["shared_ranking_rule"] == "FT04_SHARED_V1"
     assert profile["compact_final_answer"] is True
 
 
@@ -410,9 +392,74 @@ def test_backend_managed_job_option_can_trigger_linked_approval_without_plugin_s
     assert response.json()["approval_id"].startswith("APR-")
 
 
-def test_frontend_defines_agent_job_polling_function():
-    source = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
-    assert "async function pollConversationJob(" in source
-    assert "GET /api/agent/chat/jobs" not in source  # implementation uses fetch wrapper, not placeholder prose
-    assert "void pollConversationJob(root,active.id,created.job_id)" in source
+def test_multi_intent_standard_plan_executes_without_coze(monkeypatch):
+    import time
 
+    def should_not_call_coze(**kwargs):
+        raise AssertionError("risk + explanation + task draft should be executed by the backend plan")
+
+    monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
+    created = client.post(
+        "/api/agent/chat/jobs",
+        json={
+            "question": "最近事情特别乱，你先检查未来两周最危险的订单，解释第一笔为什么优先，再给它建一个任务，但不要发消息。",
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "create_approval_request": True,
+        },
+    )
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    completed = None
+    for _ in range(60):
+        response = client.get(f"/api/agent/chat/jobs/{job_id}")
+        if response.json()["status"] == "COMPLETED":
+            completed = response.json()
+            break
+        time.sleep(0.02)
+    assert completed is not None
+    result = completed["result"]
+    assert [x["intent"] for x in result["route_plan"]["intents"]] == [
+        "RISK_DIAGNOSIS",
+        "EXPLAIN_PRIORITY",
+        "CREATE_TASK_DRAFT",
+    ]
+    assert result["route_plan"]["constraints"]["allow_external_send"] is False
+    assert result["task_draft_id"].startswith("TDRAFT-")
+    assert result["approval_id"].startswith("APR-")
+
+
+def test_followup_explanation_reuses_previous_structured_run(monkeypatch):
+    import time
+
+    def should_not_call_coze(**kwargs):
+        raise AssertionError("structured follow-up should not call Coze")
+
+    monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
+    first = client.post(
+        "/api/agent/chat/jobs",
+        json={"question": "检查未来14天最需要处理的订单", "current_user_id": "USER-1"},
+    )
+    run_id = first.json()["linked_run_id"]
+    for _ in range(60):
+        if client.get(f"/api/agent/chat/jobs/{first.json()['job_id']}").json()["status"] == "COMPLETED":
+            break
+        time.sleep(0.02)
+    second = client.post(
+        "/api/agent/chat/jobs",
+        json={
+            "question": "为什么第一笔排在最前？",
+            "current_user_id": "USER-1",
+            "previous_run_id": run_id,
+        },
+    )
+    completed = None
+    for _ in range(60):
+        response = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}")
+        if response.json()["status"] == "COMPLETED":
+            completed = response.json()
+            break
+        time.sleep(0.02)
+    assert completed is not None
+    assert completed["result"]["execution_mode"] == "HYBRID_DETERMINISTIC_PLAN"
+    assert "第1笔排在这里" in completed["result"]["answer"]

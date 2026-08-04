@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 
 from coze_agent_client import agent_status as coze_agent_status, run_agent_chat
 from analytics import ensure_analytics_schema, track_event
+from agent_router import route_agent_request
 
 CN_TZ = timezone(timedelta(hours=8))
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,7 +27,7 @@ CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
 AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
 AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
-COZE_AGENT_TIMEOUT_SECONDS = max(AGENT_MAX_DURATION_SECONDS + 90, int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "240")))
+COZE_AGENT_TIMEOUT_SECONDS = max(15, min(int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "60")), 60))
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 OWNER_ID_TO_NAME = {value: key for key, value in OWNER_NAME_TO_ID.items()}
@@ -907,6 +908,307 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
 
 
 
+
+def create_task_draft_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    """Create a bounded task draft and optional approval using one shared implementation."""
+    body = dict(payload)
+    a = actor(body)
+    enforce_run_budget(conn, body.get("run_id"))
+    order = _assert_order_access(conn, str(body.get("order_id") or ""), a)
+    draft_id = new_id("TDRAFT")
+    task = {
+        "task_draft_id": draft_id,
+        "order_id": order["order_id"],
+        "title": body.get("title") or "处理订单异常",
+        "recommended_action": body.get("recommended_action") or body.get("title") or "处理订单异常",
+        "target": body.get("target") or "internal",
+        "owner_user_id": body.get("owner_user_id") or order.get("owner") or a["current_user_id"],
+        "risk_level": body.get("risk_level") or "medium",
+        "business_deadline": body.get("business_deadline"),
+        "evidence": body.get("evidence") or [],
+        "status": "DRAFT",
+        "requires_approval": True,
+    }
+    audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
+    create_linked_approval = bool(body.get("create_approval_request"))
+    if not create_linked_approval and body.get("run_id"):
+        linked_job = conn.execute(
+            """SELECT request_json FROM agent_chat_jobs WHERE linked_run_id=?
+               ORDER BY created_at DESC LIMIT 1""",
+            (body.get("run_id"),),
+        ).fetchone()
+        if linked_job:
+            linked_request = safe_json(linked_job["request_json"], {})
+            create_linked_approval = bool(linked_request.get("create_approval_request"))
+    if create_linked_approval:
+        approval_payload = {
+            **body,
+            **a,
+            "task_draft_id": draft_id,
+            "order_id": order["order_id"],
+            "action_type": "CREATE_TASK",
+            "action_payload": {
+                "task_draft_id": draft_id,
+                "order_id": order["order_id"],
+                "title": task["title"],
+                "recommended_action": task["recommended_action"],
+                "target": task["target"],
+                "owner_user_id": task["owner_user_id"],
+                "risk_level": task["risk_level"],
+                "business_deadline": task["business_deadline"],
+                "evidence": task["evidence"],
+            },
+            "idempotency_key": body.get("approval_idempotency_key") or f"CREATE_TASK:{body.get('run_id')}:{order['order_id']}",
+            "high_risk": str(task["risk_level"]).lower() in {"high", "critical"},
+        }
+        approval = create_approval_logic(conn, approval_payload)
+        task.update(
+            {
+                "approval_id": approval.get("approval_id"),
+                "approval_status": approval.get("status"),
+                "approval_required_role": approval.get("required_role"),
+                "approval_duplicate_skipped": bool(approval.get("duplicate_skipped")),
+            }
+        )
+        track_event(
+            conn,
+            "approval_created",
+            organization_id=a["organization_id"],
+            user_id=a["current_user_id"],
+            user_role=a["current_role"],
+            order_id=order["order_id"],
+            run_id=body.get("run_id"),
+            source="agent_tool_fast_path",
+            properties={
+                "approval_id": approval.get("approval_id"),
+                "action_type": "CREATE_TASK",
+                "required_role": approval.get("required_role"),
+                "duplicate_skipped": bool(approval.get("duplicate_skipped")),
+            },
+        )
+    log_tool_call(
+        conn,
+        run_id=body.get("run_id"),
+        tool_name="create_task_draft",
+        request={
+            "order_id": order["order_id"],
+            "title": task["title"],
+            "create_approval_request": create_linked_approval,
+        },
+        response={
+            "task_draft_id": draft_id,
+            "status": "DRAFT",
+            "approval_id": task.get("approval_id"),
+            "approval_status": task.get("approval_status"),
+        },
+        status="SUCCESS",
+        duration_ms=0,
+    )
+    track_event(
+        conn,
+        "task_draft_created",
+        organization_id=a["organization_id"],
+        user_id=a["current_user_id"],
+        user_role=a["current_role"],
+        order_id=order["order_id"],
+        run_id=body.get("run_id"),
+        source="agent_tool",
+        properties={
+            "task_draft_id": draft_id,
+            "risk_level": task["risk_level"],
+            "requires_approval": True,
+            "approval_id": task.get("approval_id"),
+        },
+    )
+    return task
+
+
+def _load_previous_diagnosis(conn: sqlite3.Connection, previous_run_id: str | None, identity: dict[str, Any]) -> dict[str, Any] | None:
+    if not previous_run_id:
+        return None
+    row = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (previous_run_id,)).fetchone()
+    if not row:
+        return None
+    if row["current_user_id"] != identity["current_user_id"] and not is_manager(identity["current_user_id"], identity["current_role"]):
+        return None
+    result = safe_json(row["result_json"], {})
+    diagnosis = result.get("diagnosis") if isinstance(result, dict) else None
+    return diagnosis if isinstance(diagnosis, dict) else None
+
+
+def _priority_item_by_rank(diagnosis: dict[str, Any] | None, rank: int) -> dict[str, Any] | None:
+    items = list((diagnosis or {}).get("items") or [])
+    for item in items:
+        if int(item.get("rank") or 0) == rank:
+            return item
+    index = rank - 1
+    return items[index] if 0 <= index < len(items) else None
+
+
+def _format_diagnosis_answer(diagnosis: dict[str, Any], *, explain_rank: int | None = None, task: dict[str, Any] | None = None) -> str:
+    items = list(diagnosis.get("items") or [])
+    lines = [
+        f"已检查{int(diagnosis.get('screened_order_count') or 0)}笔订单，发现{int(diagnosis.get('risk_order_count') or len(items))}笔需要关注的风险订单。",
+    ]
+    if not items:
+        lines.append("当前没有符合规则的真实风险订单；信息不足的订单已单独列为信息缺口，不会被用来凑数。")
+    else:
+        for item in items[: min(5, len(items))]:
+            reasons = list(item.get("priority_reasons") or item.get("evidence") or [])[:2]
+            reason_text = "；".join(str(x) for x in reasons if str(x).strip()) or "基于确定性规则排序"
+            lines.append(f"{item.get('rank')}. {item.get('order_no') or item.get('order_id')}：{reason_text}")
+    if explain_rank:
+        target = _priority_item_by_rank(diagnosis, explain_rank)
+        if target:
+            reasons = list(target.get("priority_reasons") or target.get("evidence") or [])
+            lines.append(f"第{explain_rank}笔排在这里，主要因为：" + "；".join(str(x) for x in reasons[:5]))
+    if task:
+        text = f"已为{task.get('order_id')}生成任务草稿{task.get('task_draft_id')}，尚未成为正式任务。"
+        if task.get("approval_id"):
+            text += f"审批请求为{task.get('approval_id')}。"
+        lines.append(text)
+    return "\n".join(lines)
+
+
+def _execute_deterministic_plan(
+    conn: sqlite3.Connection,
+    *,
+    plan: dict[str, Any],
+    body: dict[str, Any],
+    identity: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    from v61_extensions import diagnose_priority_orders_logic, parse_bulk_order_updates_logic
+
+    intent_names = [step.get("intent") for step in plan.get("intents") or []]
+    extracted = plan.get("extracted") or {}
+    diagnosis: dict[str, Any] | None = None
+    bulk_update: dict[str, Any] | None = None
+    task: dict[str, Any] | None = None
+    explanation_rank: int | None = None
+
+    if "RISK_DIAGNOSIS" in intent_names and "BATCH_UPDATE_PARSE" not in intent_names:
+        started = time.perf_counter()
+        diagnosis = diagnose_priority_orders_logic(
+            conn,
+            {
+                **body,
+                **actor(identity),
+                "run_id": run_id,
+                "due_within_days": extracted.get("due_within_days") or body.get("due_within_days") or 14,
+                "top_n": extracted.get("top_n") or body.get("top_n") or 7,
+                "source": "backend_agent_router",
+            },
+        )
+        log_tool_call(
+            conn,
+            run_id=run_id,
+            tool_name="diagnose_priority_orders",
+            request={
+                "due_within_days": diagnosis.get("due_within_days"),
+                "top_n": extracted.get("top_n") or body.get("top_n") or 7,
+                "router": "HYBRID_INTENT_ROUTER_V1",
+            },
+            response={
+                "screened_order_count": diagnosis.get("screened_order_count"),
+                "risk_order_count": diagnosis.get("risk_order_count"),
+                "information_gap_order_count": diagnosis.get("information_gap_order_count"),
+                "ranking_rule_version": diagnosis.get("selection_strategy", {}).get("ranking_rule_version"),
+            },
+            status="SUCCESS",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+    elif any(name in intent_names for name in ("EXPLAIN_PRIORITY", "CREATE_TASK_DRAFT")):
+        diagnosis = _load_previous_diagnosis(conn, body.get("previous_run_id"), identity)
+
+    if "BATCH_UPDATE_PARSE" in intent_names:
+        started = time.perf_counter()
+        bulk_update = parse_bulk_order_updates_logic(
+            conn,
+            {
+                **body,
+                **actor(identity),
+                "run_id": run_id,
+                "text": body.get("question"),
+                "source": "backend_agent_router",
+            },
+            persist=True,
+        )
+        log_tool_call(
+            conn,
+            run_id=run_id,
+            tool_name="parse_bulk_order_updates",
+            request={"text_length": len(str(body.get("question") or "")), "router": "HYBRID_INTENT_ROUTER_V1"},
+            response={"batch_id": bulk_update.get("batch_id"), **(bulk_update.get("summary") or {})},
+            status="SUCCESS",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    if "EXPLAIN_PRIORITY" in intent_names:
+        explanation_rank = int(extracted.get("target_rank") or 1)
+
+    if "CREATE_TASK_DRAFT" in intent_names and plan.get("constraints", {}).get("allow_task_draft", True):
+        target_rank = int(extracted.get("target_rank") or 1)
+        target = _priority_item_by_rank(diagnosis, target_rank)
+        if not target and extracted.get("order_refs"):
+            ref = str(extracted.get("order_refs")[0]).upper()
+            row = conn.execute("SELECT * FROM orders WHERE UPPER(order_no)=? OR UPPER(order_id)=? LIMIT 1", (ref, ref)).fetchone()
+            if row:
+                order = _assert_order_access(conn, row["order_id"], actor(identity))
+                target = {
+                    "order_id": order["order_id"],
+                    "order_no": order.get("order_no"),
+                    "recommended_action": "根据用户目标创建跟进任务草稿",
+                    "evidence": [f"用户明确指定订单{order.get('order_no') or order.get('order_id')}"],
+                    "severity": "MEDIUM",
+                }
+        if target:
+            severity = str(target.get("severity") or "MEDIUM").lower()
+            risk_level = severity if severity in {"low", "medium", "high", "critical"} else "medium"
+            task = create_task_draft_logic(
+                conn,
+                {
+                    **body,
+                    **actor(identity),
+                    "run_id": run_id,
+                    "order_id": target.get("order_id"),
+                    "title": f"处理{target.get('order_no') or target.get('order_id')}风险事项",
+                    "recommended_action": target.get("recommended_action") or "核实风险证据并推进下一步",
+                    "evidence": target.get("evidence") or [],
+                    "risk_level": risk_level,
+                    "create_approval_request": bool(body.get("create_approval_request", True)),
+                },
+            )
+
+    if diagnosis:
+        answer = _format_diagnosis_answer(diagnosis, explain_rank=explanation_rank, task=task)
+    elif bulk_update:
+        summary = bulk_update.get("summary") or {}
+        answer = (
+            f"已解析批量进展，匹配{int(summary.get('matched_order_count') or 0)}笔订单，"
+            f"生成{int(summary.get('candidate_field_count') or 0)}项字段候选。候选尚未写回，请进入确认页面审核。"
+        )
+        if "RISK_DIAGNOSIS" in intent_names:
+            answer += "为避免用未确认数据排序，本次暂不执行风险诊断；确认更新后再运行风险检查。"
+    else:
+        answer = "已完成当前受控执行计划。"
+
+    return {
+        "answer": answer,
+        "conversation_id": body.get("conversation_id"),
+        "execution_mode": "HYBRID_DETERMINISTIC_PLAN",
+        "router_version": "HYBRID_INTENT_ROUTER_V1",
+        "route_plan": plan,
+        "diagnosis": diagnosis,
+        "bulk_update": bulk_update,
+        "task_draft": task,
+        "task_draft_id": task.get("task_draft_id") if task else None,
+        "approval_id": task.get("approval_id") if task else None,
+        "deferred_intents": ["RISK_DIAGNOSIS"] if bulk_update and "RISK_DIAGNOSIS" in intent_names else [],
+        "usage": {},
+    }
+
+
 def _execute_agent_chat_job(
     job_id: str,
     *,
@@ -918,12 +1220,7 @@ def _execute_agent_chat_job(
     started_at: str,
     run_id: str | None = None,
 ) -> None:
-    """Run a Coze Agent chat outside the browser request lifecycle.
-
-    Railway/HTTP clients may close a long, idle request while Coze is still
-    executing tools. Persisting the job first lets the browser poll without
-    resubmitting the Agent goal or creating duplicate drafts/approvals.
-    """
+    """Execute a routed Agent job outside the browser request lifecycle."""
     with db() as conn:
         conn.execute(
             "UPDATE agent_chat_jobs SET status='RUNNING',started_at=?,updated_at=? WHERE job_id=?",
@@ -932,72 +1229,91 @@ def _execute_agent_chat_job(
         conn.commit()
     started_perf = time.perf_counter()
     try:
-        result = run_agent_chat(
-            user_id=user_id,
-            question=agent_question,
-            parameters=parameters,
-            conversation_id=body.get("conversation_id"),
-            timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS,
-        )
-        with db() as conn:
-            latest = conn.execute(
-                "SELECT * FROM agent_runs WHERE run_id=?",
-                (run_id,),
-            ).fetchone() if run_id else conn.execute(
-                """SELECT * FROM agent_runs WHERE current_user_id=? AND created_at>=?
-                   ORDER BY created_at DESC LIMIT 1""",
-                (user_id, started_at),
-            ).fetchone()
-            total_duration_ms = int((time.perf_counter() - started_perf) * 1000)
-            if latest and latest["status"] in {"RUNNING", "PARTIAL"}:
-                stop_reason = "BACKEND_MANAGED_AGENT_COMPLETED" if latest["status"] == "RUNNING" else (latest["stop_reason"] or "PARTIAL_RESULT")
-                final_status = "COMPLETED" if latest["status"] == "RUNNING" else latest["status"]
-                compact_result = {
-                    "answer": result.get("answer"),
-                    "conversation_id": result.get("conversation_id"),
-                    "usage": result.get("usage") or {},
-                    "backend_managed_run": True,
-                }
-                conn.execute(
-                    """UPDATE agent_runs SET status=?,result_json=?,stop_reason=?,duration_ms=?,completed_at=?
-                       WHERE run_id=?""",
-                    (final_status, json.dumps(compact_result, ensure_ascii=False), stop_reason,
-                     total_duration_ms, iso(), latest["run_id"]),
-                )
-                log_tool_call(
-                    conn,
-                    run_id=latest["run_id"],
-                    tool_name="backend_finalize_agent_run",
-                    request={"job_id": job_id},
-                    response={"status": final_status, "stop_reason": stop_reason},
-                    status="SUCCESS",
-                    duration_ms=0,
-                )
-                latest = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (latest["run_id"],)).fetchone()
-            performance_metrics = {
-                "total_duration_ms": total_duration_ms,
-                "tool_call_count": 0,
-                "backend_tool_duration_ms": 0,
-                "agent_orchestration_duration_ms": total_duration_ms,
+        plan = body.get("_route_plan") or route_agent_request(
+            str(body.get("question") or ""),
+            {
+                "default_due_within_days": parameters.get("default_due_within_days"),
+                "default_top_n": parameters.get("default_top_n"),
+                "previous_run_id": body.get("previous_run_id"),
+            },
+        ).to_dict()
+        if plan.get("route_mode") == "CLARIFICATION":
+            result = {
+                "answer": plan.get("clarification_question") or "请补充你希望我完成的具体目标。",
+                "conversation_id": body.get("conversation_id"),
+                "execution_mode": "CLARIFICATION",
+                "router_version": "HYBRID_INTENT_ROUTER_V1",
+                "route_plan": plan,
+                "usage": {},
             }
-            if latest:
-                perf_row = conn.execute(
-                    """SELECT COUNT(*) AS call_count,COALESCE(SUM(duration_ms),0) AS backend_ms
-                       FROM agent_tool_calls WHERE run_id=? AND tool_name!='backend_finalize_agent_run'""",
-                    (latest["run_id"],),
-                ).fetchone()
-                backend_ms = int(perf_row["backend_ms"] or 0)
-                performance_metrics = {
-                    "total_duration_ms": total_duration_ms,
-                    "tool_call_count": int(perf_row["call_count"] or 0),
-                    "backend_tool_duration_ms": backend_ms,
-                    "agent_orchestration_duration_ms": max(0, total_duration_ms - backend_ms),
-                }
-            payload = {
+        elif plan.get("route_mode") == "DETERMINISTIC_PLAN":
+            with db() as conn:
+                result = _execute_deterministic_plan(
+                    conn,
+                    plan=plan,
+                    body=body,
+                    identity=identity,
+                    run_id=str(run_id or ""),
+                )
+                conn.commit()
+        else:
+            parameters = {**parameters, "route_plan": plan}
+            result = run_agent_chat(
+                user_id=user_id,
+                question=agent_question,
+                parameters=parameters,
+                conversation_id=body.get("conversation_id"),
+                timeout_seconds=COZE_AGENT_TIMEOUT_SECONDS,
+            )
+            result = {
                 **result,
                 "execution_mode": "COZE_AGENT",
-                "performance_profile": "FAST_STANDARD_DIAGNOSIS",
-                "performance_metrics": performance_metrics,
+                "router_version": "HYBRID_INTENT_ROUTER_V1",
+                "route_plan": plan,
+            }
+
+        with db() as conn:
+            latest = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone() if run_id else None
+            total_duration_ms = int((time.perf_counter() - started_perf) * 1000)
+            stop_reason = {
+                "CLARIFICATION": "NEEDS_CLARIFICATION",
+                "HYBRID_DETERMINISTIC_PLAN": "DETERMINISTIC_PLAN_COMPLETED",
+                "COZE_AGENT": "COZE_AGENT_COMPLETED",
+            }.get(result.get("execution_mode"), "AGENT_COMPLETED")
+            compact_result = {
+                **result,
+                "backend_managed_run": True,
+            }
+            conn.execute(
+                """UPDATE agent_runs SET status='COMPLETED',result_json=?,stop_reason=?,duration_ms=?,completed_at=?
+                   WHERE run_id=?""",
+                (json.dumps(compact_result, ensure_ascii=False), stop_reason, total_duration_ms, iso(), run_id),
+            )
+            log_tool_call(
+                conn,
+                run_id=run_id,
+                tool_name="backend_finalize_agent_run",
+                request={"job_id": job_id, "route_mode": result.get("execution_mode")},
+                response={"status": "COMPLETED", "stop_reason": stop_reason},
+                status="SUCCESS",
+                duration_ms=0,
+            )
+            latest = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone() if run_id else latest
+            perf_row = conn.execute(
+                """SELECT COUNT(*) AS call_count,COALESCE(SUM(duration_ms),0) AS backend_ms
+                   FROM agent_tool_calls WHERE run_id=? AND tool_name!='backend_finalize_agent_run'""",
+                (run_id,),
+            ).fetchone() if run_id else None
+            backend_ms = int(perf_row["backend_ms"] or 0) if perf_row else 0
+            payload = {
+                **result,
+                "performance_profile": "HYBRID_ROUTED_AGENT",
+                "performance_metrics": {
+                    "total_duration_ms": total_duration_ms,
+                    "tool_call_count": int(perf_row["call_count"] or 0) if perf_row else 0,
+                    "backend_tool_duration_ms": backend_ms,
+                    "agent_orchestration_duration_ms": max(0, total_duration_ms - backend_ms),
+                },
                 "run": dict(latest) if latest else None,
                 "resolved_identity": {
                     "current_user_id": identity["current_user_id"],
@@ -1013,7 +1329,7 @@ def _execute_agent_chat_job(
                 (
                     json.dumps(payload, ensure_ascii=False),
                     result.get("conversation_id"),
-                    latest["run_id"] if latest else run_id,
+                    run_id,
                     total_duration_ms,
                     iso(),
                     iso(),
@@ -1021,7 +1337,7 @@ def _execute_agent_chat_job(
                 ),
             )
             conn.commit()
-    except Exception as exc:  # Background jobs must persist failures for polling.
+    except Exception as exc:
         with db() as conn:
             failed_duration_ms = int((time.perf_counter() - started_perf) * 1000)
             conn.execute(
@@ -1031,12 +1347,11 @@ def _execute_agent_chat_job(
             )
             if run_id:
                 conn.execute(
-                    """UPDATE agent_runs SET status='FAILED',stop_reason='COZE_AGENT_FAILED',duration_ms=?,completed_at=?
+                    """UPDATE agent_runs SET status='FAILED',stop_reason='AGENT_EXECUTION_FAILED',duration_ms=?,completed_at=?
                        WHERE run_id=? AND status IN ('RUNNING','PARTIAL')""",
                     (failed_duration_ms, iso(), run_id),
                 )
             conn.commit()
-
 
 def _agent_chat_job_payload(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
@@ -1070,9 +1385,9 @@ def register_agent_api(app) -> None:
                    WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
             ).fetchone()
         return {
-            "version": "6.1.3.4",
+            "version": "6.1.4.1",
             "agent_name": "FlowOrder订单异常诊断Agent",
-            "backend": {"online": True, "version": "6.1.3.4"},
+            "backend": {"online": True, "version": "6.1.4.1"},
             "coze_agent": {
                 "configured": coze["configured"],
                 "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
@@ -1088,9 +1403,13 @@ def register_agent_api(app) -> None:
             "analytics_enabled": True,
             "async_agent_chat": {"available": True, "polling": True, "stream_timeout_seconds": COZE_AGENT_TIMEOUT_SECONDS},
             "performance_profile": {
-                "name": "FAST_STANDARD_DIAGNOSIS",
+                "name": "HYBRID_ROUTED_AGENT",
                 "backend_managed_run": True,
-                "standard_agent_tool_turns": 2,
+                "hybrid_intent_router": True,
+                "multi_intent_plan": True,
+                "standard_agent_tool_turns": 1,
+                "shared_ranking_rule": "FT04_SHARED_V1",
+                "coze_only_for_open_goals": True,
                 "compact_final_answer": True,
             },
         }
@@ -1170,78 +1489,10 @@ def register_agent_api(app) -> None:
     @router.post("/api/agent/tools/task-drafts/create")
     def tool_create_task_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
-        body = payload.model_dump(); a = actor(body)
         with db() as conn:
-            enforce_run_budget(conn, body.get("run_id"))
-            order = _assert_order_access(conn, str(body.get("order_id") or ""), a)
-            draft_id = new_id("TDRAFT")
-            task = {
-                "task_draft_id": draft_id, "order_id": order["order_id"], "title": body.get("title") or "处理订单异常",
-                "recommended_action": body.get("recommended_action") or body.get("title") or "处理订单异常",
-                "target": body.get("target") or "internal", "owner_user_id": body.get("owner_user_id") or order.get("owner") or a["current_user_id"],
-                "risk_level": body.get("risk_level") or "medium", "business_deadline": body.get("business_deadline"),
-                "evidence": body.get("evidence") or [], "status": "DRAFT", "requires_approval": True,
-            }
-            audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
-            approval = None
-            create_linked_approval = bool(body.get("create_approval_request"))
-            if not create_linked_approval and body.get("run_id"):
-                linked_job = conn.execute(
-                    """SELECT request_json FROM agent_chat_jobs WHERE linked_run_id=?
-                       ORDER BY created_at DESC LIMIT 1""",
-                    (body.get("run_id"),),
-                ).fetchone()
-                if linked_job:
-                    linked_request = safe_json(linked_job["request_json"], {})
-                    create_linked_approval = bool(linked_request.get("create_approval_request"))
-            if create_linked_approval:
-                approval_payload = {
-                    **body,
-                    **a,
-                    "task_draft_id": draft_id,
-                    "order_id": order["order_id"],
-                    "action_type": "CREATE_TASK",
-                    "action_payload": {
-                        "task_draft_id": draft_id,
-                        "order_id": order["order_id"],
-                        "title": task["title"],
-                        "recommended_action": task["recommended_action"],
-                        "target": task["target"],
-                        "owner_user_id": task["owner_user_id"],
-                        "risk_level": task["risk_level"],
-                        "business_deadline": task["business_deadline"],
-                        "evidence": task["evidence"],
-                    },
-                    "idempotency_key": body.get("approval_idempotency_key") or f"CREATE_TASK:{body.get('run_id')}:{order['order_id']}",
-                    "high_risk": str(task["risk_level"]).lower() in {"high", "critical"},
-                }
-                approval = create_approval_logic(conn, approval_payload)
-                task.update({
-                    "approval_id": approval.get("approval_id"),
-                    "approval_status": approval.get("status"),
-                    "approval_required_role": approval.get("required_role"),
-                    "approval_duplicate_skipped": bool(approval.get("duplicate_skipped")),
-                })
-                track_event(
-                    conn, "approval_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
-                    user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool_fast_path",
-                    properties={"approval_id": approval.get("approval_id"), "action_type": "CREATE_TASK",
-                                "required_role": approval.get("required_role"), "duplicate_skipped": bool(approval.get("duplicate_skipped"))},
-                )
-            log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_task_draft",
-                          request={"order_id": order["order_id"], "title": task["title"],
-                                   "create_approval_request": create_linked_approval},
-                          response={"task_draft_id": draft_id, "status": "DRAFT",
-                                    "approval_id": task.get("approval_id"), "approval_status": task.get("approval_status")},
-                          status="SUCCESS", duration_ms=0)
-            track_event(
-                conn, "task_draft_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
-                user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool",
-                properties={"task_draft_id": draft_id, "risk_level": task["risk_level"], "requires_approval": True,
-                            "approval_id": task.get("approval_id")},
-            )
+            result = create_task_draft_logic(conn, payload.model_dump())
             conn.commit()
-        return task
+        return result
 
     @router.post("/api/agent/tools/message-drafts/create")
     def tool_create_message_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
@@ -1408,8 +1659,25 @@ def register_agent_api(app) -> None:
             "run_managed_by_backend": True,
             "response_mode": "COMPACT",
         }
+        route_plan = route_agent_request(
+            question,
+            {
+                "default_due_within_days": parameters["default_due_within_days"],
+                "default_top_n": parameters["default_top_n"],
+                "previous_run_id": body.get("previous_run_id"),
+            },
+        ).to_dict()
+        body["_route_plan"] = route_plan
+        parameters["route_plan"] = route_plan
         agent_question = build_trusted_agent_question(question, identity, parameters)
         with db() as conn:
+            # Railway redeploys can terminate worker threads while leaving RUNNING rows.
+            stale_before = iso(now_cn() - timedelta(minutes=5))
+            conn.execute(
+                """UPDATE agent_chat_jobs SET status='FAILED',error_message='后台任务已失效，请重新提交',
+                   completed_at=?,updated_at=? WHERE status IN ('QUEUED','RUNNING') AND updated_at<?""",
+                (iso(), iso(), stale_before),
+            )
             # Prevent accidental double-clicks from spawning identical live jobs.
             existing = conn.execute(
                 """SELECT * FROM agent_chat_jobs
@@ -1430,7 +1698,9 @@ def register_agent_api(app) -> None:
                 conn, "agent_run_started", organization_id=identity["organization_id"], user_id=user_id,
                 user_role=role, run_id=run_id, source="website_agent_job",
                 properties={"goal": question[:120], "trigger_type": "USER_BACKEND_MANAGED",
-                            "performance_profile": "FAST_STANDARD_DIAGNOSIS"},
+                            "performance_profile": "HYBRID_ROUTED_AGENT",
+                            "route_mode": route_plan.get("route_mode"),
+                            "intents": [x.get("intent") for x in route_plan.get("intents") or []]},
             )
             conn.execute(
                 """INSERT INTO agent_chat_jobs(

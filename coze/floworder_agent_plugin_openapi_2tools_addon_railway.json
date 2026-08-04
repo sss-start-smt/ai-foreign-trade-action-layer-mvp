@@ -15,7 +15,7 @@
       "post": {
         "operationId": "parse_bulk_order_updates",
         "summary": "解析一段多订单进展文本",
-        "description": "把用户粘贴的一大段订单进展拆分、匹配订单并生成字段更新候选。不会直接写回；返回review_url供用户人工确认。",
+        "description": "用户输入同时包含多笔订单号及进度、承诺、延期、等待或物流信息时使用。只生成字段更新候选和review_url，不写回正式订单；不要用于风险排序。",
         "requestBody": {
           "required": true,
           "content": {
@@ -106,7 +106,7 @@
       "post": {
         "operationId": "diagnose_priority_orders",
         "summary": "一次完成Top 7笔不同风险订单诊断",
-        "description": "组合工具：一次完成候选筛选、证据读取、异常生成、同订单聚合和Top N排序；信息缺口单独返回，不用于凑数。",
+        "description": "用于跨多笔订单检查并排序未来时间窗口内最需要处理的真实风险订单。内部复用FT04共享行动规则与异常证据；信息缺口单独返回，不凑Top N。不要用于单订单解释或批量进展解析。",
         "requestBody": {
           "required": true,
           "content": {

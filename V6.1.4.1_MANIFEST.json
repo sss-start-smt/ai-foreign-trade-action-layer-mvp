@@ -1,0 +1,400 @@
+{
+  "version": "6.1.4.1",
+  "files": [
+    {
+      "path": "ACCESSIBILITY_REPORT.md",
+      "sha256": "50b72e8a84e2dbdee79e954b4778be05b033778cf1884d7c0342a877e3bcd080",
+      "size": 869
+    },
+    {
+      "path": "CHANGELOG_V6.md",
+      "sha256": "b7e2a7c7b73ed2c296407b2fc731eadc78dc3c3b66531f0dc1916b8d415b1c57",
+      "size": 880
+    },
+    {
+      "path": "DEPLOY_V6.1.4.1.md",
+      "sha256": "adb64ce805623193c63489e59edefbf4212cbcec233c1267fa68f7912f467c5e",
+      "size": 4063
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "e64a532f85851bcb49f228242b0cd4dc5a2536c30e636c68176b6abd8a6275f6",
+      "size": 193
+    },
+    {
+      "path": "FRONTEND_FREEZE_MANIFEST.json",
+      "sha256": "5a13850fe9f4e5f0e99c3e91b1ec9878df26f4891166d8bd4bc68b48c32c4f82",
+      "size": 1036
+    },
+    {
+      "path": "FlowOrder_V6.1.3_Code_Diff.patch",
+      "sha256": "7863671955ea8603f1395103495ef89b85981d9beb7e37aec69947a59f9435ef",
+      "size": 99072
+    },
+    {
+      "path": "PATCH_FILES.txt",
+      "sha256": "5d99fb4311e60ce974a2cf9c65607eaf8f2d6128d74d02652874cb9b5538171c",
+      "size": 968
+    },
+    {
+      "path": "PATCH_FILES_V6.1.3.txt",
+      "sha256": "1699b9c5d260b527f89f8ef384d73593b708360cb96160776fee81ad723223a3",
+      "size": 392
+    },
+    {
+      "path": "README.md",
+      "sha256": "71faf9b9ac9f59a2ccd5bcd35622f84c150e2f7d52ef05067afab54dea3c1b05",
+      "size": 1173
+    },
+    {
+      "path": "UI_UX_REDESIGN.md",
+      "sha256": "27e0b540af3e6d516c74e34e9cf3c4812b977372b24d45379e7d1d7023014072",
+      "size": 1616
+    },
+    {
+      "path": "V6.1.3.5_FRONTEND_CODE_DIFF.patch",
+      "sha256": "e51d2bb0514f153249847e7fb638f4a162f6b91a665b5f8f2f2867b0a21c8f37",
+      "size": 144617
+    },
+    {
+      "path": "V6.1.3.6_MANIFEST.json",
+      "sha256": "d1a1434082cd3438201785cb0adeea5c6a55bf4a8412c4c1efb454ecf19ca9fd",
+      "size": 548
+    },
+    {
+      "path": "V6.1.3.6_SHA256.txt",
+      "sha256": "297d70b555a7c16b8b3f40e3a040da9fcb413971ef732f1edb04e4939a4b11e0",
+      "size": 248
+    },
+    {
+      "path": "V6.1.3.7_MANIFEST.json",
+      "sha256": "37151fbcea3dac84fcbd3712f97e3736d8f5a49ebe0bd538268f786c65ca7f2c",
+      "size": 464
+    },
+    {
+      "path": "V6.1.3.7_SHA256.txt",
+      "sha256": "7585f3382ec9b774b13c056dc2475a904c1406e522052f45a0c71763adc3664a",
+      "size": 248
+    },
+    {
+      "path": "V6.1.4.1_RELEASE_NOTES.md",
+      "sha256": "5d46b57362e9417d8e3820a299dbad10d62ac8d6ca95af23b863c7076fbfebf8",
+      "size": 2775
+    },
+    {
+      "path": "VALIDATION.md",
+      "sha256": "3c518f2439671fad3784583d86aefa01309567a77591ac7e0cc7abdd4782575f",
+      "size": 304
+    },
+    {
+      "path": "VALIDATION_REPORT.md",
+      "sha256": "acc5f16c82f4cf44eb7d0adce1fa7b128dfef6bf07abb2c48a3711305678b5a9",
+      "size": 699
+    },
+    {
+      "path": "action_rules.py",
+      "sha256": "f1fd7f7aeae36d557ee7379cf3f45c93cdeca8b2fb8bec2753a9eb92246c5c7a",
+      "size": 5973
+    },
+    {
+      "path": "agent_api.py",
+      "sha256": "e7b5f3de8c345168276681e1263b712f47223a4490d26032c693e94f2c938664",
+      "size": 100384
+    },
+    {
+      "path": "agent_router.py",
+      "sha256": "48926ce68a450217282c985fb1d18cdfa42dc36acbf737a902a6bd039ebabeaa",
+      "size": 13859
+    },
+    {
+      "path": "analytics.py",
+      "sha256": "55f33eeba51c43a08ba96b9287cd703192c6b8f99c0d8d6c630492aa577f0119",
+      "size": 8630
+    },
+    {
+      "path": "communication_workflows_patch.py",
+      "sha256": "7e30af240ed5f8dfc75ba9c53611fe0d84652d539a8c982e70ad11d84816d260",
+      "size": 130341
+    },
+    {
+      "path": "coze/AGENT_SYSTEM_PROMPT.md",
+      "sha256": "38f538d767b6e1f0b28564380ecd4bdbf32c0b8e847f5abcb650f6f9d3aaba34",
+      "size": 8190
+    },
+    {
+      "path": "coze/AGENT_SYSTEM_PROMPT_V6_1.md",
+      "sha256": "a99d099f5d2725b429ec4721ad28e1be7ee7a28488b54173dfed84c01c2220be",
+      "size": 8682
+    },
+    {
+      "path": "coze/COZE_SETUP_GUIDE.md",
+      "sha256": "7d364d96746da38c6f2d8be2a1e2ca335c9e79a356674b9ba51c675d2cb5df4f",
+      "size": 3461
+    },
+    {
+      "path": "coze/DAILY_TRIGGER_PROMPT.md",
+      "sha256": "3ec7792621d56235dd65b4160a26081a85f7ae624a86cbf9b9f50f219cd52927",
+      "size": 1115
+    },
+    {
+      "path": "coze/MODEL_SELECTION_AND_EVAL.md",
+      "sha256": "5872fd471b1768038bbdd101da63b22407613bd5fba5f854055193097a700bad",
+      "size": 3422
+    },
+    {
+      "path": "coze/floworder_agent_plugin_openapi.yaml",
+      "sha256": "ec4efd9c0e2743393f1dcd745408487c5465a048e0e19dea78f5dcd200c64c2b",
+      "size": 29966
+    },
+    {
+      "path": "coze/floworder_agent_plugin_openapi_12tools_railway.json",
+      "sha256": "5612db4156e12a2c64559c28434cad0cd873cd8d30209e59ee1632178c774761",
+      "size": 40849
+    },
+    {
+      "path": "coze/floworder_agent_plugin_openapi_2tools_addon_railway.json",
+      "sha256": "4be6f1ba02b46b67b84ddd91c68074c174b5da2f25a84005aff86a0571764750",
+      "size": 7711
+    },
+    {
+      "path": "coze/floworder_agent_plugin_openapi_production_6tools_railway.json",
+      "sha256": "56083c4b1aaefb05f5e4a9cb07df64fe6513f88333e8b793a9dba3c2a89dfd54",
+      "size": 21370
+    },
+    {
+      "path": "coze/floworder_agent_plugin_openapi_production_6tools_railway.yaml",
+      "sha256": "ef85696f200177501a1aa424d0618928adc1ae7f7bfc3cee57123298ff3742e4",
+      "size": 15790
+    },
+    {
+      "path": "coze/workflows/README_#U6a21#U578b#U5207#U6362#U4e0e#U56de#U5f52.md",
+      "sha256": "228808c3ceb449d5c59d3a701122a330764ae9e9c83293eff8cd0d963dbb6503",
+      "size": 993
+    },
+    {
+      "path": "coze/workflows/Workflow-FT05_LowLatency_V6-draft.zip",
+      "sha256": "9e60dbb31dcf665102da4a43bee6b77ba90176e46953a6918e0d0d26bb17191b",
+      "size": 6961
+    },
+    {
+      "path": "coze/workflows/Workflow-FT06_LowLatency_V6-draft.zip",
+      "sha256": "8bf383191ee98cf9fed3b3803695380158b98c9f67170ab6cdd46f011f3508d2",
+      "size": 9629
+    },
+    {
+      "path": "coze_agent_client.py",
+      "sha256": "7014ed650042808fe7cfac324f1c108de9942017bb09ec769d2674246b899f7b",
+      "size": 2968
+    },
+    {
+      "path": "coze_integration.py",
+      "sha256": "3c4e4aee81a66b0308af62c82f9f6af05dfa3113cb44bd6734a1edd0761cbe94",
+      "size": 21301
+    },
+    {
+      "path": "demo_data/FlowOrder_Agent#U9471#U65c7#U769f_#U7481#U3220#U5d1f#U7035#U714e#U53c6#U5a34#U5b2d#U762f#U93c1#U7248#U5d41_12#U9357#U66232026-08-02.xlsx",
+      "sha256": "3ed63bcfabeb25313efa331d8507fe4104fed455be3c42f3f80b0ed2b9cdd47c",
+      "size": 10898
+    },
+    {
+      "path": "demo_payloads/FT01_confirmed_writeback.json",
+      "sha256": "b0b6846ee46f49b378d6e4517876df4c3a3fd2a9064118918a82937dc01d3b01",
+      "size": 965
+    },
+    {
+      "path": "demo_payloads/FT02_confirmed_writeback.json",
+      "sha256": "9fb42e8c69433d7f086d4a47fcf5691bbf44fa25e6e6a7828f3c1d1a14d958b3",
+      "size": 1398
+    },
+    {
+      "path": "docs/#U9369#U5b2c#U5063#U6d5c#U5b29#U6b22#U701b#U6940#U5400_V6.1.csv",
+      "sha256": "eafa860e3a18594ef18e318a4f4d129a33aef27763e1329477a3e1b27c28b99a",
+      "size": 1965
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "701450714bec3457971cf126e51fe08e3497503ba530e217976a9c713a6f837b",
+      "size": 1935
+    },
+    {
+      "path": "docs/DEPLOYMENT.md",
+      "sha256": "b1e51ece0402c1cbaad3c075fdb3bee27b03088552367a0dd4285e1dc33eb6ce",
+      "size": 1246
+    },
+    {
+      "path": "docs/MAINTENANCE.md",
+      "sha256": "24b61a4dc3baebfd8fa531b205b2a8cd20f75abca3879ddc79ee74a4d3f4cb29",
+      "size": 1559
+    },
+    {
+      "path": "docs/SECURITY_AND_APPROVAL.md",
+      "sha256": "2f885cfcd66ad4f077c573d5844533b942f0a506dffe3ebde63218d0ca1397d3",
+      "size": 1478
+    },
+    {
+      "path": "docs/V6.1.3.1_HOTFIX_GUIDE.md",
+      "sha256": "72ee7b72f8105f1a0cd8253d69658220b7ea924c5331b6b546a91b281ce3ac26",
+      "size": 1297
+    },
+    {
+      "path": "docs/V6.1.3.2_IDENTITY_CONTEXT_HOTFIX_GUIDE.md",
+      "sha256": "ab684af55692c84a988329dd470e7ff9c7a1fa6da4173e97475996fbd1c15ea7",
+      "size": 4400
+    },
+    {
+      "path": "docs/V6.1.3.3_ASYNC_AGENT_GUIDE.md",
+      "sha256": "487703c1319dc4a7b3704eec7eebc470c3fc22cb7fcce0c3491349b2fb890907",
+      "size": 3118
+    },
+    {
+      "path": "docs/V6.1.3.4_AGENT_PERFORMANCE_GUIDE.md",
+      "sha256": "7dc005a2dea8548f5b224969a2b2b8a0a620846120356f63eb689b91e016404b",
+      "size": 5976
+    },
+    {
+      "path": "docs/V6.1.3.5_FRONTEND_FREEZE_DEPLOYMENT_GUIDE.md",
+      "sha256": "254ad47a0e870994e61c255ce613eb778ab7ba2fc4f40bcd00f4cacb2216b4e4",
+      "size": 4214
+    },
+    {
+      "path": "docs/V6.1.3_DEPLOYMENT_AND_VALIDATION_GUIDE.md",
+      "sha256": "66a9f78ef35b6c2b4f097cb5b1d9cdd3645be9095166876e8c969f20e219b492",
+      "size": 16677
+    },
+    {
+      "path": "docs/V6.1.4.1_AGENT_ARCHITECTURE.md",
+      "sha256": "26134009ba04ed8df24eb30b56715cbb57698ac2fb90883d2d6f38e79fe6f1d0",
+      "size": 971
+    },
+    {
+      "path": "evaluation/FlowOrder_Agent_Evaluation.xlsx",
+      "sha256": "9facfe17be1b3d347984c2970d4d8404f41b82983cb8a668b9b170feba318bc0",
+      "size": 18913
+    },
+    {
+      "path": "evaluation/agent_eval_cases.json",
+      "sha256": "3dbca9f76fd077109454f38995269367bb0055056c4691ccb36c1934f411a09e",
+      "size": 3977
+    },
+    {
+      "path": "excel_import_patch.py",
+      "sha256": "5a8907ccf9df94753ab6dad12961e49d4f7af93edaba8c46f24a349f3519a9bb",
+      "size": 63872
+    },
+    {
+      "path": "install_communication_workflows_patch.py",
+      "sha256": "489ae5184d31729386269dc0fe14d88bcb55514e98e28b3ac20a130715507555",
+      "size": 3215
+    },
+    {
+      "path": "install_excel_import_patch.py",
+      "sha256": "f0c7266baeab77ef647f891089f485b2177c76b2d6826ed409feb477969c6961",
+      "size": 3301
+    },
+    {
+      "path": "install_unified_action_experience_patch.py",
+      "sha256": "949416075c581911bb1d6eea4e7e8d58d4047b63200fb8faf5fd245317725f7f",
+      "size": 303
+    },
+    {
+      "path": "main.py",
+      "sha256": "7e73db08228d8d5613eea402f4d9fa2fa35eb4e989ecae1a9779d082e67ce81c",
+      "size": 105972
+    },
+    {
+      "path": "railway.json",
+      "sha256": "23dcb1c4fe78495d23e2c863414a28d0da2a9c317eca8a385fe11bec9d7b4854",
+      "size": 311
+    },
+    {
+      "path": "render.yaml",
+      "sha256": "7ec9ff69c5dcc0885e44d02f496d2fe00cf4092fd860b93adf8f0837abf5e5dc",
+      "size": 1582
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "491ccb96d41a49c602a11b314bdd6fd410a06e1bad2d89f346a30a7707f4af4c",
+      "size": 104
+    },
+    {
+      "path": "runtime.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "schema.sql",
+      "sha256": "129dabf55c5f34a661d69a63755c2806845e1304ab9480ddf8a5a3f37845acd7",
+      "size": 13844
+    },
+    {
+      "path": "seed_agent_evaluation.py",
+      "sha256": "6a5575791c4fda026de3347a434158c57239e3b373ded40fbcdec47596498a75",
+      "size": 10169
+    },
+    {
+      "path": "static/app.js",
+      "sha256": "77c8bcff9f5d720e9c0c3c84ac3c1bf6557f8320dd1012c780092c1cb38a1cbd",
+      "size": 124189
+    },
+    {
+      "path": "static/index.html",
+      "sha256": "f7e360bc859fc4ec18f967e8797ec9a341f068543ff7e01e1ca424abcd1ae539",
+      "size": 15356
+    },
+    {
+      "path": "static/styles.css",
+      "sha256": "479dbac3eb133c74a1e6134e224c627356579a3de135ff3d70bdde72eb3e3a23",
+      "size": 59069
+    },
+    {
+      "path": "tests/test_action_layer.db",
+      "sha256": "04466e18311f91d02784b320600fc2a57e5dcffc92a63dae19613dfd53cdba64",
+      "size": 454656
+    },
+    {
+      "path": "tests/test_agent_api.py",
+      "sha256": "135343f830bb59e1a9b10edbd17a7130a09b9b4f2a0e168faa2260f494d42ae0",
+      "size": 8449
+    },
+    {
+      "path": "tests/test_agent_identity_context.py",
+      "sha256": "db52dd08852e4a14c20ac63d3e4b6df1718f2a937798f18068cf61320f34d92f",
+      "size": 3274
+    },
+    {
+      "path": "tests/test_agent_router.py",
+      "sha256": "49246493106529f7237159f86eb875855c5e223935ffb5b979e05c38644fbaaf",
+      "size": 2203
+    },
+    {
+      "path": "tests/test_api.py",
+      "sha256": "dbe8fa9131196dd43264f89535634a5ac5a56369000e8b2d2dfd49f099a144ca",
+      "size": 12932
+    },
+    {
+      "path": "tests/test_coze_integration.py",
+      "sha256": "5917524f92148583af000cc482f683c518fd6528da8b1999991aae87ce1a5ac0",
+      "size": 4542
+    },
+    {
+      "path": "tests/test_v613_regressions.py",
+      "sha256": "a78fbb742ea66741e10da606069ba9c58bb5aaf96e61e56966d52c98195aae24",
+      "size": 18166
+    },
+    {
+      "path": "tests/test_v61_extensions.py",
+      "sha256": "6871647a532764b8dda3d2262a6cf90fa537820f93f6c8cbcdda1f63d77aec93",
+      "size": 5850
+    },
+    {
+      "path": "unified_action_experience_patch.py",
+      "sha256": "86d824ef90307b36d5f13ba44bb7483a145df0b7b1078b0588e627603ca34a07",
+      "size": 576
+    },
+    {
+      "path": "v61_extensions.py",
+      "sha256": "918f0e2d1b9cf70b38b207d53d2cab9c3427509f8c7e7f90ac565ac8e9f1dcb1",
+      "size": 52519
+    }
+  ]
+}

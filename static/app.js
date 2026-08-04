@@ -201,10 +201,53 @@ function newAgentConversation(){return{id:`LCONV-${Date.now()}-${Math.random().t
 function loadAgentConversations(){try{const v=JSON.parse(localGet(agentStoreKey())||'[]');return Array.isArray(v)?v:[]}catch{return[]}}
 function saveAgentConversations(list){localSet(agentStoreKey(),JSON.stringify(list.slice(0,20).map(c=>({...c,messages:(c.messages||[]).slice(-12)}))))}
 function saveOneConversation(conv){const list=loadAgentConversations();const i=list.findIndex(x=>x.id===conv.id);if(i>=0)list[i]=conv;else list.unshift(conv);list.sort((a,b)=>String(b.updated_at).localeCompare(String(a.updated_at)));saveAgentConversations(list)}
+const agentPollingJobs=new Map();
+async function pollConversationJob(root,conversationId,jobId,attempt=0){
+  const key=`${conversationId}:${jobId}`;
+  if(agentPollingJobs.has(key)&&attempt===0)return;
+  agentPollingJobs.set(key,true);
+  try{
+    const job=await api(`/api/agent/chat/jobs/${encodeURIComponent(jobId)}`,{timeoutMs:12000});
+    const conversations=loadAgentConversations();
+    const active=conversations.find(x=>x.id===conversationId);
+    if(!active){agentPollingJobs.delete(key);return}
+    active.last_job_id=jobId;
+    active.updated_at=job.updated_at||new Date().toISOString();
+    const live=$('#agentLiveStatus',root);
+    if(job.status==='COMPLETED'){
+      const result=job.result||{};
+      if(active.last_processed_job_id!==job.job_id){
+        active.messages.push({role:'assistant',content:result.answer||'Agent已完成运行，请查看右侧结构化结果。',time:job.completed_at||new Date().toISOString()});
+      }
+      active.coze_conversation_id=job.conversation_id||result.conversation_id||active.coze_conversation_id;
+      active.last_run_id=job.linked_run_id||result.run?.run_id||active.last_run_id;
+      const diagnosis=result.diagnosis||{};
+      if(result.diagnosis){active.metrics={screened:Number(diagnosis.screened_order_count||0),risk:Number(diagnosis.risk_order_count||0),gaps:Number(diagnosis.information_gap_order_count||0)}}
+      active.last_processed_job_id=job.job_id;
+      saveOneConversation(active);
+      agentPollingJobs.delete(key);
+      if(route.name==='agent'&&localGet(agentActiveKey())===conversationId)renderRoute(false);
+      return;
+    }
+    if(job.status==='FAILED'){
+      if(active.last_processed_job_id!==job.job_id){active.messages.push({role:'assistant',content:`本次运行未完成：${job.error_message||'未知错误'}`,time:job.completed_at||new Date().toISOString()})}
+      active.last_processed_job_id=job.job_id;saveOneConversation(active);agentPollingJobs.delete(key);
+      if(live)live.textContent=job.error_message||'Agent运行未完成';
+      if(route.name==='agent'&&localGet(agentActiveKey())===conversationId)renderRoute(false);
+      return;
+    }
+    saveOneConversation(active);
+    if(live)live.textContent=job.message||(job.status==='QUEUED'?'Agent任务已进入后台队列':'Agent正在执行已识别的工具计划…');
+    setTimeout(()=>{agentPollingJobs.delete(key);pollConversationJob(root,conversationId,jobId,attempt+1)},attempt<10?1000:2000);
+  }catch(err){
+    if(attempt<4){setTimeout(()=>{agentPollingJobs.delete(key);pollConversationJob(root,conversationId,jobId,attempt+1)},1800);return}
+    agentPollingJobs.delete(key);const live=$('#agentLiveStatus',root);if(live)live.textContent=`状态查询失败：${err.message}`;
+  }
+}
 function agentSessionItem(c,active){const meta=[];if(c.last_run_id)meta.push('已运行');if(c.metrics?.risk!=null)meta.push(`${c.metrics.risk}笔风险`);if(!meta.length)meta.push('未开始');return `<button class="session-item ${active?'active':''}" data-agent-session="${esc(c.id)}"><div class="s-when">${esc(fdt(c.updated_at))}</div><div class="s-title">${esc(c.title||'新会话')}</div><div class="s-meta">${meta.map(x=>`<span>${esc(x)}</span>`).join('')}</div></button>`}
 function agentMessagesHtml(messages=[]){if(!messages.length)return '<p class="demo-note">输入一个业务目标开始新会话。系统会保留本次会话ID，后续追问可以继续引用上一轮结果。</p>';return messages.map(m=>`<div class="chat-bubble ${m.role==='user'?'user':'agent'}">${esc(m.content)}<span class="c-time">${esc(fdt(m.time))}</span></div>`).join('')}
 function toolDisplayName(name){return({diagnose_priority_orders:'分析订单风险并排序',create_task_draft:'生成任务草稿',create_approval_request:'创建人工审批',deterministic_rule_inspection:'执行规则巡检',backend_finalize_agent_run:'保存运行结果',start_agent_run:'创建运行记录',complete_agent_run:'完成运行记录'}[name]||name)}
-function agentStructuredResultHtml({active,job,latest,latestRun,latestCalls,status,metrics}){const answer=job?.result?.answer||(active.messages||[]).filter(x=>x.role==='assistant').slice(-1)[0]?.content||'';const calls=latestCalls||[];const draftId=latestRun?.result?.task_draft_id||job?.result?.task_draft_id||'—';const approvalId=latestRun?.result?.approval_id||job?.result?.approval_id||'—';return `<div class="run-row"><span class="r-label">扫描范围</span><span class="r-val">未来14天 · ${Number(metrics.screened||0)} 笔订单</span></div><div class="run-row"><span class="r-label">风险订单</span><span class="r-val">${Number(metrics.risk||0)} 笔</span></div><div class="run-row"><span class="r-label">信息缺口</span><span class="r-val">${Number(metrics.gaps||0)} 笔，未计入风险排序</span></div><div class="run-row"><span class="r-label">执行过程</span><span class="r-val"><ul class="trace">${calls.map(c=>`<li>${esc(toolDisplayName(c.tool_name))}</li>`).join('')||'<li>尚无执行轨迹</li>'}</ul></span></div><div class="run-row"><span class="r-label">停止原因</span><span class="r-val">${esc(latestRun?.stop_reason||latestRun?.status||job?.status||'尚未运行')}</span></div><div class="run-row"><span class="r-label">任务草稿</span><span class="r-val">${esc(draftId)}</span></div><div class="run-row"><span class="r-label">审批</span><span class="r-val">${esc(approvalId)}</span></div>${answer?`<div class="cc-evidence">${esc(answer)}</div>`:''}<details class="tech-details"><summary>查看技术执行详情</summary><div class="tech-box">run_id：${esc(active.last_run_id||latestRun?.run_id||'—')}<br>conversation_id：${esc(active.coze_conversation_id||job?.conversation_id||job?.result?.conversation_id||'—')}<br>Agent状态：${status.coze_agent?.configured?'已配置':'未配置'}<br>工具调用：${calls.map(c=>esc(c.tool_name)).join(' → ')||'—'}</div></details><div class="row-actions" style="margin-top:12px"><button class="btn secondary" id="runRuleInspection">仅运行规则巡检</button><button class="btn primary" data-go="confirm">查看审批</button></div>`}
+function agentStructuredResultHtml({active,job,latest,latestRun,latestCalls,status,metrics}){const answer=job?.result?.answer||(active.messages||[]).filter(x=>x.role==='assistant').slice(-1)[0]?.content||'';const calls=latestCalls||[];const draftId=latestRun?.result?.task_draft_id||job?.result?.task_draft_id||job?.result?.task_draft?.task_draft_id||'—';const approvalId=latestRun?.result?.approval_id||job?.result?.approval_id||job?.result?.task_draft?.approval_id||'—';return `<div class="run-row"><span class="r-label">扫描范围</span><span class="r-val">未来14天 · ${Number(metrics.screened||0)} 笔订单</span></div><div class="run-row"><span class="r-label">风险订单</span><span class="r-val">${Number(metrics.risk||0)} 笔</span></div><div class="run-row"><span class="r-label">信息缺口</span><span class="r-val">${Number(metrics.gaps||0)} 笔，未计入风险排序</span></div><div class="run-row"><span class="r-label">执行过程</span><span class="r-val"><ul class="trace">${calls.map(c=>`<li>${esc(toolDisplayName(c.tool_name))}</li>`).join('')||'<li>尚无执行轨迹</li>'}</ul></span></div><div class="run-row"><span class="r-label">停止原因</span><span class="r-val">${esc(latestRun?.stop_reason||latestRun?.status||job?.status||'尚未运行')}</span></div><div class="run-row"><span class="r-label">任务草稿</span><span class="r-val">${esc(draftId)}</span></div><div class="run-row"><span class="r-label">审批</span><span class="r-val">${esc(approvalId)}</span></div>${answer?`<div class="cc-evidence">${esc(answer)}</div>`:''}<details class="tech-details"><summary>查看技术执行详情</summary><div class="tech-box">run_id：${esc(active.last_run_id||latestRun?.run_id||'—')}<br>conversation_id：${esc(active.coze_conversation_id||job?.conversation_id||job?.result?.conversation_id||'—')}<br>执行方式：${esc(job?.result?.execution_mode||'—')}<br>识别目标：${esc((job?.result?.route_plan?.intents||[]).map(x=>x.intent).join(' → ')||'—')}<br>Agent状态：${status.coze_agent?.configured?'已配置':'未配置'}<br>工具调用：${calls.map(c=>esc(c.tool_name)).join(' → ')||'—'}</div></details><div class="row-actions" style="margin-top:12px"><button class="btn secondary" id="runRuleInspection">仅运行规则巡检</button><button class="btn primary" data-go="confirm">查看审批</button></div>`}
 
 function confirmCardShell(category,type,ref,suggest,evidence,fields,risk,by,after,actions,color='muted'){return `<div class="confirm-card" data-confirm-type="${esc(category)}"><div class="cc-head"><span class="tag ${color}">${esc(type)}</span><span class="demo-note">${esc(ref||'')}</span></div><div class="cc-grid"><span class="cc-k">系统建议</span><span class="cc-v">${esc(suggest||'—')}</span><span class="cc-k">影响字段</span><span class="cc-v">${esc(fields||'—')}</span><span class="cc-k">风险</span><span class="cc-v">${esc(risk||'—')}</span><span class="cc-k">发起方</span><span class="cc-v">${esc(by||'—')}</span><span class="cc-k">确认后</span><span class="cc-v">${esc(after||'—')}</span></div><div class="cc-evidence">${esc(evidence||'暂无证据摘要')}</div><div class="row-actions" style="margin-top:12px">${actions}</div></div>`}
 function confirmReviewCard(x){const c=x.candidate||safeJson(x.candidate_json,{});const fields=(c.fields||[]).map(f=>fieldLabel(f.field_name)).join('、')||'订单字段候选';const suggest=(c.fields||[]).map(f=>`${fieldLabel(f.field_name)}：${f.normalized_value??'—'}`).join('；')||'查看AI提取的字段变化';const risk=(c.risk_signals||[])[0]?.risk_level||'需人工确认';const actions=x.status==='PENDING'?`<button class="btn primary" data-review-confirm="${esc(x.review_id)}">确认</button><button class="btn ghost" data-review-reject="${esc(x.review_id)}">驳回</button><button class="btn link" data-review-open="${esc(x.review_id)}">查看详情</button>`:`<button class="btn link" data-review-open="${esc(x.review_id)}">查看详情</button>`;return confirmCardShell('数据变更','消息字段变更',x.order_no||x.review_id,suggest,x.raw_content,fields,risk,automationLabel(x.workflow_source),'写回已确认字段并重新生成行动排序',actions,x.status==='PENDING'?'amber':'green')}
@@ -342,66 +385,6 @@ function agentRunTrace(run,calls=[]){
   return `<div class="agent-trace-head"><div><span>${mode==='COZE_AGENT'?'Coze Agent运行':'规则巡检运行'}</span><strong>${esc(run.run_id)}</strong></div><div><span>停止原因</span><strong>${esc(run.stop_reason||run.status||'运行中')}</strong></div><div><span>耗时</span><strong>${run.duration_ms==null?'—':`${Number(run.duration_ms)}ms`}</strong></div></div><ol class="agent-trace-list">${steps||'<li><b>1</b><div><strong>运行记录已创建</strong><small>暂无工具调用明细</small></div></li>'}</ol>`
 }
 
-
-const agentJobPollRegistry=new Map();
-const waitForAgentPoll=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-function agentJobProgressText(job){
-  if(job?.status==='QUEUED')return job.message||'Agent任务已进入后台队列';
-  if(job?.status==='RUNNING')return job.message||'Agent正在理解目标、选择工具并检索证据';
-  if(job?.status==='COMPLETED')return job.message||'Agent诊断已完成';
-  if(job?.status==='FAILED')return job.error_message||job.message||'Agent诊断未完成';
-  return job?.message||'正在查询Agent任务状态…';
-}
-async function pollConversationJob(root,localConversationId,jobId){
-  if(!jobId)return;
-  const pollKey=`${localConversationId}:${jobId}`;
-  if(agentJobPollRegistry.has(pollKey))return agentJobPollRegistry.get(pollKey);
-  const pollTask=(async()=>{
-    let consecutiveErrors=0;
-    while(true){
-      if(route.name!=='agent'||!root?.isConnected)return;
-      const conversation=loadAgentConversations().find(x=>x.id===localConversationId);
-      if(!conversation||conversation.last_job_id!==jobId)return;
-      const statusEl=$('#agentLiveStatus',root);
-      const sendButton=$('#askAgent',root);
-      if(sendButton)sendButton.disabled=true;
-      try{
-        const job=await api(`/api/agent/chat/jobs/${encodeURIComponent(jobId)}`,{timeoutMs:15000});
-        consecutiveErrors=0;
-        if(statusEl)statusEl.textContent=agentJobProgressText(job);
-        if(job.status==='COMPLETED'){
-          await renderRoute(false);
-          toast('Agent运行完成','success');
-          return;
-        }
-        if(job.status==='FAILED'){
-          if(sendButton)sendButton.disabled=false;
-          await renderRoute(false);
-          toast(job.error_message||'Agent运行未完成','error');
-          return;
-        }
-        if(!['QUEUED','RUNNING'].includes(job.status)){
-          if(sendButton)sendButton.disabled=false;
-          if(statusEl)statusEl.textContent=`未知任务状态：${job.status||'—'}`;
-          return;
-        }
-        await waitForAgentPoll(job.status==='QUEUED'?1200:1600);
-      }catch(err){
-        consecutiveErrors+=1;
-        if(statusEl)statusEl.textContent=`状态查询暂时失败，正在重试（${consecutiveErrors}/4）`;
-        if(consecutiveErrors>=4){
-          if(sendButton)sendButton.disabled=false;
-          toast(`Agent任务已经提交，但状态查询失败：${err.message}`,'error');
-          return;
-        }
-        await waitForAgentPoll(1200*consecutiveErrors);
-      }
-    }
-  })().finally(()=>agentJobPollRegistry.delete(pollKey));
-  agentJobPollRegistry.set(pollKey,pollTask);
-  return pollTask;
-}
-
 async function pageAgent(root){
   const role=currentUser()==='MANAGER-1'?'manager':'operator';
   let conversations=loadAgentConversations();if(!conversations.length){conversations=[newAgentConversation()];saveAgentConversations(conversations)}
@@ -414,19 +397,19 @@ async function pageAgent(root){
   ]);
   updateBadges(null,null,data.summary.candidate_count);
   const latest=data.reports?.[0]?.report||null;const latestRun=trace?.run||data.latest_run;const latestCalls=trace?.tool_calls||data.latest_tool_calls||[];const cozeConfigured=!!status.coze_agent?.configured;
-  if(job?.status==='COMPLETED'&&active.last_processed_job_id!==job.job_id){const answer=job.result?.answer||'Agent已完成运行，请查看右侧结构化结果。';active.messages.push({role:'assistant',content:answer,time:job.completed_at||new Date().toISOString()});active.coze_conversation_id=job.conversation_id||job.result?.conversation_id||active.coze_conversation_id;active.last_run_id=job.linked_run_id||job.result?.run?.run_id||active.last_run_id;active.last_processed_job_id=job.job_id;active.updated_at=job.completed_at||new Date().toISOString();saveOneConversation(active);conversations=loadAgentConversations()}
+  if(job?.status==='COMPLETED'&&active.last_processed_job_id!==job.job_id){const answer=job.result?.answer||'Agent已完成运行，请查看右侧结构化结果。';active.messages.push({role:'assistant',content:answer,time:job.completed_at||new Date().toISOString()});active.coze_conversation_id=job.conversation_id||job.result?.conversation_id||active.coze_conversation_id;active.last_run_id=job.linked_run_id||job.result?.run?.run_id||active.last_run_id;const diagnosis=job.result?.diagnosis||{};if(job.result?.diagnosis)active.metrics={screened:Number(diagnosis.screened_order_count||0),risk:Number(diagnosis.risk_order_count||0),gaps:Number(diagnosis.information_gap_order_count||0)};active.last_processed_job_id=job.job_id;active.updated_at=job.completed_at||new Date().toISOString();saveOneConversation(active);conversations=loadAgentConversations()}
   if(latestRun?.run_id&&active.last_run_id===latestRun.run_id&&latest){active.metrics={screened:Number(latest.screened_order_count||0),risk:Number(latest.risk_order_count||0),gaps:Number(latest.information_gap_order_count||0)};saveOneConversation(active)}
   const metrics=active.metrics||{screened:Number(latest?.screened_order_count||0),risk:Number(latest?.risk_order_count||0),gaps:Number(latest?.information_gap_order_count||0)};
   root.innerHTML=`<div class="page-stack"><div class="agent-3col">
     <section class="panel" style="display:flex;flex-direction:column"><div class="panel-head"><button class="btn primary" id="newAgentConversation" style="height:30px;padding:0 10px">+ 新建会话</button></div><div class="panel-body"><div class="session-list" id="agentSessionList">${conversations.map(c=>agentSessionItem(c,c.id===active.id)).join('')}</div></div></section>
-    <section class="panel" style="display:flex;flex-direction:column"><div class="panel-head"><h3>对话与目标</h3></div><div class="panel-body" style="flex:1;display:flex;flex-direction:column"><div class="chat" id="agentChat">${agentMessagesHtml(active.messages)}</div><div id="agentLiveStatus" class="demo-note" style="margin-top:auto">${esc(job&&['QUEUED','RUNNING','FAILED'].includes(job.status)?agentJobProgressText(job):'')}</div><div class="chat-input"><input id="agentQuestion" type="text" placeholder="输入目标，例如：检查未来14天最需要处理的订单" ${cozeConfigured?'':'disabled'} /><button class="btn primary" id="askAgent" ${cozeConfigured?'':'disabled'}>发送</button></div></div></section>
+    <section class="panel" style="display:flex;flex-direction:column"><div class="panel-head"><h3>对话与目标</h3></div><div class="panel-body" style="flex:1;display:flex;flex-direction:column"><div class="chat" id="agentChat">${agentMessagesHtml(active.messages)}</div><div id="agentLiveStatus" class="demo-note" style="margin-top:auto"></div><div class="chat-input"><input id="agentQuestion" type="text" placeholder="输入目标，例如：检查未来14天最需要处理的订单" /><button class="btn primary" id="askAgent">发送</button></div></div></section>
     <section class="panel" style="display:flex;flex-direction:column"><div class="panel-head"><h3>本次运行结果</h3><span class="tag ${job?.status==='FAILED'?'danger':job?.status==='RUNNING'||job?.status==='QUEUED'?'warning':'success'}">${esc(job?.status==='RUNNING'?'运行中':job?.status==='QUEUED'?'排队中':job?.status==='FAILED'?'未完成':active.last_run_id?'已完成':'暂无运行')}</span></div><div class="panel-body" id="agentResultPanel">${agentStructuredResultHtml({active,job,latest,latestRun,latestCalls,status,metrics})}</div></section>
   </div></div>`;
   $('#newAgentConversation',root).onclick=()=>{const list=loadAgentConversations();const c=newAgentConversation();list.unshift(c);saveAgentConversations(list);localSet(agentActiveKey(),c.id);renderRoute(false)};
   $$('[data-agent-session]',root).forEach(b=>b.onclick=()=>{localSet(agentActiveKey(),b.dataset.agentSession);renderRoute(false)});
-  const send=async()=>{const input=$('#agentQuestion',root),question=input.value.trim();if(!question)return toast('请输入业务目标','error');active=loadAgentConversations().find(x=>x.id===active.id)||active;active.messages.push({role:'user',content:question,time:new Date().toISOString()});if(!active.title||active.title==='新会话')active.title=question.slice(0,24);active.updated_at=new Date().toISOString();saveOneConversation(active);$('#agentChat',root).innerHTML=agentMessagesHtml(active.messages);input.value='';$('#askAgent',root).disabled=true;$('#agentLiveStatus',root).textContent='正在创建Agent后台任务…';try{const created=await api('/api/agent/chat/jobs',{method:'POST',body:JSON.stringify({question,current_user_id:currentUser(),current_role:role,due_within_days:14,top_n:7,create_task_draft:true,create_approval_request:true,conversation_id:active.coze_conversation_id||null}),timeoutMs:15000});active.last_job_id=created.job_id;active.updated_at=new Date().toISOString();saveOneConversation(active);void pollConversationJob(root,active.id,created.job_id)}catch(e){$('#agentLiveStatus',root).textContent=e.message;$('#askAgent',root).disabled=false;toast(e.message,'error')}};
+  const send=async()=>{const input=$('#agentQuestion',root),question=input.value.trim();if(!question)return toast('请输入业务目标','error');active=loadAgentConversations().find(x=>x.id===active.id)||active;active.messages.push({role:'user',content:question,time:new Date().toISOString()});if(!active.title||active.title==='新会话')active.title=question.slice(0,24);active.updated_at=new Date().toISOString();saveOneConversation(active);$('#agentChat',root).innerHTML=agentMessagesHtml(active.messages);input.value='';$('#askAgent',root).disabled=true;$('#agentLiveStatus',root).textContent='正在创建Agent后台任务…';try{const created=await api('/api/agent/chat/jobs',{method:'POST',body:JSON.stringify({question,current_user_id:currentUser(),current_role:role,due_within_days:14,top_n:7,create_task_draft:true,create_approval_request:true,conversation_id:active.coze_conversation_id||null,previous_run_id:active.last_run_id||null}),timeoutMs:15000});active.last_job_id=created.job_id;active.updated_at=new Date().toISOString();saveOneConversation(active);pollConversationJob(root,active.id,created.job_id)}catch(e){$('#agentLiveStatus',root).textContent=e.message;$('#askAgent',root).disabled=false;toast(e.message,'error')}};
   $('#askAgent',root).onclick=send;$('#agentQuestion',root).onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
-  if(job&&['QUEUED','RUNNING'].includes(job.status))void pollConversationJob(root,active.id,job.job_id);
+  if(job&&['QUEUED','RUNNING'].includes(job.status))pollConversationJob(root,active.id,job.job_id);
   $('#runRuleInspection',root)?.addEventListener('click',async()=>{const b=$('#runRuleInspection',root);b.disabled=true;try{await api('/api/agent/inspection/run',{method:'POST',body:JSON.stringify({current_user_id:currentUser(),current_role:role,due_within_days:14,top_n:7,goal:'规则巡检未来14天订单',trigger_type:'MANUAL_RULE'}),timeoutMs:120000});cache={operators:cache.operators};toast('规则巡检完成','success');renderRoute(false)}catch(e){toast(e.message,'error')}finally{b.disabled=false}});
   bindRouteButtons(root)
 }

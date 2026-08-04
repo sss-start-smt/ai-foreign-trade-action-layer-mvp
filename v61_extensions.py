@@ -12,9 +12,10 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 import agent_api
+from action_rules import decide_task
 from analytics import build_analytics_summary, ensure_analytics_schema, track_event
 
-VERSION = "6.1.3.4"
+VERSION = "6.1.4.1"
 
 SAFE_ORDER_FIELDS = {
     "current_progress",
@@ -689,6 +690,53 @@ def confirm_bulk_updates_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _attach_shared_task_priority(conn, items: list[dict[str, Any]], actor: dict[str, Any]) -> list[dict[str, Any]]:
+    """Merge the shared FT04 task-action priority into order-level diagnosis.
+
+    Agent anomaly rules remain evidence signals, while waiting windows, deadlines,
+    responsibility and task action states come from the exact same decide_task()
+    function used by the normal task workspace.
+    """
+    current = agent_api.now_cn()
+    enriched: list[dict[str, Any]] = []
+    for item in items:
+        order_id = item.get("order_id")
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE related_order_id=? AND status!='DONE' ORDER BY updated_at DESC",
+            (order_id,),
+        ).fetchall() if order_id else []
+        evaluated: list[dict[str, Any]] = []
+        for row in rows:
+            task = dict(row)
+            effective_user = (task.get("owner_user_id") or actor["current_user_id"]) if agent_api.is_manager(actor["current_user_id"], actor["current_role"]) else actor["current_user_id"]
+            evaluated.append(decide_task(task, current, effective_user))
+        actionable = [x for x in evaluated if not x.get("ranking_suppressed") and x.get("action_state") not in {"DONE", "NOT_MY_RESPONSIBILITY"}]
+        top_task = max(actionable, key=lambda x: float(x.get("priority_score") or 0), default=None)
+        anomaly_score = float(item.get("priority_score") or 0)
+        task_score = max(0.0, float(top_task.get("priority_score") or 0)) if top_task else 0.0
+        combined = round(anomaly_score + task_score, 2)
+        reasons = list(item.get("priority_reasons") or [])
+        if top_task:
+            for reason in top_task.get("priority_reasons") or []:
+                if reason not in reasons:
+                    reasons.append(reason)
+        enriched.append({
+            **item,
+            "anomaly_priority_score": anomaly_score,
+            "task_priority_score": task_score,
+            "priority_score": combined,
+            "task_action_state": top_task.get("action_state") if top_task else None,
+            "top_task_id": top_task.get("task_id") if top_task else None,
+            "top_task_title": top_task.get("title") if top_task else None,
+            "priority_reasons": reasons[:5],
+            "ranking_rule_version": "FT04_SHARED_V1",
+        })
+    enriched.sort(key=lambda x: (-float(x.get("priority_score") or 0), str(x.get("order_no") or "")))
+    for index, item in enumerate(enriched, 1):
+        item["rank"] = index
+    return enriched
+
 def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
     """Composite diagnosis: one Agent tool call performs screening, evidence lookup,
     anomaly creation and deterministic Top-N ranking.
@@ -710,7 +758,7 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
         all_candidates.extend(result["items"])
     # V6.1.3: information gaps are reported separately and never pad the risk Top N.
     aggregated = agent_api.aggregate_order_candidates(all_candidates, top_n)
-    ranked = aggregated["risk_items"]
+    ranked = _attach_shared_task_priority(conn, aggregated["risk_items"], actor)
     information_gaps = aggregated["information_gaps"]
 
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -727,10 +775,11 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
         "items": ranked,
         "selection_strategy": {
             "candidate_pool": "当前用户有权限的活跃订单，满足未来时间窗口或承诺超时、高风险任务、客户确认阻塞、高风险消息、物流异常任一条件",
-            "ranking": "先过滤信息缺口，再按异常基础分与严重程度排序；同订单异常聚合，多异常订单加分；同分按订单号稳定排序",
+            "ranking": "先过滤信息缺口；异常规则生成证据信号，再叠加与今日工作台共用的FT04任务行动分数（等待窗口、截止、责任、确认状态）；同分按订单号稳定排序",
             "not_padded": True,
             "max_items": 7,
             "unit": "unique_order",
+            "ranking_rule_version": "FT04_SHARED_V1",
         },
         "human_confirmation_required": True,
         "duration_ms": duration_ms,
