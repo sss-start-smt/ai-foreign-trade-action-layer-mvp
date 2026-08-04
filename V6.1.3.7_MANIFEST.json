@@ -1,0 +1,12 @@
+{
+  "version": "6.1.3.7",
+  "base": "6.1.3.6",
+  "visual_reference": "preview-pages(4).html",
+  "styles_source": "user_uploaded_styles.css",
+  "database_migration": false,
+  "files": {
+    "static/index.html": "cda354127fb022de2022f49902750dd6e68f3255af16d5dfc92bf2ad30712454",
+    "static/app.js": "6a546d426944908510418fc74437ac8b115b73b3820996ae3c2d69b71b9c5b30",
+    "static/styles.css": "479dbac3eb133c74a1e6134e224c627356579a3de135ff3d70bdde72eb3e3a23"
+  }
+}

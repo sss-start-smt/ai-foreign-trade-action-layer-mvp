@@ -48,7 +48,7 @@ const riskLabels={critical:'严重',high:'高风险',medium:'中风险',low:'低
 const readinessLabels={BASE_ONLY:'仅有基础订单',NEEDS_STATUS:'待补充进展',READY_FOR_RANKING:'可生成行动',ACTION_GENERATED:'已有行动',CLOSED:'已完成'};
 const contactStatusLabels={NOT_CONTACTED:'尚未联系',WAITING_REPLY:'已联系，等待回复',REPLIED:'已收到回复',UNKNOWN:'不清楚'};
 const draftTypeLabels={CUSTOMER_REPLY:'客户回复',CUSTOMER_CONFIRMATION_REMINDER:'催客户确认',SUPPLIER_PROGRESS_FOLLOWUP:'催工厂进度',DELIVERY_STATUS_REPLY:'回复交期状态',CHANGE_HISTORY_SUMMARY:'汇总客户变更'};
-const FRONTEND_VERSION='6.1.3.6-visual-fidelity';
+const FRONTEND_VERSION='6.1.3.7-visual-fidelity';
 const pageMeta={
   today:['TODAY WORKBENCH','今日工作台'],
   agent:['AGENT ASSISTANT','Agent助手'],
