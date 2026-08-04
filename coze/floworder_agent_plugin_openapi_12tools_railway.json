@@ -490,7 +490,7 @@
       "post": {
         "operationId": "create_task_draft",
         "summary": "生成任务草稿",
-        "description": "只生成DRAFT，不创建正式任务。",
+        "description": "生成任务草稿；标准巡检可在同一次工具调用中同时创建关联人工审批，仍不会创建正式任务。",
         "requestBody": {
           "required": true,
           "content": {
@@ -568,6 +568,15 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "create_approval_request": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "是否在同一次调用中为CREATE_TASK创建关联人工审批，减少Agent往返次数"
+                  },
+                  "approval_idempotency_key": {
+                    "type": "string",
+                    "description": "可选审批幂等键；未提供时按run_id与order_id生成"
                   }
                 },
                 "required": [

@@ -237,6 +237,9 @@ def build_trusted_agent_question(question: str, identity: dict[str, Any], parame
         "default_top_n": parameters["default_top_n"],
         "create_task_draft": parameters["create_task_draft"],
         "create_approval_request": parameters["create_approval_request"],
+        "run_id": parameters.get("run_id"),
+        "run_managed_by_backend": bool(parameters.get("run_managed_by_backend")),
+        "response_mode": parameters.get("response_mode") or "COMPACT",
     }
     return (
         "[FLOWORDER_SYSTEM_CONTEXT_BEGIN]\n"
@@ -248,7 +251,10 @@ def build_trusted_agent_question(question: str, identity: dict[str, Any], parame
         f"{question}\n"
         "[USER_BUSINESS_GOAL_END]\n\n"
         "执行要求：按系统上下文中的身份范围调用工具；对业务用户使用姓名和角色表达，"
-        "除调试外不要展示USER-1等内部ID。"
+        "除调试外不要展示USER-1等内部ID。若run_managed_by_backend=true，直接使用run_id，"
+        "不要调用start_agent_run或complete_agent_run。标准风险巡检优先采用两步快速链路："
+        "diagnose_priority_orders → create_task_draft（需要审批时在同一次调用中创建）。最终回答保持精简，"
+        "网站会展示完整订单卡片，不要重复逐笔展开所有字段。"
     )
 
 
@@ -910,6 +916,7 @@ def _execute_agent_chat_job(
     parameters: dict[str, Any],
     agent_question: str,
     started_at: str,
+    run_id: str | None = None,
 ) -> None:
     """Run a Coze Agent chat outside the browser request lifecycle.
 
@@ -934,14 +941,63 @@ def _execute_agent_chat_job(
         )
         with db() as conn:
             latest = conn.execute(
-                """SELECT run_id,status,stop_reason,created_at,completed_at
-                   FROM agent_runs WHERE current_user_id=? AND created_at>=?
+                "SELECT * FROM agent_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone() if run_id else conn.execute(
+                """SELECT * FROM agent_runs WHERE current_user_id=? AND created_at>=?
                    ORDER BY created_at DESC LIMIT 1""",
                 (user_id, started_at),
             ).fetchone()
+            total_duration_ms = int((time.perf_counter() - started_perf) * 1000)
+            if latest and latest["status"] in {"RUNNING", "PARTIAL"}:
+                stop_reason = "BACKEND_MANAGED_AGENT_COMPLETED" if latest["status"] == "RUNNING" else (latest["stop_reason"] or "PARTIAL_RESULT")
+                final_status = "COMPLETED" if latest["status"] == "RUNNING" else latest["status"]
+                compact_result = {
+                    "answer": result.get("answer"),
+                    "conversation_id": result.get("conversation_id"),
+                    "usage": result.get("usage") or {},
+                    "backend_managed_run": True,
+                }
+                conn.execute(
+                    """UPDATE agent_runs SET status=?,result_json=?,stop_reason=?,duration_ms=?,completed_at=?
+                       WHERE run_id=?""",
+                    (final_status, json.dumps(compact_result, ensure_ascii=False), stop_reason,
+                     total_duration_ms, iso(), latest["run_id"]),
+                )
+                log_tool_call(
+                    conn,
+                    run_id=latest["run_id"],
+                    tool_name="backend_finalize_agent_run",
+                    request={"job_id": job_id},
+                    response={"status": final_status, "stop_reason": stop_reason},
+                    status="SUCCESS",
+                    duration_ms=0,
+                )
+                latest = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (latest["run_id"],)).fetchone()
+            performance_metrics = {
+                "total_duration_ms": total_duration_ms,
+                "tool_call_count": 0,
+                "backend_tool_duration_ms": 0,
+                "agent_orchestration_duration_ms": total_duration_ms,
+            }
+            if latest:
+                perf_row = conn.execute(
+                    """SELECT COUNT(*) AS call_count,COALESCE(SUM(duration_ms),0) AS backend_ms
+                       FROM agent_tool_calls WHERE run_id=? AND tool_name!='backend_finalize_agent_run'""",
+                    (latest["run_id"],),
+                ).fetchone()
+                backend_ms = int(perf_row["backend_ms"] or 0)
+                performance_metrics = {
+                    "total_duration_ms": total_duration_ms,
+                    "tool_call_count": int(perf_row["call_count"] or 0),
+                    "backend_tool_duration_ms": backend_ms,
+                    "agent_orchestration_duration_ms": max(0, total_duration_ms - backend_ms),
+                }
             payload = {
                 **result,
                 "execution_mode": "COZE_AGENT",
+                "performance_profile": "FAST_STANDARD_DIAGNOSIS",
+                "performance_metrics": performance_metrics,
                 "run": dict(latest) if latest else None,
                 "resolved_identity": {
                     "current_user_id": identity["current_user_id"],
@@ -957,8 +1013,8 @@ def _execute_agent_chat_job(
                 (
                     json.dumps(payload, ensure_ascii=False),
                     result.get("conversation_id"),
-                    latest["run_id"] if latest else None,
-                    int((time.perf_counter() - started_perf) * 1000),
+                    latest["run_id"] if latest else run_id,
+                    total_duration_ms,
                     iso(),
                     iso(),
                     job_id,
@@ -967,11 +1023,18 @@ def _execute_agent_chat_job(
             conn.commit()
     except Exception as exc:  # Background jobs must persist failures for polling.
         with db() as conn:
+            failed_duration_ms = int((time.perf_counter() - started_perf) * 1000)
             conn.execute(
                 """UPDATE agent_chat_jobs SET status='FAILED',error_message=?,duration_ms=?,completed_at=?,updated_at=?
                    WHERE job_id=?""",
-                (str(exc), int((time.perf_counter() - started_perf) * 1000), iso(), iso(), job_id),
+                (str(exc), failed_duration_ms, iso(), iso(), job_id),
             )
+            if run_id:
+                conn.execute(
+                    """UPDATE agent_runs SET status='FAILED',stop_reason='COZE_AGENT_FAILED',duration_ms=?,completed_at=?
+                       WHERE run_id=? AND status IN ('RUNNING','PARTIAL')""",
+                    (failed_duration_ms, iso(), run_id),
+                )
             conn.commit()
 
 
@@ -1007,9 +1070,9 @@ def register_agent_api(app) -> None:
                    WHERE trigger_type NOT LIKE '%RULE%' ORDER BY created_at DESC LIMIT 1"""
             ).fetchone()
         return {
-            "version": "6.1.3.3",
+            "version": "6.1.3.4",
             "agent_name": "FlowOrder订单异常诊断Agent",
-            "backend": {"online": True, "version": "6.1.3.3"},
+            "backend": {"online": True, "version": "6.1.3.4"},
             "coze_agent": {
                 "configured": coze["configured"],
                 "state": "CONFIGURED" if coze["configured"] else "NOT_CONFIGURED",
@@ -1024,6 +1087,12 @@ def register_agent_api(app) -> None:
             "composite_tools": ["parse_bulk_order_updates", "diagnose_priority_orders"],
             "analytics_enabled": True,
             "async_agent_chat": {"available": True, "polling": True, "stream_timeout_seconds": COZE_AGENT_TIMEOUT_SECONDS},
+            "performance_profile": {
+                "name": "FAST_STANDARD_DIAGNOSIS",
+                "backend_managed_run": True,
+                "standard_agent_tool_turns": 2,
+                "compact_final_answer": True,
+            },
         }
 
     # ---- Coze plugin tools (API-key protected) ----
@@ -1114,13 +1183,62 @@ def register_agent_api(app) -> None:
                 "evidence": body.get("evidence") or [], "status": "DRAFT", "requires_approval": True,
             }
             audit_event(conn, "task_draft", draft_id, "AGENT_TASK_DRAFT_CREATED", task, a["current_user_id"])
+            approval = None
+            create_linked_approval = bool(body.get("create_approval_request"))
+            if not create_linked_approval and body.get("run_id"):
+                linked_job = conn.execute(
+                    """SELECT request_json FROM agent_chat_jobs WHERE linked_run_id=?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (body.get("run_id"),),
+                ).fetchone()
+                if linked_job:
+                    linked_request = safe_json(linked_job["request_json"], {})
+                    create_linked_approval = bool(linked_request.get("create_approval_request"))
+            if create_linked_approval:
+                approval_payload = {
+                    **body,
+                    **a,
+                    "task_draft_id": draft_id,
+                    "order_id": order["order_id"],
+                    "action_type": "CREATE_TASK",
+                    "action_payload": {
+                        "task_draft_id": draft_id,
+                        "order_id": order["order_id"],
+                        "title": task["title"],
+                        "recommended_action": task["recommended_action"],
+                        "target": task["target"],
+                        "owner_user_id": task["owner_user_id"],
+                        "risk_level": task["risk_level"],
+                        "business_deadline": task["business_deadline"],
+                        "evidence": task["evidence"],
+                    },
+                    "idempotency_key": body.get("approval_idempotency_key") or f"CREATE_TASK:{body.get('run_id')}:{order['order_id']}",
+                    "high_risk": str(task["risk_level"]).lower() in {"high", "critical"},
+                }
+                approval = create_approval_logic(conn, approval_payload)
+                task.update({
+                    "approval_id": approval.get("approval_id"),
+                    "approval_status": approval.get("status"),
+                    "approval_required_role": approval.get("required_role"),
+                    "approval_duplicate_skipped": bool(approval.get("duplicate_skipped")),
+                })
+                track_event(
+                    conn, "approval_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
+                    user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool_fast_path",
+                    properties={"approval_id": approval.get("approval_id"), "action_type": "CREATE_TASK",
+                                "required_role": approval.get("required_role"), "duplicate_skipped": bool(approval.get("duplicate_skipped"))},
+                )
             log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_task_draft",
-                          request={"order_id": order["order_id"], "title": task["title"]},
-                          response={"task_draft_id": draft_id, "status": "DRAFT"}, status="SUCCESS", duration_ms=0)
+                          request={"order_id": order["order_id"], "title": task["title"],
+                                   "create_approval_request": create_linked_approval},
+                          response={"task_draft_id": draft_id, "status": "DRAFT",
+                                    "approval_id": task.get("approval_id"), "approval_status": task.get("approval_status")},
+                          status="SUCCESS", duration_ms=0)
             track_event(
                 conn, "task_draft_created", organization_id=a["organization_id"], user_id=a["current_user_id"],
                 user_role=a["current_role"], order_id=order["order_id"], run_id=body.get("run_id"), source="agent_tool",
-                properties={"task_draft_id": draft_id, "risk_level": task["risk_level"], "requires_approval": True},
+                properties={"task_draft_id": draft_id, "risk_level": task["risk_level"], "requires_approval": True,
+                            "approval_id": task.get("approval_id")},
             )
             conn.commit()
         return task
@@ -1272,6 +1390,9 @@ def register_agent_api(app) -> None:
         identity = resolve_chat_identity(body)
         user_id = identity["current_user_id"]
         role = identity["current_role"]
+        job_id = new_id("AJOB")
+        run_id = new_id("AGR")
+        created_at = iso()
         parameters = {
             "organization_id": identity["organization_id"],
             "current_user_id": user_id,
@@ -1283,10 +1404,11 @@ def register_agent_api(app) -> None:
             "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
             "create_task_draft": bool(body.get("create_task_draft", True)),
             "create_approval_request": bool(body.get("create_approval_request", True)),
+            "run_id": run_id,
+            "run_managed_by_backend": True,
+            "response_mode": "COMPACT",
         }
         agent_question = build_trusted_agent_question(question, identity, parameters)
-        job_id = new_id("AJOB")
-        created_at = iso()
         with db() as conn:
             # Prevent accidental double-clicks from spawning identical live jobs.
             existing = conn.execute(
@@ -1298,10 +1420,23 @@ def register_agent_api(app) -> None:
             if existing:
                 return _agent_chat_job_payload(existing)
             conn.execute(
+                """INSERT INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
+                   max_tool_calls,max_duration_seconds,started_at,created_at)
+                   VALUES(?,?,?,?,?,'USER_BACKEND_MANAGED','RUNNING',?,?,?,?)""",
+                (run_id, identity["organization_id"], user_id, role, question,
+                 AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, created_at, created_at),
+            )
+            track_event(
+                conn, "agent_run_started", organization_id=identity["organization_id"], user_id=user_id,
+                user_role=role, run_id=run_id, source="website_agent_job",
+                properties={"goal": question[:120], "trigger_type": "USER_BACKEND_MANAGED",
+                            "performance_profile": "FAST_STANDARD_DIAGNOSIS"},
+            )
+            conn.execute(
                 """INSERT INTO agent_chat_jobs(
-                   job_id,organization_id,current_user_id,current_role,question,status,request_json,
+                   job_id,organization_id,current_user_id,current_role,question,status,request_json,linked_run_id,
                    created_at,updated_at)
-                   VALUES(?,?,?,?,?,'QUEUED',?,?,?)""",
+                   VALUES(?,?,?,?,?,'QUEUED',?,?,?,?)""",
                 (
                     job_id,
                     identity["organization_id"],
@@ -1309,6 +1444,7 @@ def register_agent_api(app) -> None:
                     role,
                     question,
                     json.dumps(body, ensure_ascii=False),
+                    run_id,
                     created_at,
                     created_at,
                 ),
@@ -1324,6 +1460,7 @@ def register_agent_api(app) -> None:
                 "parameters": parameters,
                 "agent_question": agent_question,
                 "started_at": created_at,
+                "run_id": run_id,
             },
             daemon=True,
             name=f"floworder-agent-{job_id}",
@@ -1361,6 +1498,8 @@ def register_agent_api(app) -> None:
             "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
             "create_task_draft": bool(body.get("create_task_draft", True)),
             "create_approval_request": bool(body.get("create_approval_request", True)),
+            "run_managed_by_backend": False,
+            "response_mode": "COMPACT",
         }
         agent_question = build_trusted_agent_question(question, identity, parameters)
         started_at = iso()

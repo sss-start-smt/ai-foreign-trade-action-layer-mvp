@@ -135,7 +135,7 @@ def test_status_exposes_backend_agent_and_rule_modes_separately():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.3"
+    assert data["version"] == "6.1.3.4"
     assert data["backend"]["online"] is True
     assert data["rule_inspection"]["available"] is True
     assert data["rule_inspection"]["silent_fallback"] is False
@@ -273,6 +273,138 @@ def test_status_advertises_async_agent_chat():
     response = client.get("/api/agent/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["version"] == "6.1.3.3"
+    assert data["version"] == "6.1.3.4"
     assert data["async_agent_chat"]["available"] is True
     assert data["async_agent_chat"]["polling"] is True
+
+
+def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
+    import time
+    captured = {}
+
+    def fake_run_agent_chat(*, user_id, question, parameters, conversation_id=None, timeout_seconds=90):
+        captured["question"] = question
+        captured["parameters"] = parameters
+        return {
+            "answer": "发现2笔风险订单，最高优先级为PO-1。",
+            "reasoning_summary": "",
+            "conversation_id": "CONV-FAST",
+            "duration_ms": 20,
+            "usage": {},
+        }
+
+    monkeypatch.setattr(agent_api, "run_agent_chat", fake_run_agent_chat)
+    created = client.post(
+        "/api/agent/chat/jobs",
+        json={
+            "question": "检查我未来14天内最需要处理的订单。",
+            "current_user_id": "USER-1",
+            "due_within_days": 14,
+            "top_n": 7,
+            "create_task_draft": True,
+            "create_approval_request": True,
+        },
+    )
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    run_id = created.json()["linked_run_id"]
+    assert run_id.startswith("AGR-")
+
+    completed = None
+    for _ in range(30):
+        polled = client.get(f"/api/agent/chat/jobs/{job_id}")
+        if polled.json()["status"] == "COMPLETED":
+            completed = polled.json()
+            break
+        time.sleep(0.02)
+    assert completed is not None
+    assert captured["parameters"]["run_id"] == run_id
+    assert captured["parameters"]["run_managed_by_backend"] is True
+    assert captured["parameters"]["response_mode"] == "COMPACT"
+    assert '"run_managed_by_backend":true' in captured["question"]
+    assert "不要调用start_agent_run或complete_agent_run" in captured["question"]
+    with db() as conn:
+        run = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+        calls = conn.execute("SELECT tool_name FROM agent_tool_calls WHERE run_id=?", (run_id,)).fetchall()
+    assert run["status"] == "COMPLETED"
+    assert run["stop_reason"] == "BACKEND_MANAGED_AGENT_COMPLETED"
+    assert "backend_finalize_agent_run" in {x[0] for x in calls}
+
+
+def test_task_draft_can_create_linked_approval_in_same_tool_call():
+    started = client.post(
+        "/api/agent/tools/runs/start",
+        headers=HEADERS,
+        json={"current_user_id": "USER-1", "current_role": "operator", "goal": "性能快速链路测试"},
+    )
+    assert started.status_code == 200, started.text
+    run_id = started.json()["run_id"]
+    response = client.post(
+        "/api/agent/tools/task-drafts/create",
+        headers=HEADERS,
+        json={
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "run_id": run_id,
+            "order_id": "ORD-1001",
+            "title": "确认工厂实际进度",
+            "recommended_action": "联系工厂确认进度与补救方案",
+            "risk_level": "high",
+            "evidence": ["距离交期较近", "进度偏低"],
+            "create_approval_request": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["task_draft_id"].startswith("TDRAFT-")
+    assert data["approval_id"].startswith("APR-")
+    assert data["approval_status"] == "PENDING"
+    with db() as conn:
+        approval = conn.execute("SELECT * FROM approval_requests WHERE approval_id=?", (data["approval_id"],)).fetchone()
+        calls = conn.execute("SELECT tool_name FROM agent_tool_calls WHERE run_id=?", (run_id,)).fetchall()
+    assert approval is not None
+    assert approval["action_type"] == "CREATE_TASK"
+    assert [x[0] for x in calls].count("create_task_draft") == 1
+    assert "create_approval_request" not in [x[0] for x in calls]
+
+
+def test_status_advertises_fast_standard_diagnosis_profile():
+    response = client.get("/api/agent/status")
+    assert response.status_code == 200
+    profile = response.json()["performance_profile"]
+    assert profile["backend_managed_run"] is True
+    assert profile["standard_agent_tool_turns"] == 2
+    assert profile["compact_final_answer"] is True
+
+
+def test_backend_managed_job_option_can_trigger_linked_approval_without_plugin_schema_change():
+    run_id = "AGR-FAST-IMPLICIT"
+    now = agent_api.iso()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
+               max_tool_calls,max_duration_seconds,started_at,created_at)
+               VALUES(?,?,?,?,?,'USER_BACKEND_MANAGED','RUNNING',?,?,?,?)""",
+            (run_id, "ORG-DEMO", "USER-1", "operator", "隐式审批测试", 8, 120, now, now),
+        )
+        conn.execute(
+            """INSERT INTO agent_chat_jobs(job_id,organization_id,current_user_id,current_role,question,status,
+               request_json,linked_run_id,created_at,updated_at)
+               VALUES('AJOB-IMPLICIT','ORG-DEMO','USER-1','operator','测试','RUNNING',?,?,?,?)""",
+            ('{"create_approval_request":true}', run_id, now, now),
+        )
+        conn.commit()
+    response = client.post(
+        "/api/agent/tools/task-drafts/create",
+        headers=HEADERS,
+        json={
+            "current_user_id": "USER-1",
+            "current_role": "operator",
+            "run_id": run_id,
+            "order_id": "ORD-1001",
+            "title": "确认工厂进度",
+            "risk_level": "high",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["approval_id"].startswith("APR-")

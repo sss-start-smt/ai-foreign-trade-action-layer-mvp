@@ -1,0 +1,16 @@
+event_name,类别,触发时机,关键properties,用途
+order_import_started,产品行为,用户确认提交导入批次,batch_id|total_rows|importable_rows,导入漏斗起点
+order_import_completed,产品行为,订单成功写入数据库,created_count|updated_count|skipped_count|failed_count,导入成功率
+order_import_failed,系统质量,导入事务失败,batch_id|error_type,定位导入故障
+bulk_update_submitted,产品行为,用户或Agent提交一段批量进展文本,text_length|segment_count,验证自然语言更新需求
+bulk_update_parsed,AI效果,系统完成订单匹配和字段提取,matched_order_count|candidate_field_count|unmatched_segment_count|high_risk_field_count|duration_ms,解析效果和耗时
+bulk_update_confirmed,AI效果,用户确认/编辑/拒绝候选,accepted_count|edited_count|rejected_count|approval_created_count|updated_order_count,候选采用率
+bulk_update_rejected,AI效果,用户拒绝部分候选,batch_id|rejected_count,分析错误类型
+agent_run_started,系统质量,Agent创建运行记录,goal|trigger_type,运行漏斗起点
+priority_diagnosis_completed,AI效果,组合工具完成Top7诊断,screened_order_count|anomaly_candidate_count|top_count|duration_ms,诊断覆盖与性能
+agent_run_completed,系统质量,Agent正常完成,status|stop_reason|duration_ms|final_response_generated,成功率和耗时
+agent_run_timeout,系统质量,达到工具或时间上限,reason|tool_call_count|elapsed_seconds|approval_created|final_response_generated,超时与结果缺失
+anomaly_result_viewed,产品行为,用户查看异常结果,candidate_count,结果消费情况
+task_draft_created,AI效果,生成任务草稿,task_draft_id|risk_level|requires_approval,诊断到行动转化
+approval_created,AI效果,创建人工审批请求,approval_id|action_type|required_role|duplicate_skipped,行动闭环
+approval_decided,AI效果,人工通过或拒绝审批,approval_id|decision|status|action_type,审批采用率

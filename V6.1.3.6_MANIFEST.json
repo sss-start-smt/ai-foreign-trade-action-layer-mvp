@@ -1,0 +1,14 @@
+{
+  "version": "6.1.3.6",
+  "base_backend": "6.1.3.4",
+  "replaces_frontend": "6.1.3.5",
+  "visual_reference": "preview-pages(4).html",
+  "files": {
+    "static/index.html": "c840adb16b52b7eddf0c4aefcb4ec664641f91039dd0f5e57efcecc70f7da406",
+    "static/app.js": "4d86351d5725e0eeddae0ebd721e4f5bcbb7e3e92a7d3e3a96fe0567be56188f",
+    "static/styles.css": "8548dd489911f01cf45b1184d7d501abec69caca7c81f2a7307c9248545e8a0f"
+  },
+  "styles_css_unchanged": true,
+  "reference_visual_tokens_preserved": true,
+  "nav_icon_intrinsic_size_guard": "18px"
+}
