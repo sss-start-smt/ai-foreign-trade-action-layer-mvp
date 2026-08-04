@@ -1,0 +1,33 @@
+{
+  "release": "6.1.3.5-ui-freeze",
+  "base_backend_release": "6.1.3.4",
+  "visual_reference": "preview-pages(4).html",
+  "files_to_replace": [
+    "static/index.html",
+    "static/app.js"
+  ],
+  "files_intentionally_not_included": [
+    "static/styles.css",
+    "main.py",
+    "agent_api.py",
+    "v61_extensions.py",
+    "schema.sql"
+  ],
+  "visual_lock": {
+    "colors_changed": false,
+    "fonts_changed": false,
+    "layout_changed": false,
+    "unnecessary_cards_added": false,
+    "styles_css_sha256": "8548dd489911f01cf45b1184d7d501abec69caca7c81f2a7307c9248545e8a0f",
+    "only_reference_css_difference": "nav icon container constrained to 18x18px to correct SVG overflow"
+  },
+  "features": [
+    "first-entry order-base screen",
+    "Excel/CSV order base import entry",
+    "real dashboard, task, order, message and confirmation data",
+    "Agent conversation list and browser short-term memory",
+    "Coze conversation_id continuation",
+    "role-aware management navigation",
+    "real system/Agent/scheduler status"
+  ]
+}

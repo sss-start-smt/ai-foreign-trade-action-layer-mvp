@@ -5,36 +5,175 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#092923" />
   <meta name="color-scheme" content="light" />
-  <title>AI外贸跟单行动系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=6.1.3.3" />
+  <title>FlowOrder · AI外贸跟单行动系统</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=6.1.3.4" />
+  <style>
+    .proto-banner{position:sticky;top:0;z-index:300;display:flex;align-items:center;gap:10px;justify-content:center;
+      padding:9px 14px;background:var(--ink);color:#fff;font-size:12px;font-weight:600;letter-spacing:.01em;border-bottom:1px solid var(--line)}
+    .proto-banner b{color:var(--brand)}
+    .metric-grid{grid-template-columns:repeat(4,1fr)}
+    .page-stack{gap:24px}
+    .proto-2col{display:grid;grid-template-columns:1.55fr 1fr;gap:18px;align-items:start}
+    .proto-3col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;align-items:start}
+    @media(max-width:1080px){.proto-2col,.proto-3col{grid-template-columns:1fr}}
+
+    /* —— 模块分组小标题：细横线 + 大写小字，明确模块边界 —— */
+    .section-title{
+      display:flex;align-items:center;gap:10px;
+      font-size:11px;font-weight:600;letter-spacing:.08em;
+      text-transform:uppercase;color:var(--muted);
+      margin:6px 2px -10px;
+    }
+    .section-title::after{content:"";flex:1;height:1px;background:var(--line)}
+
+    /* —— 面板/卡片边框微调,让模块轮廓更利落 —— */
+    .panel,.order-card,.info-card,.risk-item,.result-card,.review-card,
+    .candidate-row,.integration-item,.context-chip,.meta-item,.channel-option label,
+    .activation-order,.permission-card,.ai-result,.agent-candidate-card,.agent-connection-card,
+    .approval-list>article,.information-gap-list article,
+    .confirm-card,.quick-entry,.session-item{
+      border-color:var(--line-strong);
+    }
+    .mini-chart{width:100%;height:200px;display:block}
+    .row-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .panel .panel-head{display:flex;align-items:center;justify-content:space-between}
+    .order-hero{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end;margin-top:6px}
+    .order-hero .stat{display:flex;flex-direction:column;gap:2px}
+    .order-hero .stat small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+    .order-hero .stat strong{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
+    .timeline{list-style:none;margin:0;padding:0}
+    .timeline li{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+    .timeline li:last-child{border-bottom:none}
+    .timeline .dot{width:9px;height:9px;border-radius:50%;margin-top:5px;background:var(--brand);flex:none}
+    .timeline .dot.muted{background:var(--muted-2)}
+    .demo-note{font-size:11px;color:var(--muted)}
+
+    /* —— 今日工作台：快捷入口 —— */
+    .quick-entries{display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 4px}
+    .quick-entry{display:flex;align-items:center;gap:8px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#fff;font-size:13px;font-weight:500;color:var(--ink);cursor:pointer;transition:border-color .15s var(--ease)}
+    .quick-entry:hover{border-color:var(--line-strong)}
+    .quick-entry .metric-icon{width:28px;height:28px;border-radius:8px;background:var(--surface-2);display:inline-flex;align-items:center;justify-content:center}
+
+    /* —— Agent 助手：三栏 —— */
+    .agent-3col{display:grid;grid-template-columns:230px 1fr 1fr;gap:18px;align-items:stretch;min-height:560px}
+    @media(max-width:1080px){.agent-3col{grid-template-columns:1fr}}
+    .session-list{display:flex;flex-direction:column;gap:8px}
+    .session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;text-align:left}
+    .session-item:hover{border-color:var(--line-strong)}
+    .session-item.active{border-color:var(--brand);background:var(--brand-soft)}
+    .session-item .s-when{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+    .session-item .s-title{font-size:13px;font-weight:500;color:var(--ink);margin-top:3px}
+    .chat{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+    .chat-bubble{max-width:86%;padding:10px 13px;border-radius:12px;font-size:13px;line-height:1.55}
+    .chat-bubble.user{align-self:flex-end;background:var(--brand);color:#fff;border-bottom-right-radius:4px}
+    .chat-bubble.agent{align-self:flex-start;background:var(--surface-2);color:var(--ink);border:1px solid var(--line);border-bottom-left-radius:4px}
+    .chat-bubble .c-time{display:block;font-size:10.5px;opacity:.6;margin-top:4px}
+    .chat-input{display:flex;gap:8px;margin-top:14px}
+    .chat-input input{flex:1;height:38px;border:1px solid var(--line);border-radius:10px;padding:0 12px;font-size:13px}
+    .chat-input input:focus{outline:none;border-color:var(--brand)}
+    .run-row{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+    .run-row:last-child{border-bottom:none}
+    .run-row .r-label{width:84px;flex:none;color:var(--muted);font-weight:500}
+    .run-row .r-val{flex:1}
+    .trace{list-style:none;margin:0;padding:0;font-size:12.5px}
+    .trace li{display:flex;gap:8px;padding:6px 0;color:var(--ink-2)}
+    .trace li::before{content:"›";color:var(--brand);font-weight:700}
+
+    /* —— 标签/来源 —— */
+    .src-tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}
+    .src-tag.manual{background:var(--surface-3);color:var(--muted)}
+    .src-tag.msg{background:var(--accent-soft);color:var(--accent)}
+    .src-tag.agent{background:var(--brand-soft);color:var(--brand-700)}
+    .src-tag.wait{background:var(--amber-soft);color:var(--amber)}
+
+    /* —— 订单详情页签 —— */
+    .tabs{display:flex;gap:4px;padding:0 20px;border-bottom:1px solid var(--line);background:#fff}
+    .tab{padding:12px 14px;font-size:13px;font-weight:500;color:var(--muted);border-bottom:2px solid transparent;cursor:pointer;background:none;border-top:none;border-left:none;border-right:none}
+    .tab:hover{color:var(--ink)}
+    .tab.active{color:var(--brand-700);border-bottom-color:var(--brand);font-weight:600}
+    .tab-panel{display:none}
+    .tab-panel.active{display:block}
+
+    /* —— 确认中心卡片 —— */
+    .confirm-list{display:flex;flex-direction:column;gap:14px}
+    .confirm-card{border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;background:#fff}
+    .confirm-card .cc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .cc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px 20px;font-size:12.5px}
+    .cc-grid .cc-k{color:var(--muted);font-weight:500}
+    .cc-grid .cc-v{color:var(--ink)}
+    .cc-evidence{margin-top:10px;padding:10px 12px;background:var(--surface-2);border-radius:8px;font-size:12.5px;color:var(--ink-2);border-left:3px solid var(--line-strong)}
+
+    /* —— 消息中心流程 —— */
+    .flow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:10px 0 16px;font-size:12px;color:var(--muted)}
+    .flow .step{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px solid var(--line);border-radius:999px;background:#fff}
+    .flow .arrow{color:var(--muted-2)}
+    .src-pick{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px}
+
+    /* —— V3 借鉴：状态 / 运行摘要 / 技术详情 / 筛选 等功能性组件（沿用本稿视觉 token）—— */
+    .status-stack{display:flex;flex-direction:column;gap:6px;width:100%;font-size:11px}
+    .status-line{display:grid;grid-template-columns:8px 1fr auto;gap:7px;align-items:center;color:var(--muted)}
+    .status-line b{font-size:11px;color:var(--ink);font-weight:600}
+    .status-dot{width:7px;height:7px;border-radius:50%;background:var(--muted-2)}
+    .status-dot.ok{background:var(--green)}
+    .status-dot.warn{background:var(--amber)}
+
+    .session-item .s-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:10.5px;color:var(--muted)}
+    .session-item .s-meta span{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;background:var(--surface-2)}
+
+    .agent-run-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+    .agent-run-summary .summary-cell{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2)}
+    .agent-run-summary small{display:block;color:var(--muted);font-size:10.5px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+    .agent-run-summary strong{font-size:18px;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+    .tech-details{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+    .tech-details summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;list-style:none}
+    .tech-details summary::-webkit-details-marker{display:none}
+    .tech-box{margin-top:8px;padding:10px 12px;border-radius:8px;background:var(--surface-2);font-size:11.5px;color:var(--ink-2);line-height:1.7;word-break:break-word}
+
+    .confirm-filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+    .confirm-filter{height:30px;padding:0 11px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);font-size:12px;cursor:pointer}
+    .confirm-filter.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand-700);font-weight:600}
+
+    .business-note{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--amber-soft);color:var(--ink-2);font-size:12px;line-height:1.6}
+
+    /* —— 导航项图标：data-icon 移到独立 .icon 容器，避免覆盖文字 —— */
+    .nav-item .icon{display:grid;place-items:center;flex:0 0 18px;width:18px;height:18px}
+    .nav-item .icon svg{width:100%;height:100%}
+  </style>
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
-      <button class="brand" data-route="today" aria-label="返回今日行动">
+      <button class="brand" data-route="today" aria-label="返回今日工作台">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="brand-copy"><strong>FlowOrder</strong><small>AI外贸跟单行动系统</small></span>
       </button>
 
       <div class="nav-section-label">工作空间</div>
       <nav class="side-nav" aria-label="主导航">
-        <button class="nav-item" data-route="today" data-icon="today"><span>今日行动</span><b id="todayBadge" hidden>0</b></button>
-        <button class="nav-item" data-route="agent" data-icon="agent"><span>异常诊断</span><b id="agentBadge" hidden>0</b></button>
-        <button class="nav-item" data-route="tasks" data-icon="tasks"><span>全部任务</span></button>
-        <button class="nav-item" data-route="orders" data-icon="orders"><span>订单中心</span></button>
-        <button class="nav-item" data-route="intake" data-icon="message"><span>消息接入</span></button>
-        <button class="nav-item" data-route="confirm" data-icon="review"><span>人工确认</span><b id="reviewBadge" hidden>0</b></button>
+        <button class="nav-item" data-route="today"><span class="icon" data-icon="today"></span><span>今日工作台</span><b id="todayBadge" hidden>0</b></button>
+        <button class="nav-item" data-route="agent"><span class="icon" data-icon="agent"></span><span>Agent助手</span></button>
+        <button class="nav-item" data-route="tasks"><span class="icon" data-icon="tasks"></span><span>任务中心</span></button>
+        <button class="nav-item" data-route="orders"><span class="icon" data-icon="orders"></span><span>订单中心</span></button>
+        <button class="nav-item" data-route="intake"><span class="icon" data-icon="message"></span><span>消息中心</span></button>
+        <button class="nav-item" data-route="confirm"><span class="icon" data-icon="review"></span><span>确认中心</span><b id="reviewBadge" hidden>0</b></button>
       </nav>
 
-      <div class="nav-section-label">管理</div>
+      <div class="nav-section-label">管理 · 仅主管</div>
       <nav class="side-nav" aria-label="管理导航">
-        <button class="nav-item" data-route="manage" data-icon="chart"><span>管理看板</span></button>
-        <button class="nav-item" data-route="settings" data-icon="settings"><span>设置与连接</span></button>
+        <button class="nav-item" data-route="manage"><span class="icon" data-icon="chart"></span><span>管理看板</span></button>
+        <button class="nav-item" data-route="settings"><span class="icon" data-icon="settings"></span><span>设置与连接</span></button>
       </nav>
 
-      <div class="sidebar-card">
-        <span class="live-dot" id="sidebarLiveDot"></span>
-        <div><strong id="sidebarStatus">服务连接中</strong><small id="sidebarStatusDetail">正在检查自动化连接</small></div>
+      <div class="sidebar-card" style="align-items:flex-start">
+        <div class="status-stack" aria-label="系统运行状态">
+          <div class="status-line"><span class="status-dot" id="systemStatusDot"></span><span>系统服务</span><b id="systemStatusValue">检查中</b></div>
+          <div class="status-line"><span class="status-dot" id="agentStatusDot"></span><span>Agent 服务</span><b id="agentStatusValue">检查中</b></div>
+          <div class="status-line"><span class="status-dot" id="scheduleStatusDot"></span><span>定时巡检</span><b id="scheduleStatusValue">检查中</b></div>
+        </div>
       </div>
     </aside>
 
@@ -43,21 +182,20 @@
         <div class="topbar-left">
           <button class="mobile-menu" id="mobileMenu" aria-label="打开导航" data-icon="menu"></button>
           <div class="page-heading">
-            <span id="pageEyebrow">ACTION WORKSPACE</span>
-            <h1 id="pageTitle">今日行动</h1>
-            <p id="pageSubtitle">从订单事实出发，完成下一步行动</p>
+            <span id="pageEyebrow">TODAY WORKBENCH</span>
+            <h1 id="pageTitle">今日工作台</h1>
           </div>
         </div>
         <div class="topbar-actions">
           <label class="global-search" id="searchWrap">
             <span data-icon="search" aria-hidden="true"></span>
-            <input id="globalSearch" type="search" autocomplete="off" placeholder="搜索当前页面" aria-label="搜索当前页面" />
+            <input id="globalSearch" type="search" autocomplete="off" placeholder="搜索订单、任务、客户或会话" aria-label="全局搜索" />
             <kbd>⌘ K</kbd>
           </label>
           <button class="icon-btn" id="refreshBtn" title="刷新页面" data-icon="refresh"></button>
           <button class="profile" id="profileButton" type="button">
             <span class="avatar" id="profileAvatar">李</span>
-            <span><strong id="profileName">李梅</strong><small id="profileRole">跟单专员</small></span>
+            <span><strong id="profileName">李梅</strong><small id="profileRole">跟单专员 · 演示</small></span>
             <span data-icon="chevron"></span>
           </button>
         </div>
@@ -70,17 +208,15 @@
   </div>
 
   <nav class="mobile-nav" aria-label="移动端导航">
-    <button data-route="today" data-icon="today"><small>行动</small></button>
+    <button data-route="today" data-icon="today"><small>工作台</small></button>
+    <button data-route="agent" data-icon="agent"><small>Agent</small></button>
     <button data-route="tasks" data-icon="tasks"><small>任务</small></button>
     <button data-route="orders" data-icon="orders"><small>订单</small></button>
-    <button data-route="intake" data-icon="message"><small>接入</small></button>
     <button data-route="confirm" data-icon="review"><small>确认</small></button>
   </nav>
 
   <div class="drawer-mask" id="drawerMask" hidden></div>
-  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="详情面板">
-    <div id="drawerBody"></div>
-  </aside>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="详情面板"><div id="drawerBody"></div></aside>
 
   <dialog class="modal" id="modal">
     <form method="dialog" id="modalForm">
@@ -94,6 +230,6 @@
   </dialog>
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
-  <script src="/static/app.js?v=6.1.3.3"></script>
+  <script src="/static/app.js?v=6.1.3.5-ui-freeze"></script>
 </body>
 </html>
