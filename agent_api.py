@@ -25,9 +25,23 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 AGENT_API_KEY = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip()
 CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
-AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
-AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
-COZE_AGENT_TIMEOUT_SECONDS = max(15, min(int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "60")), 60))
+def _safe_int_env(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(str(raw).strip()) if raw not in (None, "") else int(default)
+    except (TypeError, ValueError):
+        print(f"[config-warning] {name}={raw!r} is invalid; using {default}", flush=True)
+        value = int(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+AGENT_MAX_TOOL_CALLS = _safe_int_env("FLOWORDER_AGENT_MAX_TOOL_CALLS", 8, minimum=1)
+AGENT_MAX_DURATION_SECONDS = _safe_int_env("FLOWORDER_AGENT_MAX_DURATION_SECONDS", 120, minimum=30)
+COZE_AGENT_TIMEOUT_SECONDS = _safe_int_env("COZE_AGENT_TIMEOUT_SECONDS", 60, minimum=15, maximum=60)
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 OWNER_ID_TO_NAME = {value: key for key, value in OWNER_NAME_TO_ID.items()}

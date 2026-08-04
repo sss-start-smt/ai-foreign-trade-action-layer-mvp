@@ -10,23 +10,25 @@ def resolve_port() -> int:
     raw = (os.getenv("PORT") or "8000").strip()
     try:
         port = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"PORT must be an integer, got {raw!r}") from exc
+    except (TypeError, ValueError):
+        print(f"[bootstrap-warning] invalid PORT={raw!r}; falling back to 8000", flush=True)
+        port = 8000
     if not 1 <= port <= 65535:
-        raise RuntimeError(f"PORT out of range: {port}")
+        print(f"[bootstrap-warning] out-of-range PORT={port}; falling back to 8000", flush=True)
+        port = 8000
     return port
 
 
 def main() -> None:
     port = resolve_port()
     print(
-        "[bootstrap] starting FlowOrder "
+        "[bootstrap] starting FlowOrder safe dispatcher "
         f"python={sys.version.split()[0]} host=0.0.0.0 port={port} "
-        f"railway_environment={bool(os.getenv('RAILWAY_ENVIRONMENT'))}",
+        f"railway_environment={bool(os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('RAILWAY_PROJECT_ID'))}",
         flush=True,
     )
     uvicorn.run(
-        "main:app",
+        "bootstrap_app:app",
         host="0.0.0.0",
         port=port,
         proxy_headers=True,

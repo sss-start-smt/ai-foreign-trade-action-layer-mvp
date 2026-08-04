@@ -39,7 +39,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="6.1.4.1.1")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.1.4.1.3")
 APP_STARTUP_STATE: dict[str, Any] = {
     "database_ready": False,
     "database_initializing": False,
@@ -1741,7 +1741,7 @@ def _mark_interrupted_intake_jobs() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(intake_jobs)")}
         required = {"status", "progress_message", "error_json", "completed_at", "updated_at"}
         if not required.issubset(columns):
-            print(f"[startup-warning] intake_jobs legacy schema; skip stale-job cleanup: missing={sorted(required-columns)}")
+            print(f"[startup-warning] intake_jobs legacy schema; skip stale-job cleanup: missing={sorted(required - columns)}")
             return
         conn.execute(
             """UPDATE intake_jobs SET status='FAILED', progress_message='服务重启，后台识别已中断',
@@ -1802,7 +1802,7 @@ def health() -> dict[str, Any]:
     """Railway liveness endpoint: never runs migrations or external checks."""
     return {
         "status": "ok",
-        "version": "6.1.4.1.1",
+        "version": "6.1.4.1.3",
         "service": "floworder",
         "database_ready": bool(APP_STARTUP_STATE["database_ready"]),
         "database_initializing": bool(APP_STARTUP_STATE["database_initializing"]),
@@ -1817,7 +1817,7 @@ def ready() -> dict[str, Any]:
             503,
             {
                 "status": "starting" if APP_STARTUP_STATE["database_initializing"] else "degraded",
-                "version": "6.1.4.1.1",
+                "version": "6.1.4.1.3",
                 "database_ready": False,
                 "startup_error": APP_STARTUP_STATE["startup_error"],
             },
@@ -1830,7 +1830,7 @@ def ready() -> dict[str, Any]:
         APP_STARTUP_STATE["startup_error"] = f"{type(exc).__name__}: {exc}"
         raise HTTPException(503, {"status": "degraded", "database_ready": False,
                                  "startup_error": APP_STARTUP_STATE["startup_error"]}) from exc
-    return {"status": "ready", "version": "6.1.4.1.1", "database_ready": True,
+    return {"status": "ready", "version": "6.1.4.1.3", "database_ready": True,
             "initialized_at": APP_STARTUP_STATE["initialized_at"]}
 
 
