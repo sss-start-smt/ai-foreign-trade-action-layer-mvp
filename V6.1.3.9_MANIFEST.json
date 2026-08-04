@@ -1,0 +1,18 @@
+{
+  "version": "6.1.3.9-agent-polling-source-fix",
+  "based_on_uploaded_source": "ai-foreign-trade-action-layer-mvp-main (3).zip",
+  "changed_files": [
+    "static/app.js",
+    "static/index.html",
+    "tests/test_v613_regressions.py"
+  ],
+  "unchanged_visual_file": "static/styles.css",
+  "styles_sha256_before": "479dbac3eb133c74a1e6134e224c627356579a3de135ff3d70bdde72eb3e3a23",
+  "styles_sha256_after": "479dbac3eb133c74a1e6134e224c627356579a3de135ff3d70bdde72eb3e3a23",
+  "app_js_sha256": "21310966ef53a6acb00ad43f35a4cd03f27faf2bc668c327d074935377381a2a",
+  "index_html_sha256": "8c2507086816ff721489c0ca4b1e160f974a0b2a7190a25a391e94c4bd979304",
+  "validation": {
+    "node_check": "passed",
+    "pytest": "49 passed"
+  }
+}

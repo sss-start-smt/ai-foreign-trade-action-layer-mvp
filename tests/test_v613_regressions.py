@@ -408,3 +408,11 @@ def test_backend_managed_job_option_can_trigger_linked_approval_without_plugin_s
     )
     assert response.status_code == 200, response.text
     assert response.json()["approval_id"].startswith("APR-")
+
+
+def test_frontend_defines_agent_job_polling_function():
+    source = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+    assert "async function pollConversationJob(" in source
+    assert "GET /api/agent/chat/jobs" not in source  # implementation uses fetch wrapper, not placeholder prose
+    assert "void pollConversationJob(root,active.id,created.job_id)" in source
+
