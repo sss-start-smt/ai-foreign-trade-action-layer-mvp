@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+import time
+import traceback
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,7 +39,14 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
-app = FastAPI(title="AI外贸跟单行动系统", version="6.1.4.1")
+app = FastAPI(title="AI外贸跟单行动系统", version="6.1.4.1.1")
+APP_STARTUP_STATE: dict[str, Any] = {
+    "database_ready": False,
+    "database_initializing": False,
+    "startup_error": None,
+    "initialized_at": None,
+}
+_STARTUP_LOCK = threading.Lock()
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 register_excel_import_patch(app)
 register_communication_workflows_patch(app)
@@ -99,9 +109,10 @@ def db():
     Windows when pytest resets the test database.
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
     finally:
@@ -1718,21 +1729,67 @@ def api_ft04_refresh(payload: AnyPayload) -> dict[str, Any]:
     return {"status": "refreshed", **(result or {})}
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
+def _mark_interrupted_intake_jobs() -> None:
+    """Close stale intake jobs after a restart without assuming a legacy schema."""
     timestamp = iso()
     with db() as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_jobs'"
+        ).fetchone()
+        if not table:
+            return
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(intake_jobs)")}
+        required = {"status", "progress_message", "error_json", "completed_at", "updated_at"}
+        if not required.issubset(columns):
+            print(f"[startup-warning] intake_jobs legacy schema; skip stale-job cleanup: missing={sorted(required-columns)}")
+            return
         conn.execute(
             """UPDATE intake_jobs SET status='FAILED', progress_message='服务重启，后台识别已中断',
                error_json=?, completed_at=?, updated_at=? WHERE status IN ('QUEUED','PROCESSING')""",
             (json.dumps({"message": "服务重启导致后台识别中断，请重新提交消息"}, ensure_ascii=False), timestamp, timestamp),
         )
         conn.commit()
-    status = storage_status()
-    print(f"[storage] db={status['db_path']} persistent={status['on_persistent_path']}")
-    if status.get("warning"):
-        print(f"[storage-warning] {status['warning']}")
+
+
+def _initialize_database_worker() -> None:
+    """Initialize the persistent database without blocking Railway liveness checks."""
+    with _STARTUP_LOCK:
+        if APP_STARTUP_STATE["database_ready"] or APP_STARTUP_STATE["database_initializing"]:
+            return
+        APP_STARTUP_STATE["database_initializing"] = True
+    delays = (0, 1, 2, 4, 8, 16)
+    last_error: Exception | None = None
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            init_db()
+            _mark_interrupted_intake_jobs()
+            APP_STARTUP_STATE.update({
+                "database_ready": True,
+                "database_initializing": False,
+                "startup_error": None,
+                "initialized_at": iso(),
+            })
+            status = storage_status()
+            print(f"[startup] database ready on attempt={attempt}")
+            print(f"[storage] db={status['db_path']} persistent={status['on_persistent_path']}")
+            if status.get("warning"):
+                print(f"[storage-warning] {status['warning']}")
+            return
+        except Exception as exc:  # Keep the process alive so /health exposes liveness.
+            last_error = exc
+            APP_STARTUP_STATE["startup_error"] = f"{type(exc).__name__}: {exc}"
+            print(f"[startup-error] database init attempt={attempt} failed: {APP_STARTUP_STATE['startup_error']}")
+            traceback.print_exc()
+    APP_STARTUP_STATE["database_initializing"] = False
+    if last_error:
+        print("[startup-error] database initialization exhausted all retries")
+
+
+@app.on_event("startup")
+def startup() -> None:
+    threading.Thread(target=_initialize_database_worker, name="floworder-db-init", daemon=True).start()
 
 
 @app.get("/")
@@ -1742,9 +1799,39 @@ def home() -> FileResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    init_db()
-    return {"status": "ok", "version": "6.1.4.1", "db": str(DB_PATH), "storage": storage_status(),
-            "coze": coze_status(), "agent": agent_api.coze_agent_status()}
+    """Railway liveness endpoint: never runs migrations or external checks."""
+    return {
+        "status": "ok",
+        "version": "6.1.4.1.1",
+        "service": "floworder",
+        "database_ready": bool(APP_STARTUP_STATE["database_ready"]),
+        "database_initializing": bool(APP_STARTUP_STATE["database_initializing"]),
+    }
+
+
+@app.get("/ready")
+def ready() -> dict[str, Any]:
+    """Application readiness endpoint for diagnostics; returns 503 until SQLite is usable."""
+    if not APP_STARTUP_STATE["database_ready"]:
+        raise HTTPException(
+            503,
+            {
+                "status": "starting" if APP_STARTUP_STATE["database_initializing"] else "degraded",
+                "version": "6.1.4.1.1",
+                "database_ready": False,
+                "startup_error": APP_STARTUP_STATE["startup_error"],
+            },
+        )
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+    except sqlite3.Error as exc:
+        APP_STARTUP_STATE["database_ready"] = False
+        APP_STARTUP_STATE["startup_error"] = f"{type(exc).__name__}: {exc}"
+        raise HTTPException(503, {"status": "degraded", "database_ready": False,
+                                 "startup_error": APP_STARTUP_STATE["startup_error"]}) from exc
+    return {"status": "ready", "version": "6.1.4.1.1", "database_ready": True,
+            "initialized_at": APP_STARTUP_STATE["initialized_at"]}
 
 
 @app.get("/api/system/storage")
@@ -2004,6 +2091,3 @@ def demo_ft02() -> dict[str, Any]:
         )
         conn.commit()
     return result
-
-
-init_db()
