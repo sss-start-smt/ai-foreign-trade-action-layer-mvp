@@ -365,6 +365,32 @@ def _extract_updates(segment: str, order: dict[str, Any]) -> tuple[list[dict[str
     return list(dedup.values()), metadata
 
 
+def _coze_safe_bulk_update_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize mixed typed update values for Coze response-schema validation.
+
+    The core parser deliberately keeps typed values (for example 0.82 for
+    progress and ISO strings for dates) because the website confirmation flow
+    needs those values for writeback. Coze output schemas do not support a
+    reliable union such as string | number | null, so the plugin response uses
+    readable strings while the website endpoint continues to receive typed
+    values.
+    """
+    safe_result = {**result, "orders": []}
+    for order in result.get("orders") or []:
+        safe_order = {**order, "updates": []}
+        for update in order.get("updates") or []:
+            field_name = str(update.get("field_name") or "")
+            safe_update = {
+                **update,
+                "old_value": _value_text(field_name, update.get("old_value")),
+                "new_value": _value_text(field_name, update.get("new_value")),
+                "new_value_text": _value_text(field_name, update.get("new_value")),
+            }
+            safe_order["updates"].append(safe_update)
+        safe_result["orders"].append(safe_order)
+    return safe_result
+
+
 def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
     ensure_v61_schema(conn)
     actor = agent_api.actor(payload)
@@ -855,7 +881,7 @@ def register_v61_extensions(app) -> None:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
             conn.commit()
-        return result
+        return _coze_safe_bulk_update_response(result)
 
     @router.post("/api/agent/tools/priority-orders/diagnose")
     def tool_diagnose_priority_orders(payload: agent_api.AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:

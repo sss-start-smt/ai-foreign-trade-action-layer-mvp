@@ -37,7 +37,7 @@ def test_parse_bulk_order_updates_returns_confirmation_candidates():
     assert data["confirmation_required"] is True
     assert data["summary"]["matched_order_count"] == 1
     updates = data["orders"][0]["updates"]
-    assert any(x["field_name"] == "current_progress" and x["new_value"] == 0.82 for x in updates)
+    assert any(x["field_name"] == "current_progress" and x["new_value"] == "82%" for x in updates)
     assert any(x["field_name"] == "latest_supplier_commitment" for x in updates)
 
 
