@@ -112,6 +112,78 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip())
 
 
+def _normalize_for_routing(text: str) -> str:
+    """Normalize common foreign-trade colloquialisms without changing the user-visible text."""
+    normalized = _normalize(text)
+    replacements = (
+        ("单子", "订单"),
+        ("这些单", "这些订单"),
+        ("哪些单", "哪些订单"),
+        ("哪几单", "哪几笔订单"),
+        ("这批单", "这批订单"),
+        ("几个单", "几笔订单"),
+        ("最需要我处理", "最需要处理"),
+        ("最需要我们处理", "最需要处理"),
+        ("最值得我先处理", "最需要处理"),
+        ("我该先处理哪些", "先处理哪些"),
+        ("我应该先处理哪些", "先处理哪些"),
+        ("我该先处理哪个", "先处理哪个"),
+        ("我应该先处理哪个", "先处理哪个"),
+    )
+    for source, target in replacements:
+        normalized = normalized.replace(source, target)
+    return normalized
+
+
+def _has_explicit_time_window(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "接下来", "未来", "最近", "往后", "这周", "本周", "两周", "一周",
+            "月底前", "本月底前", "一个月", "天内", "日内", "周内",
+        ),
+    ) or bool(re.search(r"[0-9一二两三四五六七八九十]+\s*(?:天|日|周|星期|个月)(?:内|以内)?", text))
+
+
+def _risk_intent_score(text: str) -> tuple[int, dict[str, bool]]:
+    """Score semantic signals for cross-order action-priority diagnosis."""
+    signals = {
+        "order_scope": _contains_any(
+            text,
+            ("订单", "哪些订单", "几笔订单", "这批订单", "哪笔", "哪些要", "几个要"),
+        ),
+        "time_window": _has_explicit_time_window(text),
+        "priority_goal": _contains_any(
+            text,
+            (
+                "最需要处理", "最该处理", "最值得处理", "先处理哪个", "先处理哪些",
+                "哪些要先处理", "哪个最急", "哪些最急", "最高优先级", "排优先级",
+                "优先处理", "挑出最", "最麻烦", "最严重",
+            ),
+        ),
+        "risk_context": _contains_any(
+            text,
+            (
+                "客户在催", "客户催", "工厂在催", "工厂拖", "催不动", "一直没回",
+                "没有回复", "交期不对", "延期", "承诺逾期", "卡住", "来不及",
+            ),
+        ),
+        "inspection_action": _contains_any(text, ("帮我看看", "看一下", "检查", "巡检", "筛出", "挑出", "找出")),
+    }
+    score = 0
+    if signals["order_scope"]:
+        score += 2
+    if signals["time_window"]:
+        score += 2
+    if signals["priority_goal"]:
+        score += 3
+    if signals["risk_context"]:
+        score += 1
+    if signals["inspection_action"]:
+        score += 1
+    return score, signals
+
+
 def _contains_any(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in text for phrase in phrases)
 
@@ -231,32 +303,35 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
     """
     context = context or {}
     text = _normalize(question)
-    lowered = text.lower()
-    due_days = _extract_due_days(text, int(context.get("default_due_within_days") or 14))
-    top_n = _extract_top_n(text, int(context.get("default_top_n") or 7))
-    target_rank = _extract_rank(text)
+    routing_text = _normalize_for_routing(text)
+    lowered = routing_text.lower()
+    due_days = _extract_due_days(routing_text, int(context.get("default_due_within_days") or 14))
+    top_n = _extract_top_n(routing_text, int(context.get("default_top_n") or 7))
+    target_rank = _extract_rank(routing_text)
     order_refs = _extract_order_refs(text)
 
     constraints = {
-        "allow_external_send": not _contains_any(text, ("不要发", "别发", "先别发", "不能发", "禁止发送", "不要发送", "不发送")),
-        "allow_order_writeback": not _contains_any(text, ("不要修改订单", "别改订单", "先别写回", "不要写回", "不写回", "先别更新订单")),
-        "allow_task_draft": not _contains_any(text, ("不要建任务", "别建任务", "不要创建任务", "不创建任务", "不要生成任务")),
-        "draft_only": _contains_any(text, ("只生成草稿", "仅生成草稿", "先出草稿", "不要直接执行", "先别执行")),
+        "allow_external_send": not _contains_any(routing_text, ("不要发", "别发", "先别发", "不能发", "禁止发送", "不要发送", "不发送")),
+        "allow_order_writeback": not _contains_any(routing_text, ("不要修改订单", "别改订单", "先别写回", "不要写回", "不写回", "先别更新订单")),
+        "allow_task_draft": not _contains_any(routing_text, ("不要建任务", "别建任务", "不要创建任务", "不创建任务", "不要生成任务")),
+        "draft_only": _contains_any(routing_text, ("只生成草稿", "仅生成草稿", "先出草稿", "不要直接执行", "先别执行")),
         "require_human_approval": True,
     }
 
-    risk = _contains_any(text, (
+    explicit_risk = _contains_any(routing_text, (
         "风险", "危险", "最急", "最紧急", "最优先", "优先处理", "最需要处理", "最该处理", "巡检", "排个优先级",
-        "排优先级", "排序", "先处理哪个", "先做哪个", "最麻烦", "最严重",
+        "排优先级", "排序", "先处理哪个", "先处理哪些", "先做哪个", "最麻烦", "最严重",
     ))
-    explain = _contains_any(text, ("为什么", "为何", "原因", "解释", "凭什么", "相比", "区别"))
-    task = _contains_any(text, ("建任务", "创建任务", "生成任务", "安排任务", "加个任务", "建个任务", "建一个任务", "创建一个任务", "生成一个任务", "建个待办", "生成待办", "安排跟进")) or bool(re.search(r"(?:建|创建|生成|安排|加)(?:一个|个|条)?任务", text))
-    message_draft = _contains_any(text, ("写邮件", "写封邮件", "生成邮件", "回复客户", "催客户", "催工厂", "沟通草稿", "消息草稿", "怎么说"))
-    approval = _contains_any(text, ("审批状态", "审批怎么样", "审批通过", "审批了吗", "待审批"))
-    info_gap = _contains_any(text, ("缺什么信息", "还缺什么", "信息缺口", "资料不全", "需要补充什么"))
-    order_status = bool(order_refs) and _contains_any(text, ("什么情况", "现在怎样", "当前状态", "进展", "到哪一步", "查一下"))
+    risk_score, risk_signals = _risk_intent_score(routing_text)
+    risk = explicit_risk or risk_score >= 5
+    explain = _contains_any(routing_text, ("为什么", "为何", "原因", "解释", "凭什么", "相比", "区别"))
+    task = _contains_any(routing_text, ("建任务", "创建任务", "生成任务", "安排任务", "加个任务", "建个任务", "建一个任务", "创建一个任务", "生成一个任务", "建个待办", "生成待办", "安排跟进")) or bool(re.search(r"(?:建|创建|生成|安排|加)(?:一个|个|条)?任务", routing_text))
+    message_draft = _contains_any(routing_text, ("写邮件", "写封邮件", "生成邮件", "回复客户", "催客户", "催工厂", "沟通草稿", "消息草稿", "怎么说"))
+    approval = _contains_any(routing_text, ("审批状态", "审批怎么样", "审批通过", "审批了吗", "待审批"))
+    info_gap = _contains_any(routing_text, ("缺什么信息", "还缺什么", "信息缺口", "资料不全", "需要补充什么"))
+    order_status = bool(order_refs) and _contains_any(routing_text, ("什么情况", "现在怎样", "当前状态", "进展", "到哪一步", "查一下"))
 
-    update_terms = _contains_any(text, ("更新", "进展", "完工", "完成", "延期", "承诺", "回复", "提柜", "到料", "到货"))
+    update_terms = _contains_any(routing_text, ("更新", "进展", "完工", "完成", "延期", "承诺", "回复", "提柜", "到料", "到货"))
     bulk_parse = len(order_refs) >= 2 and update_terms
     if not bulk_parse:
         line_count = sum(1 for line in str(question or "").splitlines() if line.strip())
@@ -284,12 +359,25 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
     if explain and not risk and context.get("previous_run_id"):
         intents = [x for x in intents if x != "RISK_DIAGNOSIS"]
 
-    vague_action = _contains_any(text, ("处理一下", "搞一下", "看着办", "有点问题", "帮我弄一下"))
+    vague_action = _contains_any(routing_text, ("处理一下", "搞一下", "看着办", "有点问题", "帮我弄一下"))
+    domain_signal = _contains_any(
+        routing_text,
+        ("订单", "客户", "工厂", "供应商", "交期", "任务", "审批", "消息", "进展", "完工", "包装", "物流"),
+    )
     needs_clarification = False
     clarification: str | None = None
-    if not intents:
+    semantic_fallback = False
+    if not intents and vague_action:
         needs_clarification = True
-        clarification = "你希望我先检查风险订单、查询某笔订单，还是生成任务/沟通草稿？"
+        clarification = "你希望我先检查所有有权限的订单风险，还是处理某一笔指定订单？"
+    elif not intents and domain_signal:
+        # Do not block the production Coze Agent when the deterministic router is uncertain.
+        # The debug Bot already handles these semantic requests correctly; production should
+        # fall through to the same semantic/tool-selection layer instead of pre-emptively asking.
+        semantic_fallback = True
+    elif not intents:
+        needs_clarification = True
+        clarification = "请说明你希望检查订单风险、查询某笔订单，还是生成任务或沟通草稿。"
     elif vague_action and not (risk or order_refs or bulk_parse or task or message_draft):
         needs_clarification = True
         clarification = "你希望我先检查所有有权限的订单风险，还是处理某一笔指定订单？"
@@ -312,9 +400,12 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
     if needs_clarification:
         route_mode = "CLARIFICATION"
         confidence = 0.45
+    elif semantic_fallback:
+        route_mode = "COZE_AGENT"
+        confidence = 0.62
     elif set(intents).issubset(deterministic_intents):
         route_mode = "DETERMINISTIC_PLAN"
-        confidence = 0.92 if risk or bulk_parse else 0.82
+        confidence = 0.94 if risk or bulk_parse else 0.82
     else:
         route_mode = "COZE_AGENT"
         confidence = 0.78
@@ -326,7 +417,7 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
         needs_clarification=needs_clarification,
         clarification_question=clarification,
         route_mode=route_mode,
-        normalized_question=text,
+        normalized_question=routing_text,
         extracted={
             "due_within_days": due_days,
             "top_n": top_n,
@@ -334,5 +425,14 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
             "order_refs": order_refs,
             "has_previous_run": bool(context.get("previous_run_id")),
             "original_length": len(str(question or "")),
+            "risk_intent_score": risk_score,
+            "risk_signals": risk_signals,
+            "semantic_fallback": semantic_fallback,
+            "router_decision_reason": (
+                "HIGH_CONFIDENCE_RISK_RULE" if risk else
+                "SEMANTIC_FALLBACK_TO_COZE" if semantic_fallback else
+                "CLARIFICATION_REQUIRED" if needs_clarification else
+                "ROUTED_BY_EXPLICIT_INTENT"
+            ),
         },
     )

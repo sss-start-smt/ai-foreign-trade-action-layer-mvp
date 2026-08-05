@@ -48,3 +48,27 @@ def test_negative_task_constraint_wins():
     plan = route_agent_request("检查风险并解释第一笔，但不要创建任务。")
     assert "CREATE_TASK_DRAFT" not in intents(plan)
     assert plan.constraints["allow_task_draft"] is False
+
+
+def test_production_router_understands_colloquial_order_priority_request():
+    plan = route_agent_request(
+        "最近事情太多了，客户和工厂都有催不动的，你先帮我看看接下来两周哪些单子最需要我处理。"
+    )
+    assert plan.route_mode == "DETERMINISTIC_PLAN"
+    assert intents(plan) == ["RISK_DIAGNOSIS"]
+    assert plan.extracted["due_within_days"] == 14
+    assert plan.extracted["risk_intent_score"] >= 5
+    assert plan.extracted["router_decision_reason"] == "HIGH_CONFIDENCE_RISK_RULE"
+
+
+def test_uncertain_business_request_falls_through_to_coze_instead_of_early_clarification():
+    plan = route_agent_request("帮我梳理一下这个客户最近的沟通情况。")
+    assert plan.route_mode == "COZE_AGENT"
+    assert plan.needs_clarification is False
+    assert plan.extracted["semantic_fallback"] is True
+
+
+def test_truly_vague_business_action_still_requires_clarification():
+    plan = route_agent_request("订单有点问题，你处理一下。")
+    assert plan.route_mode == "CLARIFICATION"
+    assert plan.needs_clarification is True
