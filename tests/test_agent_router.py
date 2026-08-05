@@ -72,3 +72,39 @@ def test_truly_vague_business_action_still_requires_clarification():
     plan = route_agent_request("订单有点问题，你处理一下。")
     assert plan.route_mode == "CLARIFICATION"
     assert plan.needs_clarification is True
+
+
+def test_production_router_understands_batch_handling_priority_phrase():
+    plan = route_agent_request(
+        "最近有点乱，帮我排一下这批单的处理优先级。",
+        {"previous_run_id": "AGR-PREVIOUS"},
+    )
+    assert plan.route_mode == "DETERMINISTIC_PLAN"
+    assert intents(plan) == ["RISK_DIAGNOSIS"]
+    assert plan.extracted["risk_signals"]["priority_goal"] is True
+    assert plan.extracted["router_decision_reason"] == "HIGH_CONFIDENCE_RISK_RULE"
+
+
+def test_production_router_understands_priority_order_variants():
+    samples = (
+        "帮我梳理一下这批订单的优先顺序。",
+        "分析一下这些单子的处理顺序。",
+        "给这几笔订单排个处理优先级。",
+        "看看这批单应该先做哪些。",
+    )
+    for question in samples:
+        plan = route_agent_request(question)
+        assert plan.route_mode == "DETERMINISTIC_PLAN", question
+        assert "RISK_DIAGNOSIS" in intents(plan), question
+
+
+def test_customer_communication_summary_still_uses_semantic_fallback():
+    plan = route_agent_request("帮我梳理一下这个客户最近的沟通情况。")
+    assert plan.route_mode == "COZE_AGENT"
+    assert plan.needs_clarification is False
+
+
+def test_vague_action_still_requires_clarification_after_priority_fix():
+    plan = route_agent_request("订单有点问题，你处理一下。")
+    assert plan.route_mode == "CLARIFICATION"
+    assert plan.needs_clarification is True

@@ -25,23 +25,9 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 AGENT_API_KEY = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip()
 CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
-def _safe_int_env(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
-    raw = os.getenv(name)
-    try:
-        value = int(str(raw).strip()) if raw not in (None, "") else int(default)
-    except (TypeError, ValueError):
-        print(f"[config-warning] {name}={raw!r} is invalid; using {default}", flush=True)
-        value = int(default)
-    if minimum is not None:
-        value = max(minimum, value)
-    if maximum is not None:
-        value = min(maximum, value)
-    return value
-
-
-AGENT_MAX_TOOL_CALLS = _safe_int_env("FLOWORDER_AGENT_MAX_TOOL_CALLS", 8, minimum=1)
-AGENT_MAX_DURATION_SECONDS = _safe_int_env("FLOWORDER_AGENT_MAX_DURATION_SECONDS", 120, minimum=30)
-COZE_AGENT_TIMEOUT_SECONDS = _safe_int_env("COZE_AGENT_TIMEOUT_SECONDS", 60, minimum=15, maximum=60)
+AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
+AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
+COZE_AGENT_TIMEOUT_SECONDS = max(15, min(int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "60")), 60))
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 OWNER_ID_TO_NAME = {value: key for key, value in OWNER_NAME_TO_ID.items()}
@@ -1059,29 +1045,69 @@ def _priority_item_by_rank(diagnosis: dict[str, Any] | None, rank: int) -> dict[
     return items[index] if 0 <= index < len(items) else None
 
 
-def _format_diagnosis_answer(diagnosis: dict[str, Any], *, explain_rank: int | None = None, task: dict[str, Any] | None = None) -> str:
+def _priority_item_by_order_ref(diagnosis: dict[str, Any] | None, order_ref: str | None) -> dict[str, Any] | None:
+    if not diagnosis or not order_ref:
+        return None
+    ref = str(order_ref).strip().upper()
+    if not ref:
+        return None
+    for item in list(diagnosis.get("items") or []):
+        if str(item.get("order_no") or "").upper() == ref or str(item.get("order_id") or "").upper() == ref:
+            return item
+    return None
+
+
+def _format_diagnosis_answer(
+    diagnosis: dict[str, Any],
+    *,
+    explain_rank: int | None = None,
+    explain_order_ref: str | None = None,
+    task: dict[str, Any] | None = None,
+    include_overview: bool = True,
+) -> str:
     items = list(diagnosis.get("items") or [])
-    lines = [
-        f"已检查{int(diagnosis.get('screened_order_count') or 0)}笔订单，发现{int(diagnosis.get('risk_order_count') or len(items))}笔需要关注的风险订单。",
-    ]
-    if not items:
-        lines.append("当前没有符合规则的真实风险订单；信息不足的订单已单独列为信息缺口，不会被用来凑数。")
-    else:
-        for item in items[: min(5, len(items))]:
-            reasons = list(item.get("priority_reasons") or item.get("evidence") or [])[:2]
-            reason_text = "；".join(str(x) for x in reasons if str(x).strip()) or "基于确定性规则排序"
-            lines.append(f"{item.get('rank')}. {item.get('order_no') or item.get('order_id')}：{reason_text}")
-    if explain_rank:
-        target = _priority_item_by_rank(diagnosis, explain_rank)
+    lines: list[str] = []
+
+    if include_overview:
+        lines.append(
+            f"已检查{int(diagnosis.get('screened_order_count') or 0)}笔订单，"
+            f"发现{int(diagnosis.get('risk_order_count') or len(items))}笔需要关注的风险订单。"
+        )
+        if not items:
+            lines.append("当前没有符合规则的真实风险订单；信息不足的订单已单独列为信息缺口，不会被用来凑数。")
+        else:
+            for item in items[: min(5, len(items))]:
+                reasons = list(item.get("priority_reasons") or item.get("evidence") or [])[:2]
+                reason_text = "；".join(str(x) for x in reasons if str(x).strip()) or "基于确定性规则排序"
+                lines.append(f"{item.get('rank')}. {item.get('order_no') or item.get('order_id')}：{reason_text}")
+
+    if explain_rank or explain_order_ref:
+        target = _priority_item_by_order_ref(diagnosis, explain_order_ref) if explain_order_ref else None
+        if not target and explain_rank:
+            target = _priority_item_by_rank(diagnosis, explain_rank)
         if target:
-            reasons = list(target.get("priority_reasons") or target.get("evidence") or [])
-            lines.append(f"第{explain_rank}笔排在这里，主要因为：" + "；".join(str(x) for x in reasons[:5]))
+            reasons = [str(x).strip() for x in list(target.get("priority_reasons") or target.get("evidence") or []) if str(x).strip()]
+            order_label = target.get("order_no") or target.get("order_id") or "该订单"
+            rank = int(target.get("rank") or explain_rank or 0)
+            reason_text = "；".join(reasons[:5]) or "命中了当前确定性排序规则"
+            detail = f"{order_label}排在第{rank}位，主要因为：{reason_text}。"
+            if target.get("priority_score") is not None:
+                detail += f"当前优先级分为{target.get('priority_score')}。"
+            if target.get("recommended_action"):
+                detail += f"建议下一步：{target.get('recommended_action')}。"
+            lines.append(detail)
+        elif explain_order_ref:
+            lines.append(f"{explain_order_ref}不在上一轮排序结果中，无法基于该次运行解释其名次。请重新运行风险诊断，或指定本轮结果中的订单。")
+        else:
+            lines.append(f"上一轮结果中没有第{explain_rank}笔订单，无法解释该名次。")
+
     if task:
         text = f"已为{task.get('order_id')}生成任务草稿{task.get('task_draft_id')}，尚未成为正式任务。"
         if task.get("approval_id"):
             text += f"审批请求为{task.get('approval_id')}。"
         lines.append(text)
-    return "\n".join(lines)
+
+    return "\n".join(lines) or "已完成当前受控执行计划。"
 
 
 def _execute_deterministic_plan(
@@ -1100,6 +1126,7 @@ def _execute_deterministic_plan(
     bulk_update: dict[str, Any] | None = None
     task: dict[str, Any] | None = None
     explanation_rank: int | None = None
+    explanation_order_ref: str | None = None
 
     if "RISK_DIAGNOSIS" in intent_names and "BATCH_UPDATE_PARSE" not in intent_names:
         started = time.perf_counter()
@@ -1159,7 +1186,9 @@ def _execute_deterministic_plan(
         )
 
     if "EXPLAIN_PRIORITY" in intent_names:
-        explanation_rank = int(extracted.get("target_rank") or 1)
+        refs = list(extracted.get("order_refs") or [])
+        explanation_order_ref = str(refs[0]) if refs else None
+        explanation_rank = None if explanation_order_ref else int(extracted.get("target_rank") or 1)
 
     if "CREATE_TASK_DRAFT" in intent_names and plan.get("constraints", {}).get("allow_task_draft", True):
         target_rank = int(extracted.get("target_rank") or 1)
@@ -1195,7 +1224,13 @@ def _execute_deterministic_plan(
             )
 
     if diagnosis:
-        answer = _format_diagnosis_answer(diagnosis, explain_rank=explanation_rank, task=task)
+        answer = _format_diagnosis_answer(
+            diagnosis,
+            explain_rank=explanation_rank,
+            explain_order_ref=explanation_order_ref,
+            task=task,
+            include_overview="RISK_DIAGNOSIS" in intent_names,
+        )
     elif bulk_update:
         summary = bulk_update.get("summary") or {}
         answer = (

@@ -462,4 +462,64 @@ def test_followup_explanation_reuses_previous_structured_run(monkeypatch):
         time.sleep(0.02)
     assert completed is not None
     assert completed["result"]["execution_mode"] == "HYBRID_DETERMINISTIC_PLAN"
-    assert "第1笔排在这里" in completed["result"]["answer"]
+    answer = completed["result"]["answer"]
+    assert "排在第1位，主要因为" in answer
+    assert "已检查" not in answer
+
+
+def test_followup_explanation_by_order_number_is_focused(monkeypatch):
+    import time
+
+    def should_not_call_coze(**kwargs):
+        raise AssertionError("order-specific structured follow-up should not call Coze")
+
+    monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
+    first = client.post(
+        "/api/agent/chat/jobs",
+        json={"question": "检查未来14天最需要处理的订单", "current_user_id": "USER-1"},
+    )
+    run_id = first.json()["linked_run_id"]
+    first_job_id = first.json()["job_id"]
+    first_result = None
+    for _ in range(60):
+        payload = client.get(f"/api/agent/chat/jobs/{first_job_id}").json()
+        if payload["status"] == "COMPLETED":
+            first_result = payload["result"]
+            break
+        time.sleep(0.02)
+    assert first_result is not None
+    target = first_result["diagnosis"]["items"][0]
+    order_no = target["order_no"]
+
+    second = client.post(
+        "/api/agent/chat/jobs",
+        json={
+            "question": f"为什么{order_no}排第一？",
+            "current_user_id": "USER-1",
+            "previous_run_id": run_id,
+        },
+    )
+    completed = None
+    for _ in range(60):
+        payload = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}").json()
+        if payload["status"] == "COMPLETED":
+            completed = payload
+            break
+        time.sleep(0.02)
+    assert completed is not None
+    answer = completed["result"]["answer"]
+    assert order_no in answer
+    assert "主要因为" in answer
+    assert "已检查" not in answer
+    assert "2." not in answer
+
+
+def test_agent_completion_updates_in_place_without_full_route_flash():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+    poll_start = app_js.index("async function pollConversationJob")
+    poll_end = app_js.index("function agentSessionItem", poll_start)
+    poll_code = app_js[poll_start:poll_end]
+    assert "refreshAgentJobUI(root,active,job)" in poll_code
+    assert "renderRoute(false)" not in poll_code
+    assert "function refreshAgentJobUI" in app_js
+    assert 'id="agentRunStatus"' in app_js

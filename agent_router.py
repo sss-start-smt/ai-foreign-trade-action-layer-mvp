@@ -145,6 +145,26 @@ def _has_explicit_time_window(text: str) -> bool:
     ) or bool(re.search(r"[0-9一二两三四五六七八九十]+\s*(?:天|日|周|星期|个月)(?:内|以内)?", text))
 
 
+def _has_priority_goal(text: str) -> bool:
+    """Detect natural-language requests to rank orders/tasks by handling priority."""
+    if _contains_any(
+        text,
+        (
+            "最需要处理", "最该处理", "最值得处理", "先处理哪个", "先处理哪些",
+            "哪些要先处理", "哪个最急", "哪些最急", "最高优先级", "排优先级",
+            "处理优先级", "订单优先级", "任务优先级", "优先顺序", "处理顺序",
+            "先后顺序", "执行顺序", "先做哪些", "先做哪个", "优先处理", "挑出最", "最麻烦", "最严重",
+        ),
+    ):
+        return True
+    patterns = (
+        r"(?:排|排一下|排下|排个|排一排|梳理|分析|看看|看下|检查|比较).{0,12}(?:处理)?优先级",
+        r"(?:订单|这批订单|几笔订单|任务).{0,10}(?:处理)?优先级",
+        r"(?:排|梳理|分析|比较).{0,12}(?:优先|处理|执行|先后)(?:顺序|次序)",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def _risk_intent_score(text: str) -> tuple[int, dict[str, bool]]:
     """Score semantic signals for cross-order action-priority diagnosis."""
     signals = {
@@ -153,14 +173,7 @@ def _risk_intent_score(text: str) -> tuple[int, dict[str, bool]]:
             ("订单", "哪些订单", "几笔订单", "这批订单", "哪笔", "哪些要", "几个要"),
         ),
         "time_window": _has_explicit_time_window(text),
-        "priority_goal": _contains_any(
-            text,
-            (
-                "最需要处理", "最该处理", "最值得处理", "先处理哪个", "先处理哪些",
-                "哪些要先处理", "哪个最急", "哪些最急", "最高优先级", "排优先级",
-                "优先处理", "挑出最", "最麻烦", "最严重",
-            ),
-        ),
+        "priority_goal": _has_priority_goal(text),
         "risk_context": _contains_any(
             text,
             (
@@ -168,7 +181,13 @@ def _risk_intent_score(text: str) -> tuple[int, dict[str, bool]]:
                 "没有回复", "交期不对", "延期", "承诺逾期", "卡住", "来不及",
             ),
         ),
-        "inspection_action": _contains_any(text, ("帮我看看", "看一下", "检查", "巡检", "筛出", "挑出", "找出")),
+        "inspection_action": _contains_any(
+            text,
+            (
+                "帮我看看", "看一下", "检查", "巡检", "筛出", "挑出", "找出",
+                "排一下", "排下", "排个", "排一排", "梳理一下", "梳理",
+            ),
+        ),
     }
     score = 0
     if signals["order_scope"]:
@@ -321,7 +340,7 @@ def route_agent_request(question: str, context: dict[str, Any] | None = None) ->
     explicit_risk = _contains_any(routing_text, (
         "风险", "危险", "最急", "最紧急", "最优先", "优先处理", "最需要处理", "最该处理", "巡检", "排个优先级",
         "排优先级", "排序", "先处理哪个", "先处理哪些", "先做哪个", "最麻烦", "最严重",
-    ))
+    )) or _has_priority_goal(routing_text)
     risk_score, risk_signals = _risk_intent_score(routing_text)
     risk = explicit_risk or risk_score >= 5
     explain = _contains_any(routing_text, ("为什么", "为何", "原因", "解释", "凭什么", "相比", "区别"))
