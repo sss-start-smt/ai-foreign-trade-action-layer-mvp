@@ -3,25 +3,36 @@ from __future__ import annotations
 import hmac
 import json
 import os
-import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Depends, Request
 from pydantic import BaseModel, ConfigDict
 
 from coze_agent_client import agent_status as coze_agent_status, run_agent_chat
 from analytics import ensure_analytics_schema, track_event
 from agent_router import route_agent_request
+from database import db, insert_or_ignore, get_table_columns
+from auth import (
+    CurrentIdentity,
+    get_current_identity,
+    get_current_identity_optional,
+    resolve_identity_for_testing,
+    require_same_org,
+    require_manager,
+    require_order_access,
+    require_task_access,
+    require_run_access,
+    require_approval_access,
+    TRUSTED_USER_MAP,
+    DEMO_TOKEN_MAP,
+)
 
 CN_TZ = timezone(timedelta(hours=8))
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
 AGENT_API_KEY = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip()
 CRON_API_KEY = os.getenv("FLOWORDER_CRON_API_KEY", "").strip()
 ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() == "true"
@@ -140,20 +151,7 @@ def owner_allowed(owner: Any, user_id: str, role: str | None = None, allowed_own
     return normalized in allowed
 
 
-@contextmanager
-def db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def rowdict(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
@@ -166,6 +164,51 @@ def _require_agent_key(x_floworder_agent_key: str | None) -> None:
         raise HTTPException(401, "Agent工具密钥无效")
 
 
+def _resolve_identity_from_token(x_auth_token: str | None, authorization: str | None = None) -> CurrentIdentity | None:
+    """Resolve identity from auth token headers. Returns None if no valid token."""
+    token = None
+    if x_auth_token and x_auth_token in DEMO_TOKEN_MAP:
+        token = x_auth_token
+    elif authorization:
+        if authorization.startswith("Bearer "):
+            token = authorization[7:].strip()
+            if token not in DEMO_TOKEN_MAP:
+                token = None
+        elif authorization in DEMO_TOKEN_MAP:
+            token = authorization
+    if not token:
+        return None
+    user_id = DEMO_TOKEN_MAP[token]
+    info = TRUSTED_USER_MAP[user_id]
+    return CurrentIdentity(
+        user_id=user_id,
+        organization_id=info["organization_id"],
+        role=info["role"],
+        name=info.get("name", user_id),
+    )
+
+
+# resolve_identity_dependency is now imported as get_current_identity from auth.py
+resolve_identity_dependency = get_current_identity
+
+
+def record_audit_event(conn, identity: CurrentIdentity, action: str, entity_type: str, entity_id: str, result: str, details: dict) -> None:
+    try:
+        import json as _json
+        import uuid as _uuid
+        audit_id = str(_uuid.uuid4())
+        created_at = datetime.now(CN_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
+        try:
+            conn.execute(
+                "INSERT INTO audit_logs(audit_id,organization_id,actor_user_id,actor_role,action,entity_type,entity_id,result,details_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (audit_id, identity.organization_id, identity.user_id, identity.role, action, entity_type, entity_id, result, _json.dumps(details, ensure_ascii=False), created_at),
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _require_cron_key(x_floworder_cron_key: str | None) -> None:
     expected = CRON_API_KEY or AGENT_API_KEY
     if not expected:
@@ -174,18 +217,95 @@ def _require_cron_key(x_floworder_cron_key: str | None) -> None:
         raise HTTPException(401, "定时巡检密钥无效")
 
 
-def actor(payload: dict[str, Any]) -> dict[str, Any]:
-    user_id = str(payload.get("current_user_id") or "USER-1").strip()
-    role = str(payload.get("current_role") or ("manager" if user_id in MANAGER_IDS else "operator")).strip()
+def actor(payload: dict[str, Any], identity: CurrentIdentity | dict[str, Any]) -> dict[str, Any]:
+    """
+    Build actor context for authorization checks.
+    
+    SECURITY: For user-facing APIs, identity MUST be a server-resolved CurrentIdentity object.
+    Internal agent execution paths may pass a dict identity that was server-derived from
+    a CurrentIdentity via resolve_chat_identity_from_identity - this is trusted.
+    Client-supplied fields (current_user_id, current_role, organization_id) in raw
+    payloads are NEVER trusted unless validated by get_agent_identity().
+    
+    Raises HTTPException(401) if identity is not a valid CurrentIdentity or trusted dict.
+    """
+    if not identity:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Server-resolved identity required. Client-supplied identity fields are not trusted.",
+            },
+        )
+
+    if isinstance(identity, CurrentIdentity):
+        org_id = identity.organization_id
+        user_id = identity.user_id
+        user_role = identity.role
+    elif isinstance(identity, dict):
+        if not identity.get("_server_validated"):
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "AUTHENTICATION_REQUIRED",
+                    "message": "Server-resolved identity required. Client-supplied identity fields are not trusted.",
+                },
+            )
+        org_id = identity["organization_id"]
+        user_id = identity["current_user_id"]
+        user_role = identity["current_role"]
+    else:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Server-resolved identity required. Client-supplied identity fields are not trusted.",
+            },
+        )
+
     allowed = payload.get("allowed_owner_ids") or []
     if isinstance(allowed, str):
         allowed = [x.strip() for x in allowed.split(",") if x.strip()]
     return {
-        "organization_id": str(payload.get("organization_id") or "ORG-DEMO"),
+        "organization_id": org_id,
         "current_user_id": user_id,
-        "current_role": role,
+        "current_role": user_role,
         "allowed_owner_ids": allowed,
     }
+
+
+def get_agent_identity(payload: dict[str, Any], identity: CurrentIdentity | None = None) -> CurrentIdentity:
+    """
+    Resolve identity for API-key protected agent tool endpoints.
+
+    SECURITY: Priority order:
+    1. If middleware-resolved identity is provided and valid, use it (token-based auth)
+    2. Fall back to body-provided current_user_id for internal agent tool calls
+       (validated against TRUSTED_USER_MAP)
+    """
+    if identity is not None and isinstance(identity, CurrentIdentity):
+        return identity
+
+    user_id = str(payload.get("current_user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "IDENTITY_REQUIRED", "message": "Agent tool requires valid identity (token or current_user_id in payload)"},
+        )
+
+    if user_id not in TRUSTED_USER_MAP:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "UNKNOWN_USER", "message": f"Unknown user_id: {user_id}"},
+        )
+
+    info = TRUSTED_USER_MAP[user_id]
+    return CurrentIdentity(
+        user_id=user_id,
+        organization_id=info["organization_id"],
+        role=info["role"],
+        name=info.get("name", user_id),
+    )
 
 
 def resolve_chat_identity(payload: dict[str, Any]) -> dict[str, Any]:
@@ -195,6 +315,10 @@ def resolve_chat_identity(payload: dict[str, Any]) -> dict[str, Any]:
     identity is still a system context value. The model must not ask the business
     user to type internal IDs such as USER-1, and it must not be allowed to turn an
     operator into a manager merely because the natural-language prompt says so.
+
+    SECURITY: This legacy function still uses payload fields and is kept for
+    backward compatibility with non-authenticated paths. New code should use
+    resolve_chat_identity_from_identity() instead.
     """
     raw_user_id = payload.get("current_user_id") or "USER-1"
     user_id = normalize_owner(raw_user_id)
@@ -214,6 +338,31 @@ def resolve_chat_identity(payload: dict[str, Any]) -> dict[str, Any]:
         "current_role": role,
         "allowed_owner_ids": allowed_owner_ids,
         "scope_description": scope_description,
+    }
+
+
+def resolve_chat_identity_from_identity(identity: CurrentIdentity) -> dict[str, Any]:
+    """
+    Resolve chat identity from a server-validated CurrentIdentity.
+    
+    SECURITY: Uses only server-resolved identity information.
+    No client-supplied fields are trusted.
+    """
+    user_id = identity.user_id
+    if identity.is_manager():
+        allowed_owner_ids = sorted(uid for uid in KNOWN_USER_IDS if uid not in MANAGER_IDS)
+        scope_description = "团队订单"
+    else:
+        allowed_owner_ids = [user_id]
+        scope_description = "本人负责订单"
+    return {
+        "organization_id": identity.organization_id,
+        "current_user_id": user_id,
+        "current_user_name": OWNER_ID_TO_NAME.get(user_id, user_id),
+        "current_role": identity.role,
+        "allowed_owner_ids": allowed_owner_ids,
+        "scope_description": scope_description,
+        "_server_validated": True,
     }
 
 
@@ -261,7 +410,7 @@ def build_trusted_agent_question(question: str, identity: dict[str, Any], parame
 
 
 
-def enforce_run_budget(conn: sqlite3.Connection, run_id: str | None) -> None:
+def enforce_run_budget(conn: Any, run_id: str | None) -> None:
     """Enforce the server-side tool and time budget for Coze-driven runs."""
     if not run_id:
         return
@@ -302,7 +451,7 @@ def enforce_run_budget(conn: sqlite3.Connection, run_id: str | None) -> None:
         conn.commit()
         raise HTTPException(429, f"{reason}；请基于当前证据返回部分结果")
 
-def log_tool_call(conn: sqlite3.Connection, *, run_id: str | None, tool_name: str, request: dict[str, Any], response: Any,
+def log_tool_call(conn: Any, *, run_id: str | None, tool_name: str, request: dict[str, Any], response: Any,
                   status: str, duration_ms: int, error_code: str | None = None, error_message: str | None = None) -> str:
     call_id = new_id("ATC")
     conn.execute(
@@ -314,40 +463,100 @@ def log_tool_call(conn: sqlite3.Connection, *, run_id: str | None, tool_name: st
     return call_id
 
 
-def audit_event(conn: sqlite3.Connection, entity_type: str, entity_id: str | None, event_type: str,
-                payload: dict[str, Any], operator_id: str) -> None:
-    conn.execute(
-        "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
-        (new_id("EVT"), entity_type, entity_id, event_type, json.dumps(payload, ensure_ascii=False), operator_id, iso()),
-    )
+def audit_event(conn: Any, entity_type: str, entity_id: str | None, event_type: str,
+                payload: dict[str, Any], operator_id: str, org_id: str | None = None) -> None:
+    columns = {col["name"] for col in get_table_columns(conn, "event_logs")}
+    if "organization_id" in columns:
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,organization_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (new_id("EVT"), entity_type, entity_id, event_type, json.dumps(payload, ensure_ascii=False), operator_id, org_id or "ORG-DEMO", iso()),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), entity_type, entity_id, event_type, json.dumps(payload, ensure_ascii=False), operator_id, iso()),
+        )
 
 
-def _order_scope_sql(a: dict[str, Any]) -> tuple[str, list[Any]]:
+def _order_scope_sql(a: dict[str, Any], identity: CurrentIdentity | dict[str, Any] | None = None) -> tuple[str, list[Any]]:
+    """
+    Build SQL WHERE clause for order listing.
+    
+    SECURITY: If identity is provided, organization filtering is ALWAYS enforced.
+    Managers can see all orders within their org; operators can only see their own orders.
+    """
+    # If we have organization_id, filter by it (STRICT org boundary)
+    if identity:
+        if isinstance(identity, CurrentIdentity):
+            org_id = identity.organization_id
+            is_mgr = identity.is_manager()
+        elif isinstance(identity, dict):
+            org_id = identity["organization_id"]
+            is_mgr = identity["current_role"] == "manager"
+        else:
+            org_id = ""
+            is_mgr = False
+        
+        org_sql = "COALESCE(organization_id, '') = ?"
+        org_params = [org_id]
+        
+        if is_mgr:
+            # Manager: see all orders in this org
+            return org_sql, org_params
+        else:
+            # Operator: see only own orders within this org
+            return f"{org_sql} AND owner = ?", [*org_params, a["current_user_id"]]
+    
+    # Legacy fallback: when identity not available, use actor dict role
     if is_manager(a["current_user_id"], a["current_role"]):
+        # WARNING: This path should not be used for production API routes
+        # Manager sees all (org filter should have been applied by caller)
         return "1=1", []
+    
     allowed = {normalize_owner(a["current_user_id"])}
     allowed.update(normalize_owner(x) for x in a["allowed_owner_ids"] if normalize_owner(x))
     placeholders = ",".join("?" for _ in allowed)
     return f"owner IN ({placeholders})", list(allowed)
 
 
-def _assert_order_access(conn: sqlite3.Connection, order_id: str, a: dict[str, Any]) -> dict[str, Any]:
+def _assert_order_access(conn: Any, order_id: str, a: dict[str, Any], identity: CurrentIdentity | dict[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Assert that the current user can access an order.
+    
+    SECURITY: If identity is provided, uses server-side organization + role checks.
+    Falls back to actor dict checks only for legacy internal calls.
+    """
     row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
     if not row:
         raise HTTPException(404, "订单不存在")
     order = dict(row)
-    if not owner_allowed(order.get("owner"), a["current_user_id"], a["current_role"], a["allowed_owner_ids"]):
-        raise HTTPException(403, "无权访问该订单")
+    
+    if identity:
+        # Convert dict identity to CurrentIdentity if needed
+        if isinstance(identity, dict):
+            identity = CurrentIdentity(
+                user_id=identity["current_user_id"],
+                organization_id=identity["organization_id"],
+                role=identity["current_role"],
+                name=identity["current_user_id"],
+            )
+        # Use secure server-side access control
+        require_order_access(identity, order, conn)
+    else:
+        # Legacy fallback - should not be used for API routes
+        if not owner_allowed(order.get("owner"), a["current_user_id"], a["current_role"], a["allowed_owner_ids"]):
+            raise HTTPException(403, "无权访问该订单")
+    
     return order
 
 
-def list_candidate_orders_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
-    a = actor(payload)
+def list_candidate_orders_logic(conn: Any, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
+    a = actor(payload, identity)
     due_days = max(1, min(int(payload.get("due_within_days") or 14), 90))
     limit = max(1, min(int(payload.get("limit") or 50), 200))
     current = parse_dt(payload.get("current_time")) or now_cn()
     deadline = current + timedelta(days=due_days)
-    scope_sql, scope_params = _order_scope_sql(a)
+    scope_sql, scope_params = _order_scope_sql(a, identity)
     rows = [dict(r) for r in conn.execute(
         f"SELECT * FROM orders WHERE {scope_sql} AND UPPER(COALESCE(status,'ACTIVE')) NOT IN ('DONE','CLOSED','CANCELLED','COMPLETED') ORDER BY requested_delivery_date,updated_at DESC",
         scope_params,
@@ -424,12 +633,12 @@ def list_candidate_orders_logic(conn: sqlite3.Connection, payload: dict[str, Any
     return {"scope": a, "due_within_days": due_days, "count": len(candidates[:limit]), "items": candidates[:limit]}
 
 
-def order_context_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
-    a = actor(payload)
+def order_context_logic(conn: Any, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
+    a = actor(payload, identity)
     order_id = str(payload.get("order_id") or "").strip()
     if not order_id:
         raise HTTPException(422, "缺少order_id")
-    order = _assert_order_access(conn, order_id, a)
+    order = _assert_order_access(conn, order_id, a, identity)
     event_limit = max(1, min(int(payload.get("event_limit") or 20), 100))
     messages = [dict(r) for r in conn.execute(
         "SELECT * FROM source_messages WHERE order_id=? ORDER BY COALESCE(source_time,created_at) DESC LIMIT ?", (order_id, event_limit)
@@ -503,16 +712,16 @@ def _delivery_risk(order: dict[str, Any], current: datetime) -> tuple[bool, floa
     return score >= 40, score, evidence, missing
 
 
-def build_anomaly_logic(conn: sqlite3.Connection, payload: dict[str, Any], persist: bool = True) -> dict[str, Any]:
-    a = actor(payload)
+def build_anomaly_logic(conn: Any, payload: dict[str, Any], persist: bool = True, identity: CurrentIdentity | None = None) -> dict[str, Any]:
+    a = actor(payload, identity)
     order_id = str(payload.get("order_id") or "").strip()
-    order = _assert_order_access(conn, order_id, a)
+    order = _assert_order_access(conn, order_id, a, identity)
     current = parse_dt(payload.get("current_time")) or now_cn()
     requested_types = payload.get("anomaly_types") or list(ANOMALY_TYPES)
     if isinstance(requested_types, str):
         requested_types = [requested_types]
     requested_types = {x for x in requested_types if x in ANOMALY_TYPES}
-    ctx = order_context_logic(conn, {**payload, "order_id": order_id})
+    ctx = order_context_logic(conn, {**payload, "order_id": order_id}, identity)
     candidates: list[dict[str, Any]] = []
 
     # 1) Supplier commitment overdue.
@@ -735,15 +944,15 @@ def aggregate_order_candidates(items: list[dict[str, Any]], top_n: int = 7) -> d
     }
 
 
-def create_approval_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
-    a = actor(payload)
+def create_approval_logic(conn: Any, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
+    a = actor(payload, identity)
     action_type = str(payload.get("action_type") or "").strip().upper()
     allowed = {"CONFIRM_ANOMALY", "CREATE_TASK", "RECORD_CONTACT", "UPDATE_ORDER", "SEND_MESSAGE", "ACCEPT_DELAY", "HIGH_RISK_OVERRIDE"}
     if action_type not in allowed:
         raise HTTPException(422, f"不支持的审批动作：{action_type}")
     order_id = str(payload.get("order_id") or "").strip() or None
     if order_id:
-        _assert_order_access(conn, order_id, a)
+        _assert_order_access(conn, order_id, a, identity)
     high_risk = action_type in {"UPDATE_ORDER", "ACCEPT_DELAY", "HIGH_RISK_OVERRIDE"} or bool(payload.get("high_risk"))
     required_role = "manager" if high_risk else "operator_or_manager"
     approval_id = new_id("APR")
@@ -764,7 +973,7 @@ def create_approval_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> 
             "message": "已创建人工审批请求，尚未执行正式写操作"}
 
 
-def _commit_approved_action(conn: sqlite3.Connection, approval: dict[str, Any], operator_id: str) -> dict[str, Any]:
+def _commit_approved_action(conn: Any, approval: dict[str, Any], operator_id: str) -> dict[str, Any]:
     payload = safe_json(approval.get("payload_json"), {})
     action_type = approval["action_type"]
     now = iso()
@@ -806,9 +1015,26 @@ def _commit_approved_action(conn: sqlite3.Connection, approval: dict[str, Any], 
         updates = {k: v for k, v in (payload.get("updates") or {}).items() if k in allowed_fields}
         if not updates:
             raise HTTPException(422, "没有可写入的订单字段")
-        set_sql = ",".join(f"{k}=?" for k in updates)
-        conn.execute(f"UPDATE orders SET {set_sql},updated_at=? WHERE order_id=?", (*updates.values(), now, order_id))
-        return {"order_id": order_id, "updated_fields": list(updates)}
+
+        # D12 transition guard: legacy Agent approval is no longer an execution
+        # authority for formal customer commitments. Keep the historical
+        # approval record for compatibility, but do not mutate protected fields.
+        protected_fields = {"requested_delivery_date"}
+        blocked = sorted(protected_fields.intersection(updates))
+        safe_updates = {k: v for k, v in updates.items() if k not in protected_fields}
+        if safe_updates:
+            set_sql = ",".join(f"{k}=?" for k in safe_updates)
+            conn.execute(f"UPDATE orders SET {set_sql},updated_at=? WHERE order_id=?", (*safe_updates.values(), now, order_id))
+        return {
+            "order_id": order_id,
+            "updated_fields": list(safe_updates),
+            "blocked_fields": blocked,
+            "d12_review_required": bool(blocked),
+            "message": (
+                "客户正式交期已被D12保护；旧Agent审批只保留审批记录，不再直接写该字段。"
+                if blocked else "低风险旧字段更新已记录。"
+            ),
+        }
     # Sending external messages is intentionally not implemented in V1.
     if action_type == "SEND_MESSAGE":
         return {"status": "APPROVED_NOT_SENT", "message": "首版不自动发送，仅记录人工审批结果"}
@@ -817,23 +1043,25 @@ def _commit_approved_action(conn: sqlite3.Connection, approval: dict[str, Any], 
     raise HTTPException(422, "审批动作尚未实现")
 
 
-def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+def run_inspection_logic(conn: Any, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
     """Run the deterministic fallback inspection without pretending it is Coze Agent."""
-    a = actor(payload)
+    a = actor(payload, identity)
     run_id = str(payload.get("run_id") or new_id("AGR"))
     trigger_type = str(payload.get("trigger_type") or "MANUAL_RULE").upper()
     started = time.perf_counter()
-    conn.execute(
-        """INSERT OR IGNORE INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
-           max_tool_calls,max_duration_seconds,started_at,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+    insert_or_ignore(
+        conn, "agent_runs",
+        ["run_id", "organization_id", "current_user_id", "current_role", "goal",
+         "trigger_type", "status", "max_tool_calls", "max_duration_seconds", "started_at", "created_at"],
         (run_id, a["organization_id"], a["current_user_id"], a["current_role"],
-         payload.get("goal") or "规则巡检近期订单", trigger_type, "RUNNING", AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
+         payload.get("goal") or "规则巡检近期订单", trigger_type, "RUNNING",
+         AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, iso(), iso()),
+        conflict_key="run_id",
     )
-    screened = list_candidate_orders_logic(conn, {**payload, **a, "limit": 50})
+    screened = list_candidate_orders_logic(conn, {**payload, **a, "limit": 50}, identity)
     all_candidates: list[dict[str, Any]] = []
     for order in screened["items"]:
-        result = build_anomaly_logic(conn, {**payload, **a, "run_id": run_id, "order_id": order["order_id"]}, persist=True)
+        result = build_anomaly_logic(conn, {**payload, **a, "run_id": run_id, "order_id": order["order_id"]}, persist=True, identity=identity)
         all_candidates.extend(result["items"])
 
     # Retire unresolved rule candidates that were in scope but did not recur in
@@ -909,12 +1137,12 @@ def run_inspection_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> d
 
 
 
-def create_task_draft_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+def create_task_draft_logic(conn: Any, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
     """Create a bounded task draft and optional approval using one shared implementation."""
     body = dict(payload)
-    a = actor(body)
+    a = actor(body, identity)
     enforce_run_budget(conn, body.get("run_id"))
-    order = _assert_order_access(conn, str(body.get("order_id") or ""), a)
+    order = _assert_order_access(conn, str(body.get("order_id") or ""), a, identity)
     draft_id = new_id("TDRAFT")
     task = {
         "task_draft_id": draft_id,
@@ -961,7 +1189,7 @@ def create_task_draft_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -
             "idempotency_key": body.get("approval_idempotency_key") or f"CREATE_TASK:{body.get('run_id')}:{order['order_id']}",
             "high_risk": str(task["risk_level"]).lower() in {"high", "critical"},
         }
-        approval = create_approval_logic(conn, approval_payload)
+        approval = create_approval_logic(conn, approval_payload, identity)
         task.update(
             {
                 "approval_id": approval.get("approval_id"),
@@ -1023,7 +1251,7 @@ def create_task_draft_logic(conn: sqlite3.Connection, payload: dict[str, Any]) -
     return task
 
 
-def _load_previous_diagnosis(conn: sqlite3.Connection, previous_run_id: str | None, identity: dict[str, Any]) -> dict[str, Any] | None:
+def _load_previous_diagnosis(conn: Any, previous_run_id: str | None, identity: dict[str, Any]) -> dict[str, Any] | None:
     if not previous_run_id:
         return None
     row = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (previous_run_id,)).fetchone()
@@ -1111,7 +1339,7 @@ def _format_diagnosis_answer(
 
 
 def _execute_deterministic_plan(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     plan: dict[str, Any],
     body: dict[str, Any],
@@ -1134,12 +1362,13 @@ def _execute_deterministic_plan(
             conn,
             {
                 **body,
-                **actor(identity),
+                **actor(body, identity),
                 "run_id": run_id,
                 "due_within_days": extracted.get("due_within_days") or body.get("due_within_days") or 14,
                 "top_n": extracted.get("top_n") or body.get("top_n") or 7,
                 "source": "backend_agent_router",
             },
+            identity=identity,
         )
         log_tool_call(
             conn,
@@ -1168,7 +1397,7 @@ def _execute_deterministic_plan(
             conn,
             {
                 **body,
-                **actor(identity),
+                **actor(body, identity),
                 "run_id": run_id,
                 "text": body.get("question"),
                 "source": "backend_agent_router",
@@ -1197,7 +1426,7 @@ def _execute_deterministic_plan(
             ref = str(extracted.get("order_refs")[0]).upper()
             row = conn.execute("SELECT * FROM orders WHERE UPPER(order_no)=? OR UPPER(order_id)=? LIMIT 1", (ref, ref)).fetchone()
             if row:
-                order = _assert_order_access(conn, row["order_id"], actor(identity))
+                order = _assert_order_access(conn, row["order_id"], actor(body, identity), identity)
                 target = {
                     "order_id": order["order_id"],
                     "order_no": order.get("order_no"),
@@ -1212,7 +1441,7 @@ def _execute_deterministic_plan(
                 conn,
                 {
                     **body,
-                    **actor(identity),
+                    **actor(body, identity),
                     "run_id": run_id,
                     "order_id": target.get("order_id"),
                     "title": f"处理{target.get('order_no') or target.get('order_id')}风险事项",
@@ -1221,6 +1450,7 @@ def _execute_deterministic_plan(
                     "risk_level": risk_level,
                     "create_approval_request": bool(body.get("create_approval_request", True)),
                 },
+                identity=identity,
             )
 
     if diagnosis:
@@ -1402,7 +1632,7 @@ def _execute_agent_chat_job(
                 )
             conn.commit()
 
-def _agent_chat_job_payload(row: sqlite3.Row) -> dict[str, Any]:
+def _agent_chat_job_payload(row: Any) -> dict[str, Any]:
     data = dict(row)
     result = safe_json(data.pop("result_json", None), None)
     request_data = safe_json(data.pop("request_json", None), {})
@@ -1426,7 +1656,7 @@ def register_agent_api(app) -> None:
     router = APIRouter()
 
     @router.get("/api/agent/status")
-    def agent_status() -> dict[str, Any]:
+    def agent_status(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         coze = coze_agent_status()
         with db() as conn:
             last_agent_run = conn.execute(
@@ -1457,7 +1687,7 @@ def register_agent_api(app) -> None:
                 "hybrid_intent_router": True,
                 "multi_intent_plan": True,
                 "standard_agent_tool_turns": 1,
-                "shared_ranking_rule": "FT04_SHARED_V1",
+                "shared_ranking_rule": "D14_2_ATTENTION_V1",
                 "coze_only_for_open_goals": True,
                 "compact_final_answer": True,
             },
@@ -1465,10 +1695,14 @@ def register_agent_api(app) -> None:
 
     # ---- Coze plugin tools (API-key protected) ----
     @router.post("/api/agent/tools/runs/start")
-    def tool_start_run(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_start_run(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump()
-        a = actor(body)
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
+        a = actor(body, resolved)
         run_id = new_id("AGR")
         with db() as conn:
             conn.execute(
@@ -1486,24 +1720,32 @@ def register_agent_api(app) -> None:
         return {"run_id": run_id, "status": "RUNNING", "max_tool_calls": AGENT_MAX_TOOL_CALLS, "max_duration_seconds": AGENT_MAX_DURATION_SECONDS}
 
     @router.post("/api/agent/tools/candidate-orders/list")
-    def tool_list_candidate_orders(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_list_candidate_orders(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); started = time.perf_counter()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
             enforce_run_budget(conn, body.get("run_id"))
-            result = list_candidate_orders_logic(conn, body)
+            result = list_candidate_orders_logic(conn, body, resolved)
             log_tool_call(conn, run_id=body.get("run_id"), tool_name="list_candidate_orders", request=body, response=result,
                           status="SUCCESS", duration_ms=int((time.perf_counter()-started)*1000))
             conn.commit()
         return result
 
     @router.post("/api/agent/tools/orders/context")
-    def tool_get_order_context(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_get_order_context(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); started = time.perf_counter()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
             enforce_run_budget(conn, body.get("run_id"))
-            result = order_context_logic(conn, body)
+            result = order_context_logic(conn, body, resolved)
             log_tool_call(conn, run_id=body.get("run_id"), tool_name="get_order_diagnostic_context", request=body,
                           response={"order_id": body.get("order_id"), "evidence_summary": result["evidence_summary"]},
                           status="SUCCESS", duration_ms=int((time.perf_counter()-started)*1000))
@@ -1511,12 +1753,16 @@ def register_agent_api(app) -> None:
         return result
 
     @router.post("/api/agent/tools/anomalies/build")
-    def tool_build_anomaly(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_build_anomaly(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); started = time.perf_counter()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
             enforce_run_budget(conn, body.get("run_id"))
-            result = build_anomaly_logic(conn, body, persist=True)
+            result = build_anomaly_logic(conn, body, persist=True, identity=resolved)
             log_tool_call(conn, run_id=body.get("run_id"), tool_name="build_anomaly_candidate", request=body,
                           response={"count": result["count"], "candidate_ids": [x["candidate_id"] for x in result["items"]]},
                           status="SUCCESS", duration_ms=int((time.perf_counter()-started)*1000))
@@ -1524,7 +1770,7 @@ def register_agent_api(app) -> None:
         return result
 
     @router.post("/api/agent/tools/anomalies/rank")
-    def tool_rank_anomalies(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_rank_anomalies(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); items = body.get("items") or []
         if not isinstance(items, list): raise HTTPException(422, "items必须是数组")
@@ -1536,20 +1782,29 @@ def register_agent_api(app) -> None:
         return {"count": len(ranked), "items": ranked}
 
     @router.post("/api/agent/tools/task-drafts/create")
-    def tool_create_task_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_create_task_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
+        body = payload.model_dump()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
-            result = create_task_draft_logic(conn, payload.model_dump())
+            result = create_task_draft_logic(conn, body, resolved)
             conn.commit()
         return result
 
     @router.post("/api/agent/tools/message-drafts/create")
-    def tool_create_message_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_create_message_draft(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
-        body = payload.model_dump(); a = actor(body)
+        body = payload.model_dump()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
             enforce_run_budget(conn, body.get("run_id"))
-            ctx = order_context_logic(conn, body)
+            ctx = order_context_logic(conn, body, resolved)
             order = ctx["order"]
             recipient = str(body.get("recipient_role") or "supplier")
             questions = body.get("questions_to_ask") or []
@@ -1569,19 +1824,24 @@ def register_agent_api(app) -> None:
                 body_text += "确认后我们会及时同步对后续安排的影响。"
                 subject = f"关于{order.get('order_no')}待确认事项"
             draft_id = new_id("ADRAFT")
+            a = actor(body, resolved)
             draft = {"draft_id": draft_id, "subject": subject, "draft": body_text, "fact_ids_used": facts,
                      "questions_to_ask": questions, "status": "DRAFT", "requires_human_review": True, "auto_send": False}
             audit_event(conn, "agent_draft", draft_id, "AGENT_MESSAGE_DRAFT_CREATED", draft, a["current_user_id"]); conn.commit()
         return draft
 
     @router.post("/api/agent/tools/approvals/create")
-    def tool_create_approval(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_create_approval(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
+        body = payload.model_dump()
+        x_auth_token = request.headers.get("x-auth-token") if request else None
+        authorization = request.headers.get("authorization") if request else None
+        token_identity = _resolve_identity_from_token(x_auth_token, authorization)
+        resolved = get_agent_identity(body, token_identity)
         with db() as conn:
-            body = payload.model_dump()
             enforce_run_budget(conn, body.get("run_id"))
-            result = create_approval_logic(conn, body)
-            a = actor(body)
+            result = create_approval_logic(conn, body, resolved)
+            a = actor(body, resolved)
             log_tool_call(conn, run_id=body.get("run_id"), tool_name="create_approval_request",
                           request={"order_id": body.get("order_id"), "action_type": body.get("action_type")},
                           response={"approval_id": result.get("approval_id"), "status": result.get("status"),
@@ -1597,7 +1857,7 @@ def register_agent_api(app) -> None:
         return result
 
     @router.post("/api/agent/tools/approvals/status")
-    def tool_approval_status(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_approval_status(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         approval_id = str(payload.model_dump().get("approval_id") or "")
         with db() as conn:
@@ -1608,7 +1868,7 @@ def register_agent_api(app) -> None:
         return result
 
     @router.post("/api/agent/tools/runs/complete")
-    def tool_complete_run(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_complete_run(payload: AnyPayload, x_floworder_agent_key: str | None = Header(None), request: Request = None) -> dict[str, Any]:
         _require_agent_key(x_floworder_agent_key)
         body = payload.model_dump(); run_id = str(body.get("run_id") or "")
         with db() as conn:
@@ -1632,21 +1892,21 @@ def register_agent_api(app) -> None:
 
     # ---- FlowOrder website / human approval endpoints ----
     @router.get("/api/agent/overview")
-    def agent_overview(current_user_id: str = Query("USER-1"), current_role: str = Query("operator")) -> dict[str, Any]:
-        a = actor({"current_user_id": current_user_id, "current_role": current_role})
+    def agent_overview(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+        a = actor({"current_user_id": identity.user_id, "current_role": identity.role}, identity)
         with db() as conn:
-            scope_sql, params = _order_scope_sql(a)
+            scope_sql, params = _order_scope_sql(a, identity)
             cands = [dict(r) for r in conn.execute(
-                f"""SELECT a.*,o.order_no,o.customer_name,o.owner FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id
-                    WHERE {scope_sql.replace('owner','o.owner')} AND a.status!='SUPERSEDED'
+                f"""SELECT a.*,o.order_no,o.customer_name,o.owner,o.organization_id AS order_org_id FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id
+                    WHERE {scope_sql.replace('owner','o.owner').replace('COALESCE(organization_id', 'COALESCE(o.organization_id')} AND a.status!='SUPERSEDED'
                     ORDER BY a.updated_at DESC, a.created_at DESC LIMIT 150""", params)]
             approvals = [dict(r) for r in conn.execute(
                 f"""SELECT p.*,o.order_no,o.customer_name FROM approval_requests p LEFT JOIN orders o ON o.order_id=p.order_id
-                    WHERE ({scope_sql.replace('owner','o.owner')}) OR p.requested_by=? ORDER BY p.created_at DESC LIMIT 50""", [*params, current_user_id])]
+                    WHERE ({scope_sql.replace('owner','o.owner').replace('COALESCE(organization_id', 'COALESCE(o.organization_id')}) OR p.requested_by=? ORDER BY p.created_at DESC LIMIT 50""", [*params, identity.user_id])]
             reports = [dict(r) for r in conn.execute(
-                "SELECT * FROM daily_inspection_reports WHERE current_user_id=? ORDER BY created_at DESC LIMIT 10", (current_user_id,))]
+                "SELECT * FROM daily_inspection_reports WHERE current_user_id=? ORDER BY created_at DESC LIMIT 10", (identity.user_id,))]
             latest_run_row = conn.execute(
-                "SELECT * FROM agent_runs WHERE current_user_id=? ORDER BY created_at DESC LIMIT 1", (current_user_id,)
+                "SELECT * FROM agent_runs WHERE current_user_id=? ORDER BY created_at DESC LIMIT 1", (identity.user_id,)
             ).fetchone()
             calls = [dict(r) for r in conn.execute(
                 "SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (latest_run_row["run_id"],)
@@ -1682,24 +1942,24 @@ def register_agent_api(app) -> None:
         }
 
     @router.post("/api/agent/chat/jobs", status_code=202)
-    def create_agent_chat_job(payload: AnyPayload) -> dict[str, Any]:
+    def create_agent_chat_job(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         body = payload.model_dump()
         question = str(body.get("question") or "").strip()
         if not question:
             raise HTTPException(422, "问题不能为空")
-        identity = resolve_chat_identity(body)
-        user_id = identity["current_user_id"]
-        role = identity["current_role"]
+        chat_identity = resolve_chat_identity_from_identity(identity)
+        user_id = chat_identity["current_user_id"]
+        role = identity.role
         job_id = new_id("AJOB")
         run_id = new_id("AGR")
         created_at = iso()
         parameters = {
-            "organization_id": identity["organization_id"],
+            "organization_id": identity.organization_id,
             "current_user_id": user_id,
-            "current_user_name": identity["current_user_name"],
+            "current_user_name": chat_identity["current_user_name"],
             "current_role": role,
-            "allowed_owner_ids": identity["allowed_owner_ids"],
-            "scope_description": identity["scope_description"],
+            "allowed_owner_ids": chat_identity["allowed_owner_ids"],
+            "scope_description": chat_identity["scope_description"],
             "default_due_within_days": max(1, min(int(body.get("due_within_days") or 14), 90)),
             "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
             "create_task_draft": bool(body.get("create_task_draft", True)),
@@ -1718,7 +1978,7 @@ def register_agent_api(app) -> None:
         ).to_dict()
         body["_route_plan"] = route_plan
         parameters["route_plan"] = route_plan
-        agent_question = build_trusted_agent_question(question, identity, parameters)
+        agent_question = build_trusted_agent_question(question, chat_identity, parameters)
         with db() as conn:
             # Railway redeploys can terminate worker threads while leaving RUNNING rows.
             stale_before = iso(now_cn() - timedelta(minutes=5))
@@ -1740,11 +2000,11 @@ def register_agent_api(app) -> None:
                 """INSERT INTO agent_runs(run_id,organization_id,current_user_id,current_role,goal,trigger_type,status,
                    max_tool_calls,max_duration_seconds,started_at,created_at)
                    VALUES(?,?,?,?,?,'USER_BACKEND_MANAGED','RUNNING',?,?,?,?)""",
-                (run_id, identity["organization_id"], user_id, role, question,
+                (run_id, identity.organization_id, user_id, role, question,
                  AGENT_MAX_TOOL_CALLS, AGENT_MAX_DURATION_SECONDS, created_at, created_at),
             )
             track_event(
-                conn, "agent_run_started", organization_id=identity["organization_id"], user_id=user_id,
+                conn, "agent_run_started", organization_id=identity.organization_id, user_id=user_id,
                 user_role=role, run_id=run_id, source="website_agent_job",
                 properties={"goal": question[:120], "trigger_type": "USER_BACKEND_MANAGED",
                             "performance_profile": "HYBRID_ROUTED_AGENT",
@@ -1758,7 +2018,7 @@ def register_agent_api(app) -> None:
                    VALUES(?,?,?,?,?,'QUEUED',?,?,?,?)""",
                 (
                     job_id,
-                    identity["organization_id"],
+                    identity.organization_id,
                     user_id,
                     role,
                     question,
@@ -1775,7 +2035,7 @@ def register_agent_api(app) -> None:
                 "job_id": job_id,
                 "user_id": user_id,
                 "body": body,
-                "identity": identity,
+                "identity": chat_identity,
                 "parameters": parameters,
                 "agent_question": agent_question,
                 "started_at": created_at,
@@ -1790,29 +2050,34 @@ def register_agent_api(app) -> None:
         return _agent_chat_job_payload(row)
 
     @router.get("/api/agent/chat/jobs/{job_id}")
-    def get_agent_chat_job(job_id: str) -> dict[str, Any]:
+    def get_agent_chat_job(job_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with db() as conn:
             row = conn.execute("SELECT * FROM agent_chat_jobs WHERE job_id=?", (job_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Agent后台任务不存在")
+        record = dict(row)
+        if record.get("organization_id") != identity.organization_id:
+            raise HTTPException(403, "无权访问其他组织的Agent任务")
+        if not identity.is_manager() and record.get("current_user_id") != identity.user_id:
+            raise HTTPException(403, "无权访问其他用户的Agent任务")
         return _agent_chat_job_payload(row)
 
     @router.post("/api/agent/chat")
-    def agent_chat(payload: AnyPayload) -> dict[str, Any]:
+    def agent_chat(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         body = payload.model_dump()
         question = str(body.get("question") or "").strip()
         if not question:
             raise HTTPException(422, "问题不能为空")
-        identity = resolve_chat_identity(body)
-        user_id = identity["current_user_id"]
-        role = identity["current_role"]
+        chat_identity = resolve_chat_identity_from_identity(identity)
+        user_id = chat_identity["current_user_id"]
+        role = identity.role
         parameters = {
-            "organization_id": identity["organization_id"],
+            "organization_id": identity.organization_id,
             "current_user_id": user_id,
-            "current_user_name": identity["current_user_name"],
+            "current_user_name": chat_identity["current_user_name"],
             "current_role": role,
-            "allowed_owner_ids": identity["allowed_owner_ids"],
-            "scope_description": identity["scope_description"],
+            "allowed_owner_ids": chat_identity["allowed_owner_ids"],
+            "scope_description": chat_identity["scope_description"],
             "default_due_within_days": max(1, min(int(body.get("due_within_days") or 14), 90)),
             "default_top_n": max(1, min(int(body.get("top_n") or 7), 7)),
             "create_task_draft": bool(body.get("create_task_draft", True)),
@@ -1820,7 +2085,7 @@ def register_agent_api(app) -> None:
             "run_managed_by_backend": False,
             "response_mode": "COMPACT",
         }
-        agent_question = build_trusted_agent_question(question, identity, parameters)
+        agent_question = build_trusted_agent_question(question, chat_identity, parameters)
         started_at = iso()
         try:
             result = run_agent_chat(user_id=user_id, question=agent_question, parameters=parameters,
@@ -1837,18 +2102,18 @@ def register_agent_api(app) -> None:
             "execution_mode": "COZE_AGENT",
             "run": dict(latest) if latest else None,
             "resolved_identity": {
-                "current_user_id": identity["current_user_id"],
-                "current_user_name": identity["current_user_name"],
-                "current_role": identity["current_role"],
-                "scope_description": identity["scope_description"],
+                "current_user_id": chat_identity["current_user_id"],
+                "current_user_name": chat_identity["current_user_name"],
+                "current_role": chat_identity["current_role"],
+                "scope_description": chat_identity["scope_description"],
             },
         }
 
     @router.post("/api/agent/inspection/run")
-    def run_inspection(payload: AnyPayload) -> dict[str, Any]:
+    def run_inspection(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         body = payload.model_dump()
         with db() as conn:
-            result = run_inspection_logic(conn, body); conn.commit()
+            result = run_inspection_logic(conn, body, identity); conn.commit()
         return result
 
     @router.post("/api/agent/inspection/scheduled")
@@ -1858,29 +2123,50 @@ def register_agent_api(app) -> None:
         results = []
         with db() as conn:
             for user_id in user_ids:
-                results.append(run_inspection_logic(conn, {**body, "current_user_id": user_id, "current_role": "operator", "trigger_type": "SCHEDULED"}))
+                info = TRUSTED_USER_MAP.get(user_id)
+                if not info:
+                    continue
+                cron_identity = CurrentIdentity(
+                    user_id=user_id,
+                    organization_id=info["organization_id"],
+                    role=info["role"],
+                    name=info.get("name", user_id),
+                )
+                results.append(run_inspection_logic(conn, {**body, "current_user_id": user_id, "current_role": info["role"], "trigger_type": "SCHEDULED"}, identity=cron_identity))
             conn.commit()
         return {"status": "COMPLETED", "inspection_time": iso(), "results": results}
 
     @router.post("/api/agent/candidates/{candidate_id}/decision")
-    def decide_candidate(candidate_id: str, payload: AnyPayload) -> dict[str, Any]:
-        body = payload.model_dump(); operator_id = str(body.get("operator_id") or "USER-1")
+    def decide_candidate(candidate_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+        body = payload.model_dump()
+        operator_id = identity.user_id
         decision = str(body.get("decision") or "").upper()
         if decision not in {"CONFIRM", "REJECT", "RESOLVE"}: raise HTTPException(422, "decision必须为CONFIRM/REJECT/RESOLVE")
         new_status = {"CONFIRM":"CONFIRMED", "REJECT":"REJECTED", "RESOLVE":"RESOLVED"}[decision]
         with db() as conn:
-            row = conn.execute("SELECT a.*,o.owner FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id WHERE candidate_id=?", (candidate_id,)).fetchone()
+            row = conn.execute("SELECT a.*,o.owner,o.organization_id FROM anomaly_candidates a JOIN orders o ON o.order_id=a.order_id WHERE candidate_id=?", (candidate_id,)).fetchone()
             if not row: raise HTTPException(404, "异常候选不存在")
-            if not owner_allowed(row["owner"], operator_id, body.get("current_role")): raise HTTPException(403, "无权处理该异常候选")
+            candidate_dict = dict(row)
+            # ENFORCE: Organization boundary check
+            order_org = candidate_dict.get("organization_id") or ""
+            if order_org:
+                require_same_org(identity, order_org)
+            
+            owner_val = candidate_dict.get("owner")
+            if not identity.is_manager() and str(owner_val or "") not in {identity.user_id, ""}:
+                raise HTTPException(403, "无权处理该异常候选")
             conn.execute("UPDATE anomaly_candidates SET status=?,confirmed_by=?,confirmed_at=?,resolution_note=?,updated_at=? WHERE candidate_id=?",
                          (new_status, operator_id if decision=="CONFIRM" else None, iso() if decision=="CONFIRM" else None,
                           body.get("note"), iso(), candidate_id))
-            audit_event(conn, "anomaly_candidate", candidate_id, f"ANOMALY_{new_status}", body, operator_id); conn.commit()
+            audit_event(conn, "anomaly_candidate", candidate_id, f"ANOMALY_{new_status}", body, operator_id)
+            record_audit_event(conn, identity, "ANOMALY_CANDIDATE_DECIDE", "anomaly_candidate", candidate_id, "SUCCESS", body)
+            conn.commit()
         return {"candidate_id": candidate_id, "status": new_status}
 
     @router.post("/api/agent/approvals/{approval_id}/decision")
-    def decide_approval(approval_id: str, payload: AnyPayload) -> dict[str, Any]:
-        body = payload.model_dump(); operator_id = str(body.get("operator_id") or "USER-1")
+    def decide_approval(approval_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+        body = payload.model_dump()
+        operator_id = identity.user_id
         decision = str(body.get("decision") or "").upper()
         if decision not in {"APPROVE", "REJECT"}: raise HTTPException(422, "decision必须为APPROVE或REJECT")
         with db() as conn:
@@ -1889,19 +2175,31 @@ def register_agent_api(app) -> None:
             if not row: raise HTTPException(404, "审批请求不存在")
             approval = dict(row)
             if approval["status"] != "PENDING": return {"approval_id": approval_id, "status": approval["status"], "duplicate_skipped": True}
+            
+            # Get related order for org check
+            order_dict = None
             if approval.get("order_id"):
-                _assert_order_access(conn, approval["order_id"], actor({"current_user_id": operator_id, "current_role": body.get("current_role")}))
-            if approval["required_role"] == "manager" and not is_manager(operator_id, body.get("current_role")):
+                order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (approval["order_id"],)).fetchone()
+                if order_row:
+                    order_dict = dict(order_row)
+            
+            # ENFORCE: Organization boundary check - approval must belong to current user's org
+            require_approval_access(identity, approval, order_dict)
+            
+            # ENFORCE: Role check - manager required for high-risk approvals
+            if approval["required_role"] == "manager" and not identity.is_manager():
                 raise HTTPException(403, "该高风险动作需要主管审批")
+            
             result = None
             if decision == "APPROVE": result = _commit_approved_action(conn, approval, operator_id)
             new_status = "APPROVED" if decision == "APPROVE" else "REJECTED"
             conn.execute("UPDATE approval_requests SET status=?,decided_by=?,decision_note=?,decided_at=?,result_json=?,updated_at=? WHERE approval_id=?",
                          (new_status, operator_id, body.get("note"), iso(), json.dumps(result or {}, ensure_ascii=False), iso(), approval_id))
             audit_event(conn, "approval", approval_id, f"AGENT_APPROVAL_{new_status}", body, operator_id)
+            record_audit_event(conn, identity, f"AGENT_APPROVAL_{new_status}", "approval", approval_id, "SUCCESS", body)
             track_event(
-                conn, "approval_decided", organization_id="ORG-DEMO", user_id=operator_id,
-                user_role=str(body.get("current_role") or "operator"), order_id=approval.get("order_id"),
+                conn, "approval_decided", organization_id=identity.organization_id, user_id=identity.user_id,
+                user_role=identity.role, order_id=approval.get("order_id"),
                 run_id=approval.get("run_id"), source="website",
                 properties={"approval_id": approval_id, "decision": decision, "status": new_status,
                             "action_type": approval.get("action_type")},
@@ -1910,14 +2208,15 @@ def register_agent_api(app) -> None:
         return {"approval_id": approval_id, "status": new_status, "result": result}
 
     @router.get("/api/agent/runs/{run_id}/trace")
-    def get_run_trace(run_id: str, current_user_id: str = Query("USER-1"), current_role: str = Query("operator")) -> dict[str, Any]:
+    def get_run_trace(run_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with db() as conn:
             run = conn.execute("SELECT * FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
             if not run: raise HTTPException(404, "Agent运行不存在")
-            if not is_manager(current_user_id, current_role) and run["current_user_id"] != current_user_id:
-                raise HTTPException(403, "无权查看该运行轨迹")
+            run_dict = dict(run)
+            # ENFORCE: Organization boundary check for trace access
+            require_run_access(identity, run_dict)
             calls = [dict(r) for r in conn.execute("SELECT * FROM agent_tool_calls WHERE run_id=? ORDER BY created_at", (run_id,))]
-        result = dict(run); result["result"] = safe_json(result.pop("result_json"), {})
+        result = dict(run_dict); result["result"] = safe_json(result.pop("result_json"), {})
         task_draft_ids: list[str] = []
         approval_ids: list[str] = []
         for call in calls:

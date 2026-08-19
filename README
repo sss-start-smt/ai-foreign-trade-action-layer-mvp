@@ -1,0 +1,44 @@
+# Alembic migrations for FlowOrder
+
+This directory contains Alembic migration scripts for the FlowOrder database schema.
+
+## Usage
+
+```bash
+# Run all pending migrations
+alembic upgrade head
+
+# Downgrade one version
+alembic downgrade -1
+
+# Downgrade to base (all tables)
+alembic downgrade base
+
+# Create a new migration
+alembic revision -m "description of change"
+
+# Auto-generate a migration from schema changes
+alembic revision --autogenerate -m "description"
+
+# View current migration version
+alembic current
+
+# View migration history
+alembic history
+```
+
+## Configuration
+
+Set `DATABASE_URL` environment variable before running Alembic:
+
+```bash
+# PostgreSQL (production)
+set DATABASE_URL=postgresql://user:password@host:port/floworder
+
+# PostgreSQL (test)
+set DATABASE_URL=postgresql://user:password@host:port/test_floworder
+```
+
+## Current Migrations
+
+- `001_initial_schema.py` - Initial schema with all 24 tables

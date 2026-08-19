@@ -8,12 +8,20 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 import agent_api
 from action_rules import decide_task
 from analytics import build_analytics_summary, ensure_analytics_schema, track_event
+from auth import (
+    CurrentIdentity,
+    get_current_identity,
+    get_current_identity_optional,
+    resolve_identity_for_testing,
+    TRUSTED_USER_MAP,
+    DEMO_TOKEN_MAP,
+)
 
 VERSION = "6.1.4.1"
 
@@ -88,6 +96,13 @@ def _value_text(field_name: str, value: Any) -> str:
 
 def ensure_v61_schema(conn) -> None:
     ensure_analytics_schema(conn)
+    if getattr(conn, "is_pg", False):
+        from database import table_exists
+        required = ("bulk_update_batches", "bulk_update_candidates")
+        missing = [name for name in required if not table_exists(conn, name)]
+        if missing:
+            raise RuntimeError(f"PostgreSQL v6.1 schema missing {missing}; run `alembic upgrade head`.")
+        return
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS bulk_update_batches (
@@ -143,8 +158,8 @@ def _split_segments(text: str) -> list[str]:
     return result[:50]
 
 
-def _order_rows(conn, actor: dict[str, Any]) -> list[dict[str, Any]]:
-    scope_sql, scope_params = agent_api._order_scope_sql(actor)
+def _order_rows(conn, actor: dict[str, Any], identity: CurrentIdentity | None = None) -> list[dict[str, Any]]:
+    scope_sql, scope_params = agent_api._order_scope_sql(actor, identity)
     return [dict(r) for r in conn.execute(
         f"SELECT * FROM orders WHERE {scope_sql} AND UPPER(COALESCE(status,'ACTIVE')) NOT IN ('DONE','CLOSED','CANCELLED','COMPLETED')",
         scope_params,
@@ -391,9 +406,9 @@ def _coze_safe_bulk_update_response(result: dict[str, Any]) -> dict[str, Any]:
     return safe_result
 
 
-def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bool = True, identity: CurrentIdentity | None = None) -> dict[str, Any]:
     ensure_v61_schema(conn)
-    actor = agent_api.actor(payload)
+    actor = agent_api.actor(payload, identity)
     text = str(payload.get("text") or payload.get("update_text") or "").strip()
     if not text:
         raise HTTPException(422, "缺少需要解析的批量进展文本")
@@ -401,7 +416,7 @@ def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bo
         raise HTTPException(422, "单次文本不能超过20000个字符")
     started = time.perf_counter()
     segments = _split_segments(text)
-    orders = _order_rows(conn, actor)
+    orders = _order_rows(conn, actor, identity)
     batch_id = _new_id("BUP")
     parsed_orders: list[dict[str, Any]] = []
     unmatched: list[dict[str, Any]] = []
@@ -544,15 +559,19 @@ def parse_bulk_order_updates_logic(conn, payload: dict[str, Any], *, persist: bo
     }
 
 
-def confirm_bulk_updates_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
+def confirm_bulk_updates_logic(conn, payload: dict[str, Any], identity: CurrentIdentity | None = None) -> dict[str, Any]:
     ensure_v61_schema(conn)
-    actor = agent_api.actor(payload)
+    actor = agent_api.actor(payload, identity)
     batch_id = str(payload.get("batch_id") or "").strip()
     if not batch_id:
         raise HTTPException(422, "缺少batch_id")
     batch = conn.execute("SELECT * FROM bulk_update_batches WHERE batch_id=?", (batch_id,)).fetchone()
     if not batch:
         raise HTTPException(404, "批量更新批次不存在")
+    # ENFORCE: Organization boundary check
+    batch_org = str(batch["organization_id"] or "").strip() if batch["organization_id"] else ""
+    if batch_org and identity:
+        agent_api.require_same_org(identity, batch_org)
     if not agent_api.is_manager(actor["current_user_id"], actor["current_role"]) and batch["current_user_id"] != actor["current_user_id"]:
         raise HTTPException(403, "无权确认其他用户的批量更新")
 
@@ -574,7 +593,7 @@ def confirm_bulk_updates_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
         candidate = dict(row)
         if candidate["status"] != "PENDING":
             continue
-        order = agent_api._assert_order_access(conn, candidate["order_id"], actor)
+        order = agent_api._assert_order_access(conn, candidate["order_id"], actor, identity)
         if action == "REJECT":
             conn.execute(
                 "UPDATE bulk_update_candidates SET status='REJECTED',decided_at=? WHERE update_id=?",
@@ -602,7 +621,7 @@ def confirm_bulk_updates_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
                     "update_id": update_id,
                 },
             }
-            approval = agent_api.create_approval_logic(conn, approval_payload)
+            approval = agent_api.create_approval_logic(conn, approval_payload, identity=identity)
             approval_items.append(approval)
             conn.execute(
                 """
@@ -632,12 +651,13 @@ def confirm_bulk_updates_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
         if candidate["order_id"] not in order_messages_written:
             conn.execute(
                 """
-                INSERT INTO source_messages(message_id,order_id,source_channel,sender_role,message_type,raw_content,source_time,created_at)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT INTO source_messages(message_id,order_id,organization_id,source_channel,sender_role,message_type,raw_content,source_time,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _new_id("MSG"),
                     candidate["order_id"],
+                    str(order.get("organization_id") or (identity.organization_id if identity else batch_org) or "ORG-QUARANTINE"),
                     "bulk_text",
                     "operator",
                     "bulk_progress_update",
@@ -763,49 +783,123 @@ def _attach_shared_task_priority(conn, items: list[dict[str, Any]], actor: dict[
         item["rank"] = index
     return enriched
 
-def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, Any]:
+def diagnose_priority_orders_logic(conn, payload: dict[str, Any], identity: CurrentIdentity | dict[str, Any] | None = None) -> dict[str, Any]:
     """Composite diagnosis: one Agent tool call performs screening, evidence lookup,
     anomaly creation and deterministic Top-N ranking.
     """
     ensure_v61_schema(conn)
-    actor = agent_api.actor(payload)
+    actor = agent_api.actor(payload, identity)
     due_days = max(1, min(int(payload.get("due_within_days") or 14), 90))
     top_n = max(1, min(int(payload.get("top_n") or 7), 7))
     scan_limit = max(top_n, min(int(payload.get("scan_limit") or 50), 200))
     started = time.perf_counter()
-    screened = agent_api.list_candidate_orders_logic(conn, {**payload, **actor, "due_within_days": due_days, "limit": scan_limit})
+    screened = agent_api.list_candidate_orders_logic(conn, {**payload, **actor, "due_within_days": due_days, "limit": scan_limit}, identity=identity)
     all_candidates: list[dict[str, Any]] = []
     for order in screened["items"]:
         result = agent_api.build_anomaly_logic(
             conn,
             {**payload, **actor, "order_id": order["order_id"]},
             persist=bool(payload.get("persist_candidates", True)),
+            identity=identity,
         )
         all_candidates.extend(result["items"])
-    # V6.1.3: information gaps are reported separately and never pad the risk Top N.
-    aggregated = agent_api.aggregate_order_candidates(all_candidates, top_n)
-    ranked = _attach_shared_task_priority(conn, aggregated["risk_items"], actor)
-    information_gaps = aggregated["information_gaps"]
+    # D14.2: preserve anomaly-candidate persistence/audit, but select the visible
+    # Top-N from the same Risk Attention ranking used by D7 and the controlled
+    # Agent read tool.  This removes the historical split-brain where the Agent
+    # page could rank a different order first from the product risk engine.
+    from d7_risk_engine import run_d7_pipeline
 
+    # Backend-managed Agent plans carry a trusted identity dict using
+    # current_user_id/current_role aliases. Normalize it to the D7 identity
+    # contract before entering the risk engine; HTTP routes may already pass a
+    # CurrentIdentity object and remain unchanged.
+    d7_identity = identity
+    if isinstance(identity, dict):
+        d7_identity = {
+            "user_id": identity.get("user_id") or identity.get("current_user_id") or actor.get("current_user_id"),
+            "organization_id": identity.get("organization_id") or actor.get("organization_id"),
+            "role": identity.get("role") or identity.get("current_role") or actor.get("current_role"),
+        }
+    d7 = run_d7_pipeline(
+        conn,
+        d7_identity,
+        top_n=top_n,
+        due_within_days=due_days,
+    )
+    attention_items = (
+        d7.get("risk_attention_items")
+        or d7.get("my_action_items")
+        or d7.get("team_action_items")
+        or d7.get("items")
+        or []
+    )
+
+    candidates_by_order: dict[str, list[dict[str, Any]]] = {}
+    for candidate in all_candidates:
+        if candidate.get("anomaly_type") == "INFORMATION_GAP":
+            continue
+        candidates_by_order.setdefault(str(candidate.get("order_id") or ""), []).append(candidate)
+
+    ranked: list[dict[str, Any]] = []
+    for index, attention in enumerate(attention_items[:top_n], 1):
+        order_id = str(attention.get("order_id") or "")
+        order_candidates = candidates_by_order.get(order_id) or []
+        if order_candidates:
+            merged_candidates = agent_api.aggregate_order_candidates(order_candidates, top_n=7)["risk_items"]
+            base = dict(merged_candidates[0]) if merged_candidates else {}
+        else:
+            base = {
+                "candidate_id": None,
+                "order_id": order_id,
+                "order_no": attention.get("order_no"),
+                "customer_name": attention.get("customer_name"),
+                "anomaly_type": attention.get("primary_anomaly_type"),
+                "primary_anomaly_type": attention.get("primary_anomaly_type"),
+                "secondary_anomaly_types": attention.get("secondary_anomaly_types") or [],
+                "order_anomaly_count": attention.get("order_anomaly_count") or len(attention.get("risk_signals") or []),
+                "status": "DETERMINISTIC_RISK_SIGNAL",
+                "evidence": attention.get("evidence") or [],
+                "missing_information": attention.get("missing_information") or [],
+            }
+        ranked.append({
+            **base,
+            "order_id": order_id,
+            "order_no": attention.get("order_no") or base.get("order_no"),
+            "customer_name": attention.get("customer_name") or base.get("customer_name"),
+            "rank": index,
+            "priority_score": attention.get("risk_attention_score") or attention.get("priority_score"),
+            "risk_attention_score": attention.get("risk_attention_score") or attention.get("priority_score"),
+            "risk_attention_band": attention.get("risk_attention_band"),
+            "priority_reasons": attention.get("risk_attention_reasons") or attention.get("priority_reasons") or base.get("priority_reasons") or [],
+            "action_bucket": attention.get("action_bucket"),
+            "current_actionability": attention.get("current_actionability"),
+            "governance_escalation_required": attention.get("governance_escalation_required"),
+            "severity": attention.get("severity") or base.get("severity"),
+            "recommended_action": attention.get("recommended_action") or base.get("recommended_action"),
+            "ranking_rule_version": attention.get("ranking_rule_version") or "D14_2_ATTENTION_V1",
+        })
+
+    information_gaps = d7.get("information_gaps") or []
     duration_ms = int((time.perf_counter() - started) * 1000)
     result = {
         "scope": screened["scope"],
         "due_within_days": due_days,
         "screened_order_count": screened["count"],
-        "anomaly_candidate_count": aggregated["risk_signal_count"],
-        "anomaly_signal_count": aggregated["risk_signal_count"],
-        "risk_order_count": len(ranked),
-        "information_gap_order_count": aggregated["information_gap_order_count"],
+        "anomaly_candidate_count": len(all_candidates),
+        "anomaly_signal_count": len(all_candidates),
+        "risk_order_count": int(d7.get("risk_order_count") or len(ranked)),
+        "information_gap_order_count": int(d7.get("information_gap_order_count") or len(information_gaps)),
         "information_gaps": information_gaps,
         "count": len(ranked),
         "items": ranked,
         "selection_strategy": {
-            "candidate_pool": "当前用户有权限的活跃订单，满足未来时间窗口或承诺超时、高风险任务、客户确认阻塞、高风险消息、物流异常任一条件",
-            "ranking": "先过滤信息缺口；异常规则生成证据信号，再叠加与今日工作台共用的FT04任务行动分数（等待窗口、截止、责任、确认状态）；同分按订单号稳定排序",
+            **(d7.get("selection_strategy") or {}),
+            "candidate_pool": "当前用户有权限的活跃订单；异常候选仍用于证据与人工确认，但可见Top-N由统一Risk Attention排序选择",
+            "ranking": "Risk Attention先排序；Action Bucket只说明当前怎么做；Governance Escalation只说明谁需要介入",
             "not_padded": True,
-            "max_items": 7,
+            "max_items": top_n,
             "unit": "unique_order",
-            "ranking_rule_version": "FT04_SHARED_V1",
+            "ranking_rule_version": "D14_2_ATTENTION_V1",
         },
         "human_confirmation_required": True,
         "duration_ms": duration_ms,
@@ -820,9 +914,9 @@ def diagnose_priority_orders_logic(conn, payload: dict[str, Any]) -> dict[str, A
         source=str(payload.get("source") or "agent_tool"),
         properties={
             "screened_order_count": screened["count"],
-            "anomaly_candidate_count": aggregated["risk_signal_count"],
+            "anomaly_candidate_count": len(all_candidates),
             "risk_order_count": len(ranked),
-            "information_gap_order_count": aggregated["information_gap_order_count"],
+            "information_gap_order_count": int(d7.get("information_gap_order_count") or len(information_gaps)),
             "top_count": len(ranked),
             "duration_ms": duration_ms,
         },
@@ -854,6 +948,9 @@ def register_v61_extensions(app) -> None:
     app.state.v61_extensions_registered = True
     router = APIRouter()
 
+    # Use the secure token-only identity resolution from auth.py
+    resolve_identity_dependency = get_current_identity
+
     @router.get("/api/v61/status")
     def v61_status() -> dict[str, Any]:
         return {
@@ -864,13 +961,14 @@ def register_v61_extensions(app) -> None:
         }
 
     @router.post("/api/agent/tools/bulk-updates/parse")
-    def tool_parse_bulk_updates(payload: agent_api.AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_parse_bulk_updates(payload: agent_api.AnyPayload, x_floworder_agent_key: str | None = Header(None), identity: CurrentIdentity | None = Depends(get_current_identity_optional)) -> dict[str, Any]:
         agent_api._require_agent_key(x_floworder_agent_key)
         body = payload.model_dump()
+        resolved = agent_api.get_agent_identity(body, identity)
         started = time.perf_counter()
         with agent_api.db() as conn:
             agent_api.enforce_run_budget(conn, body.get("run_id"))
-            result = parse_bulk_order_updates_logic(conn, body, persist=True)
+            result = parse_bulk_order_updates_logic(conn, body, persist=True, identity=resolved)
             agent_api.log_tool_call(
                 conn,
                 run_id=body.get("run_id"),
@@ -884,13 +982,14 @@ def register_v61_extensions(app) -> None:
         return _coze_safe_bulk_update_response(result)
 
     @router.post("/api/agent/tools/priority-orders/diagnose")
-    def tool_diagnose_priority_orders(payload: agent_api.AnyPayload, x_floworder_agent_key: str | None = Header(None)) -> dict[str, Any]:
+    def tool_diagnose_priority_orders(payload: agent_api.AnyPayload, x_floworder_agent_key: str | None = Header(None), identity: CurrentIdentity | None = Depends(get_current_identity_optional)) -> dict[str, Any]:
         agent_api._require_agent_key(x_floworder_agent_key)
         body = payload.model_dump()
+        resolved = agent_api.get_agent_identity(body, identity)
         started = time.perf_counter()
         with agent_api.db() as conn:
             agent_api.enforce_run_budget(conn, body.get("run_id"))
-            result = diagnose_priority_orders_logic(conn, body)
+            result = diagnose_priority_orders_logic(conn, body, identity=resolved)
             agent_api.log_tool_call(
                 conn,
                 run_id=body.get("run_id"),
@@ -915,27 +1014,32 @@ def register_v61_extensions(app) -> None:
     # Website endpoints deliberately do not require the Coze plugin key. They still
     # enforce FlowOrder order ownership and explicit human confirmation.
     @router.post("/api/agent/bulk-updates/parse")
-    def web_parse_bulk_updates(payload: agent_api.AnyPayload) -> dict[str, Any]:
+    def web_parse_bulk_updates(payload: agent_api.AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with agent_api.db() as conn:
-            result = parse_bulk_order_updates_logic(conn, {**payload.model_dump(), "source": "website"}, persist=True)
+            result = parse_bulk_order_updates_logic(conn, {**payload.model_dump(), "source": "website"}, persist=True, identity=identity)
             conn.commit()
         return result
 
     @router.post("/api/agent/bulk-updates/confirm")
-    def web_confirm_bulk_updates(payload: agent_api.AnyPayload) -> dict[str, Any]:
+    def web_confirm_bulk_updates(payload: agent_api.AnyPayload, request: Request, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with agent_api.db() as conn:
-            result = confirm_bulk_updates_logic(conn, {**payload.model_dump(), "source": "website"})
+            result = confirm_bulk_updates_logic(conn, {**payload.model_dump(), "source": "website"}, identity=identity)
             conn.commit()
         return result
 
     @router.get("/api/agent/bulk-updates/{batch_id}")
-    def get_bulk_update_batch(batch_id: str, current_user_id: str = Query("USER-1"), current_role: str = Query("operator")) -> dict[str, Any]:
+    def get_bulk_update_batch(batch_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with agent_api.db() as conn:
             ensure_v61_schema(conn)
             batch = conn.execute("SELECT * FROM bulk_update_batches WHERE batch_id=?", (batch_id,)).fetchone()
             if not batch:
                 raise HTTPException(404, "批量更新批次不存在")
-            if not agent_api.is_manager(current_user_id, current_role) and batch["current_user_id"] != current_user_id:
+            # ENFORCE: Organization boundary check
+            batch_org = str(batch["organization_id"] or "").strip() if batch["organization_id"] else ""
+            if batch_org:
+                agent_api.require_same_org(identity, batch_org)
+            # ENFORCE: Role check - managers can see all, operators can only see their own
+            if not identity.is_manager() and batch["current_user_id"] != identity.user_id:
                 raise HTTPException(403, "无权查看该批次")
             items = [dict(r) for r in conn.execute("SELECT * FROM bulk_update_candidates WHERE batch_id=? ORDER BY created_at", (batch_id,))]
         for item in items:
@@ -949,13 +1053,12 @@ def register_v61_extensions(app) -> None:
         return result
 
     @router.post("/api/analytics/events")
-    def collect_analytics_event(payload: agent_api.AnyPayload) -> dict[str, Any]:
+    def record_event(payload: agent_api.AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         body = payload.model_dump()
         event_name = str(body.get("event_name") or "").strip()
         if not event_name:
             raise HTTPException(422, "缺少event_name")
         properties = body.get("properties") or {}
-        # Explicitly reject likely secrets/raw messages in analytics payloads.
         blocked = {"agent_key", "api_key", "token", "raw_content", "full_text", "email_body"}
         if isinstance(properties, dict) and blocked.intersection({str(k).lower() for k in properties}):
             raise HTTPException(422, "埋点properties不得包含密钥或沟通全文")
@@ -963,9 +1066,9 @@ def register_v61_extensions(app) -> None:
             event_id = track_event(
                 conn,
                 event_name,
-                organization_id=body.get("organization_id") or "ORG-DEMO",
-                user_id=body.get("user_id") or body.get("current_user_id"),
-                user_role=body.get("user_role") or body.get("current_role"),
+                organization_id=identity.organization_id,
+                user_id=identity.user_id,
+                user_role=identity.role,
                 session_id=body.get("session_id"),
                 order_id=body.get("order_id"),
                 run_id=body.get("run_id"),
@@ -977,9 +1080,10 @@ def register_v61_extensions(app) -> None:
         return {"event_id": event_id, "status": "RECORDED"}
 
     @router.get("/api/analytics/summary")
-    def analytics_summary(days: int = Query(30, ge=1, le=365), organization_id: str | None = Query(None)) -> dict[str, Any]:
+    def analytics_summary(days: int = Query(30, ge=1, le=365), identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
         with agent_api.db() as conn:
-            return build_analytics_summary(conn, days=days, organization_id=organization_id)
+            # ENFORCE: Use authenticated user's organization, not client-supplied one
+            return build_analytics_summary(conn, days=days, organization_id=identity.organization_id)
 
     @router.get("/bulk-update", response_class=HTMLResponse)
     def bulk_update_page() -> HTMLResponse:

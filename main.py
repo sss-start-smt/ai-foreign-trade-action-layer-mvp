@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
-import sqlite3
 import threading
 import time
 import traceback
@@ -16,9 +16,27 @@ import re
 from communication_workflows_patch import register_communication_workflows_patch
 from action_rules import decide_task, next_workday_9, parse_dt
 from excel_import_patch import register_excel_import_patch
+from erpnext_readonly import register_erpnext_routes
 import agent_api
 from agent_api import register_agent_api
 from v61_extensions import register_v61_extensions
+from d9_task_waiting import D9NotFoundError, D9StateError
+from d12_api import register_d12_api
+from d13_api import register_d13_api
+from d15_api import register_d15_api
+from d16_api import register_d16_api
+from d19_auth_api import register_d19_auth_api
+from d19_ui_api import register_d19_ui_api, candidate_requires_manager
+import d16_observability as d16
+from d11_action_workspace import (
+    build_case_workspace,
+    list_action_workspaces,
+    create_case_task,
+    start_case_task,
+    complete_case_task,
+    wait_case_task,
+    record_case_waiting_reply,
+)
 
 from coze_integration import (
     CozeWorkflowError,
@@ -29,10 +47,36 @@ from coze_integration import (
     run_workflow,
 )
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
+
+from database import (
+    db,
+    table_exists,
+    insert_or_replace,
+    get_table_columns,
+    begin_transaction,
+    get_database_url,
+    is_postgres_mode,
+)
+from auth import (
+    get_current_identity,
+    get_current_identity_optional,
+    resolve_identity_for_testing,
+    require_same_org,
+    require_order_access,
+    require_task_access,
+    require_manager,
+    require_run_access,
+    can_modify_order,
+    can_modify_task,
+    audit_log,
+    CurrentIdentity,
+    TRUSTED_USER_MAP,
+    DEMO_TOKEN_MAP,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "action_layer.db")))
@@ -52,16 +96,35 @@ register_excel_import_patch(app)
 register_communication_workflows_patch(app)
 register_agent_api(app)
 register_v61_extensions(app)
+register_erpnext_routes(app)
+register_d12_api(app)
+register_d13_api(app)
+register_d15_api(app)
+register_d16_api(app)
+register_d19_auth_api(app)
+register_d19_ui_api(app)
 
 
 def storage_status() -> dict[str, Any]:
-    """Describe whether the active SQLite file is on durable storage."""
+    """Describe storage for the active backend without pretending PG is a local file."""
+    database_url = get_database_url()
+    render_runtime = bool(os.getenv("RENDER")) or Path("/opt/render/project/src").exists()
+    railway_runtime = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+    if is_postgres_mode(database_url):
+        return {
+            "backend": "postgresql",
+            "db_path": None,
+            "render_runtime": render_runtime,
+            "railway_runtime": railway_runtime,
+            "on_persistent_path": True,
+            "writable": True,
+            "warning": None,
+        }
+
     path = DB_PATH.resolve()
     path_text = str(path)
     persistent_prefixes = ("/var/data/", "/opt/render/project/src/storage/", "/data/")
     on_persistent_path = any(path_text.startswith(prefix) for prefix in persistent_prefixes)
-    render_runtime = bool(os.getenv("RENDER")) or Path("/opt/render/project/src").exists()
-    railway_runtime = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
     cloud_runtime = render_runtime or railway_runtime
     warning = None
     if cloud_runtime and not on_persistent_path:
@@ -75,6 +138,7 @@ def storage_status() -> dict[str, Any]:
     except OSError:
         writable = False
     return {
+        "backend": "sqlite",
         "db_path": path_text,
         "render_runtime": render_runtime,
         "railway_runtime": railway_runtime,
@@ -100,25 +164,6 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:10].upper()}"
 
 
-@contextmanager
-def db():
-    """Create and always close a SQLite connection.
-
-    sqlite3.Connection's built-in context manager commits or rolls back, but
-    does not close the connection. Explicit closing prevents WinError 32 on
-    Windows when pytest resets the test database.
-    """
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
 ACTIVATION_COLUMNS: dict[str, str] = {
     "owner": "TEXT",
     "action_readiness": "TEXT NOT NULL DEFAULT 'BASE_ONLY'",
@@ -130,19 +175,64 @@ ACTIVATION_COLUMNS: dict[str, str] = {
     "initialization_source": "TEXT",
     "initialized_at": "TEXT",
     "last_dynamic_update_at": "TEXT",
+    "organization_id": "TEXT",
 }
 ACTION_READINESS_VALUES = {"BASE_ONLY", "NEEDS_STATUS", "READY_FOR_RANKING", "ACTION_GENERATED", "CLOSED"}
 CONTACT_STATUS_VALUES = {"NOT_CONTACTED", "WAITING_REPLY", "REPLIED", "UNKNOWN"}
 ISSUE_STATUS_VALUES = {"NONE", "KNOWN", "UNKNOWN"}
 
 
-def ensure_activation_schema(conn: sqlite3.Connection) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
-    for name, definition in ACTIVATION_COLUMNS.items():
-        if name not in columns:
-            conn.execute(f'ALTER TABLE orders ADD COLUMN "{name}" {definition}')
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner)")
+def ensure_activation_schema(conn: Any) -> None:
+    columns = {col["name"] for col in get_table_columns(conn, "orders")}
+    missing = [name for name in ACTIVATION_COLUMNS if name not in columns]
+    if getattr(conn, "is_pg", False):
+        if missing:
+            raise RuntimeError(
+                "PostgreSQL schema is behind the application; run `alembic upgrade head`. "
+                f"Missing orders columns: {missing}"
+            )
+    else:
+        for name, definition in ACTIVATION_COLUMNS.items():
+            if name not in columns:
+                conn.execute(f'ALTER TABLE orders ADD COLUMN "{name}" {definition}')
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_action_readiness ON orders(action_readiness, requested_delivery_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner)")
+        tasks_cols = {col["name"] for col in get_table_columns(conn, "tasks")}
+        if "organization_id" not in tasks_cols:
+            conn.execute('ALTER TABLE tasks ADD COLUMN "organization_id" TEXT')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_org ON tasks(organization_id)")
+        logs_cols = {col["name"] for col in get_table_columns(conn, "event_logs")}
+        if "organization_id" not in logs_cols:
+            conn.execute('ALTER TABLE event_logs ADD COLUMN "organization_id" TEXT')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org ON event_logs(organization_id)")
+        approval_cols = {col["name"] for col in get_table_columns(conn, "approval_requests")}
+        if "organization_id" not in approval_cols:
+            conn.execute('ALTER TABLE approval_requests ADD COLUMN "organization_id" TEXT')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_approvals_org ON approval_requests(organization_id)")
+        if not table_exists(conn, "audit_logs"):
+            conn.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
+                audit_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                actor_user_id TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                result TEXT NOT NULL DEFAULT 'SUCCESS',
+                details_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_logs(organization_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)")
+        # Migration: add organization_id to intake_jobs, source_messages, candidate_reviews
+        _migrate_intake_org_id(conn)
+        _migrate_source_messages_org_id(conn)
+        _migrate_candidate_reviews_org_id(conn)
+        # Add indexes for org isolation
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intake_jobs_org_status ON intake_jobs(organization_id, status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_source_messages_org ON source_messages(organization_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_reviews_org ON candidate_reviews(organization_id, status)")
     # Existing orders that already have open tasks are not first-use base records.
     conn.execute(
         """UPDATE orders SET action_readiness='ACTION_GENERATED',
@@ -167,21 +257,49 @@ def ensure_activation_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE orders SET owner='USER-1' WHERE TRIM(COALESCE(owner,'')) IN ('','待分配','未分配','-','—')"
             )
+    _enrich_org_id(conn)
     conn.commit()
 
 
+PG_REQUIRED_TABLES = {
+    "orders", "source_messages", "tasks", "risk_signals", "commitment_history",
+    "confirmation_snapshots", "event_logs", "idempotency_records", "candidate_reviews",
+    "user_settings", "workflow_runs", "task_rankings", "intake_jobs", "order_dependencies",
+    "logistics_events", "agent_chat_jobs", "agent_runs", "agent_tool_calls",
+    "anomaly_candidates", "approval_requests", "daily_inspection_reports", "bulk_update_batches",
+    "bulk_update_candidates", "analytics_events", "communication_events",
+    "communication_workflow_runs", "communication_drafts", "communication_task_candidates",
+    "order_import_rows", "order_import_batches",
+    "action_cases", "d9_action_case_tasks", "d9_action_case_waitings", "d9_trace_events",
+    "d10_business_actions", "d10_outbox_events", "d10_idempotency_records", "d10_audit_events",
+    "d12_human_reviews", "d13_agent_runs", "d13_agent_trace_events", "d15_outbox_execution_state", "d15_execution_trace_events", "audit_logs",
+    "erp_sync_state", "erp_read_snapshots",
+}
+
+
 def init_db() -> None:
-    agent_api.DB_PATH = DB_PATH
     with db() as conn:
-        conn.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
+        if getattr(conn, "is_pg", False):
+            # PostgreSQL schema is Alembic-owned. Runtime startup must never mask a
+            # missing migration by creating tables from SQLite-era schema.sql.
+            missing_tables = sorted(t for t in PG_REQUIRED_TABLES if not table_exists(conn, t))
+            if missing_tables:
+                raise RuntimeError(
+                    "PostgreSQL schema is not migrated; run `alembic upgrade head`. "
+                    f"Missing tables: {missing_tables}"
+                )
+        else:
+            conn.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
         ensure_activation_schema(conn)
         count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         if count == 0 and os.getenv("SEED_DEMO_DATA", "false").lower() == "true":
             reset_demo_data(conn)
 
 
-def reset_demo_data(conn: sqlite3.Connection) -> None:
+def reset_demo_data(conn: Any) -> None:
     for table in [
+        "d13_agent_trace_events", "d13_agent_runs", "d12_human_reviews", "d15_execution_trace_events", "d15_outbox_execution_state", "d10_outbox_events", "d10_idempotency_records", "d10_audit_events", "d10_business_actions",
+        "d9_trace_events", "d9_action_case_waitings", "d9_action_case_tasks", "action_cases",
         "bulk_update_candidates", "bulk_update_batches", "analytics_events",
         "agent_chat_jobs", "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
@@ -202,11 +320,11 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
         conn.execute(
             """INSERT INTO orders(order_id,order_no,customer_name,product_name,packaging_method,
                requested_delivery_date,latest_supplier_commitment,current_progress,current_node,
-               created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (*row, iso(now), iso(now)),
+               organization_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (*row, "ORG-A", iso(now), iso(now)),
         )
     for order_id, owner_id in (("ORD-1001", "USER-1"), ("ORD-1002", "USER-1"), ("ORD-1003", "USER-1"), ("ORD-1004", "USER-2"), ("ORD-1005", "USER-3")):
-        conn.execute("UPDATE orders SET owner=? WHERE order_id=?", (owner_id, order_id))
+        conn.execute("UPDATE orders SET owner=?, organization_id=? WHERE order_id=?", (owner_id, "ORG-A", order_id))
 
     tasks = [
         ("TASK-WAIT-001", "ORD-1002", "等待工厂确认拉链到料时间", "等待工厂回复", "factory", "OPEN", "USER-1", "assigned", "factory", iso(now + timedelta(hours=3)), iso(now + timedelta(hours=3)), iso(now + timedelta(days=2)), iso(now - timedelta(hours=20)), "high", 0, 0, None, ["工厂承诺3小时内回复"]),
@@ -223,9 +341,9 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
             """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,
                owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,
                business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,
-               source_message_id,evidence_json,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (*t[:-1], json.dumps(t[-1], ensure_ascii=False), iso(now), iso(now)),
+               source_message_id,evidence_json,organization_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (*t[:-1], json.dumps(t[-1], ensure_ascii=False), "ORG-A", iso(now), iso(now)),
         )
 
     risks = [
@@ -243,9 +361,9 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
     msg_id = "MSG-SEED-001"
     raw = "PO-1001的包装方式请改为彩盒，并请今天确认是否会影响8月20日交期。"
     conn.execute(
-        """INSERT INTO source_messages(message_id,order_id,source_channel,sender_role,message_type,raw_content,source_time,created_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (msg_id, "ORD-1001", "email", "customer", "customer_request", raw, iso(now - timedelta(minutes=18)), iso(now - timedelta(minutes=18))),
+        """INSERT INTO source_messages(message_id,order_id,organization_id,source_channel,sender_role,message_type,raw_content,source_time,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (msg_id, "ORD-1001", "ORG-A", "email", "customer", "customer_request", raw, iso(now - timedelta(minutes=18)), iso(now - timedelta(minutes=18))),
     )
     candidate = {
         "message_type": "customer_request",
@@ -258,9 +376,9 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
         "action_candidates": [{"action_type": "confirm_with_factory", "title": "确认包装调整是否影响交期", "recommended_action": "联系工厂确认包装调整是否影响交期", "target": "factory"}],
     }
     conn.execute(
-        """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,workflow_source,candidate_json,status,created_at)
-           VALUES(?,?,?,?,?,?,?)""",
-        ("REV-SEED-001", msg_id, "ORD-1001", "COZE_FT01_SAMPLE", json.dumps(candidate, ensure_ascii=False), "PENDING", iso(now - timedelta(minutes=17))),
+        """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,organization_id,workflow_source,candidate_json,status,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        ("REV-SEED-001", msg_id, "ORD-1001", "ORG-A", "COZE_FT01_SAMPLE", json.dumps(candidate, ensure_ascii=False), "PENDING", iso(now - timedelta(minutes=17))),
     )
     defaults = {"theme": "upstream", "compact": False, "show_demo": False, "current_user_id": "USER-1", "notifications": {"urgent": True, "waiting_overdue": True, "writeback": True, "daily_summary": False}}
     conn.execute("INSERT INTO user_settings(user_id,settings_json,updated_at) VALUES(?,?,?)", ("USER-1", json.dumps(defaults, ensure_ascii=False), iso(now)))
@@ -274,7 +392,7 @@ def reset_demo_data(conn: sqlite3.Connection) -> None:
 
 
 
-def get_order_id(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dict[str, Any]) -> str | None:
+def get_order_id(conn: Any, wrapper: dict[str, Any], plan: dict[str, Any]) -> str | None:
     state = wrapper.get("existing_business_state_json") or wrapper.get("existing_business_state")
     if isinstance(state, str):
         try:
@@ -317,7 +435,7 @@ TASK_FIELDS = {
 }
 
 
-def apply_writeback(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+def apply_writeback(conn: Any, wrapper: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     key = str(plan.get("idempotency_key") or wrapper.get("idempotency_key") or "")
     if not key:
         raise HTTPException(422, "缺少idempotency_key")
@@ -356,7 +474,7 @@ def apply_writeback(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dic
             conn.execute(f"UPDATE orders SET {field}=?, updated_at=? WHERE order_id=?", (value, timestamp, target_id))
             applied.append({"domain": domain, "entity_id": target_id, "field": field, "value": value})
             conn.execute(
-                "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
                 (new_id("EVT"), "order", target_id, "ORDER_FIELD_UPDATED",
                  json.dumps({"field": field, "value": value, "idempotency_key": key}, ensure_ascii=False), operator_id, timestamp),
             )
@@ -375,7 +493,7 @@ def apply_writeback(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dic
             conn.execute(f"UPDATE tasks SET {field}=?, updated_at=? WHERE task_id=?", (value, timestamp, target_id))
             applied.append({"domain": domain, "entity_id": target_id, "field": field, "value": value})
             conn.execute(
-                "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
                 (new_id("EVT"), "task", target_id, "TASK_FIELD_UPDATED",
                  json.dumps({"field": field, "value": value, "idempotency_key": key}, ensure_ascii=False), operator_id, timestamp),
             )
@@ -418,7 +536,7 @@ def apply_writeback(conn: sqlite3.Connection, wrapper: dict[str, Any], plan: dic
         "committed_at": timestamp,
     }
     conn.execute(
-        "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
         (new_id("EVT"), "transaction", key, "FT03_WRITEBACK_COMMITTED",
          json.dumps(result, ensure_ascii=False), operator_id, timestamp),
     )
@@ -452,7 +570,9 @@ def normalize_owner_value(value: Any, *, fallback: str | None = None) -> str | N
 
 
 def is_manager(user_id: str | None) -> bool:
-    return str(user_id or "").upper() == "MANAGER-1"
+    if user_id and user_id in TRUSTED_USER_MAP:
+        return TRUSTED_USER_MAP[user_id]["role"] == "manager"
+    return str(user_id or "").upper() in {"MANAGER-1", "MANAGER-A", "MANAGER-B"}
 
 
 def owner_matches(owner: Any, user_id: str | None) -> bool:
@@ -462,15 +582,134 @@ def owner_matches(owner: Any, user_id: str | None) -> bool:
     return bool(normalized and normalized == user_id)
 
 
+# Identity resolution is now handled exclusively by get_current_identity from auth.py
+# DO NOT redefine this function - it uses token-only authentication
+# Imported at top of file: from auth import get_current_identity
 
-def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+
+def _enrich_org_id(conn: Any) -> None:
+    columns = {col["name"] for col in get_table_columns(conn, "orders")}
+    if "organization_id" not in columns:
+        return
+    user_org_map = {uid: info["organization_id"] for uid, info in TRUSTED_USER_MAP.items()}
+    for owner, org_id in [
+        ("USER-1", "ORG-A"), ("USER-2", "ORG-A"), ("USER-3", "ORG-A"), ("MANAGER-1", "ORG-A"),
+        ("OPERATOR-A1", "ORG-A"), ("OPERATOR-A2", "ORG-A"), ("MANAGER-A", "ORG-A"),
+        ("OPERATOR-B1", "ORG-B"), ("OPERATOR-B2", "ORG-B"), ("MANAGER-B", "ORG-B"),
+    ]:
+        org = user_org_map.get(owner, "ORG-DEMO")
+        if owner == "":
+            continue
+        if owner in columns or "owner" in columns:
+            conn.execute("UPDATE orders SET organization_id=? WHERE owner=? AND organization_id IS NULL", (org, owner))
+            conn.execute("UPDATE orders SET organization_id=? WHERE owner=? AND organization_id=''", (org, owner))
+    conn.execute("UPDATE orders SET organization_id='ORG-DEMO' WHERE organization_id IS NULL OR organization_id=''")
+    try:
+        task_columns = {col["name"] for col in get_table_columns(conn, "tasks")}
+        if "organization_id" in task_columns:
+            conn.execute("UPDATE tasks SET organization_id=(SELECT organization_id FROM orders WHERE orders.order_id=tasks.related_order_id) WHERE organization_id IS NULL AND related_order_id IS NOT NULL")
+            conn.execute("UPDATE tasks SET organization_id='ORG-DEMO' WHERE organization_id IS NULL")
+    except Exception:
+        pass
+    try:
+        log_columns = {col["name"] for col in get_table_columns(conn, "event_logs")}
+        if "organization_id" in log_columns:
+            conn.execute("UPDATE event_logs SET organization_id='ORG-DEMO' WHERE organization_id IS NULL")
+    except Exception:
+        pass
+    try:
+        approval_columns = {col["name"] for col in get_table_columns(conn, "approval_requests")}
+        if "organization_id" in approval_columns:
+            conn.execute("UPDATE approval_requests SET organization_id='ORG-DEMO' WHERE organization_id IS NULL")
+    except Exception:
+        pass
+    conn.commit()
+
+
+def _migrate_intake_org_id(conn: Any) -> None:
+    """Add organization_id to intake_jobs and backfill from request_json or order."""
+    cols = {col["name"] for col in get_table_columns(conn, "intake_jobs")}
+    if "organization_id" not in cols:
+        conn.execute('ALTER TABLE intake_jobs ADD COLUMN "organization_id" TEXT')
+    conn.execute("""
+        UPDATE intake_jobs SET organization_id = (
+            SELECT o.organization_id FROM orders o WHERE o.order_id = intake_jobs.order_id
+        ) WHERE organization_id IS NULL AND order_id IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE intake_jobs SET organization_id = 'ORG-DEMO' WHERE organization_id IS NULL
+    """)
+
+
+def _migrate_source_messages_org_id(conn: Any) -> None:
+    """Add organization_id to source_messages and backfill from orders."""
+    cols = {col["name"] for col in get_table_columns(conn, "source_messages")}
+    if "organization_id" not in cols:
+        conn.execute('ALTER TABLE source_messages ADD COLUMN "organization_id" TEXT')
+    conn.execute("""
+        UPDATE source_messages SET organization_id = (
+            SELECT o.organization_id FROM orders o WHERE o.order_id = source_messages.order_id
+        ) WHERE organization_id IS NULL AND order_id IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE source_messages SET organization_id = 'ORG-DEMO' WHERE organization_id IS NULL
+    """)
+
+
+def _migrate_candidate_reviews_org_id(conn: Any) -> None:
+    """Add organization_id to candidate_reviews and backfill from orders or source_messages."""
+    cols = {col["name"] for col in get_table_columns(conn, "candidate_reviews")}
+    if "organization_id" not in cols:
+        conn.execute('ALTER TABLE candidate_reviews ADD COLUMN "organization_id" TEXT')
+    conn.execute("""
+        UPDATE candidate_reviews SET organization_id = (
+            SELECT o.organization_id FROM orders o WHERE o.order_id = candidate_reviews.order_id
+        ) WHERE organization_id IS NULL AND order_id IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE candidate_reviews SET organization_id = (
+            SELECT sm.organization_id FROM source_messages sm WHERE sm.message_id = candidate_reviews.source_message_id
+        ) WHERE organization_id IS NULL AND source_message_id IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE candidate_reviews SET organization_id = 'ORG-DEMO' WHERE organization_id IS NULL
+    """)
+
+
+def _log_event(conn: Any, entity_type: str, entity_id: str, event_type: str, payload: Any, operator_id: str | None = None, org_id: str | None = None) -> None:
+    columns = {col["name"] for col in get_table_columns(conn, "event_logs")}
+    has_org = "organization_id" in columns
+    if has_org and org_id is None:
+        org_id = "ORG-DEMO"
+    op_id = operator_id or "USER-1"
+    if has_org:
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,organization_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (new_id("EVT"), entity_type, entity_id, event_type, json.dumps(payload, ensure_ascii=False), op_id, org_id, now_cn_iso()),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), entity_type, entity_id, event_type, json.dumps(payload, ensure_ascii=False), op_id, now_cn_iso()),
+        )
+
+
+
+def rowdict(row: Any) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
 def extract_order_numbers(raw: str) -> list[str]:
-    found = re.findall(r"\\bPO[-_ ]?\\d+\\b", raw or "", re.I)
-    return list(dict.fromkeys(x.replace("_", "-").replace(" ", "-").upper() for x in found))
-
+    # Match PO/SO/ORD followed by dash, underscore, or space, then alphanumeric parts
+    found = re.findall(r"\b(?:PO|SO|ORD)[-_ ][A-Z0-9]+(?:[-_ ][A-Z0-9]+)*\b", raw or "", re.I)
+    normalized = []
+    for x in found:
+        # Normalize: replace underscores and spaces with dashes, then uppercase
+        norm = re.sub(r"[_ ]", "-", x).upper()
+        # Remove any double dashes
+        norm = re.sub(r"-{2,}", "-", norm)
+        normalized.append(norm)
+    return list(dict.fromkeys(normalized))
 
 def normalize_cn_date(source_time: str | None, text: str) -> str | None:
     m = re.search(r"(\\d{1,2})月(\\d{1,2})日", text or "")
@@ -488,16 +727,17 @@ def normalize_cn_date(source_time: str | None, text: str) -> str | None:
 
 def record_coze_run(log: dict[str, Any]) -> None:
     with db() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO workflow_runs(
-               run_id,workflow_key,workflow_id,status,input_json,output_json,coze_code,coze_msg,
-               debug_url,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        insert_or_replace(
+            conn, "workflow_runs",
+            ["run_id", "workflow_key", "workflow_id", "status", "input_json", "output_json",
+             "coze_code", "coze_msg", "debug_url", "duration_ms", "created_at"],
             (
                 log.get("run_id"), log.get("workflow_key"), log.get("workflow_id"),
                 log.get("status"), log.get("input_json") or "{}", log.get("output_json"),
                 log.get("coze_code"), log.get("coze_msg"), log.get("debug_url"),
                 log.get("duration_ms"), log.get("created_at") or iso(),
             ),
+            conflict_key="run_id",
         )
         conn.commit()
 
@@ -512,13 +752,29 @@ def coze_http_error(exc: CozeWorkflowError) -> HTTPException:
     return HTTPException(status_code=502 if exc.status_code != 401 else 401, detail=detail)
 
 
-def order_and_task_context(order_id: str | None, raw: str = "") -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def order_and_task_context(order_id: str | None, raw: str = "", org_id: str | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     with db() as conn:
-        order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()) if order_id else None
+        order = None
+        if order_id:
+            if org_id:
+                # P0-2: Enforce organization isolation when explicit order_id is provided
+                order = rowdict(conn.execute(
+                    "SELECT * FROM orders WHERE order_id=? AND organization_id=?",
+                    (order_id, org_id)
+                ).fetchone())
+            else:
+                order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone())
         if not order:
             order_nos = extract_order_numbers(raw)
             if len(order_nos) == 1:
-                order = rowdict(conn.execute("SELECT * FROM orders WHERE order_no=?", (order_nos[0],)).fetchone())
+                if org_id:
+                    # Enforce organization isolation: only match orders within the caller's org
+                    order = rowdict(conn.execute(
+                        "SELECT * FROM orders WHERE order_no=? AND organization_id=?", 
+                        (order_nos[0], org_id)
+                    ).fetchone())
+                else:
+                    order = rowdict(conn.execute("SELECT * FROM orders WHERE order_no=?", (order_nos[0],)).fetchone())
         task = None
         if order:
             task = rowdict(conn.execute(
@@ -628,7 +884,7 @@ def build_ft02_parameters(
         "order_context": json.dumps(order_context, ensure_ascii=False),
     }
 
-def create_or_update_action_task(conn: sqlite3.Connection, review: dict[str, Any], candidate: dict[str, Any], order_id: str) -> str | None:
+def create_or_update_action_task(conn: Any, review: dict[str, Any], candidate: dict[str, Any], order_id: str) -> str | None:
     action = (candidate.get("action_candidates") or [None])[0]
     if not action:
         return None
@@ -743,6 +999,11 @@ def coze_rankings(current_user_id: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+# resolve_identity_dependency is now imported as get_current_identity from auth.py
+# Kept as alias for backward compatibility
+resolve_identity_dependency = get_current_identity
+
+
 def local_candidate(raw: str, sender_role: str, source_time: str | None, order: dict[str, Any] | None) -> dict[str, Any]:
     fields: list[dict[str, Any]] = []
     risks: list[dict[str, Any]] = []
@@ -787,6 +1048,118 @@ def local_candidate(raw: str, sender_role: str, source_time: str | None, order: 
     }
 
 
+# ── D11 UAT Fixture Provider (TEST/UAT ONLY) ────────────────────────────
+# Enabled only when D11_UAT_INTAKE_PROVIDER=fixture is set.
+# Produces deterministic candidate changes for known test messages.
+# Does NOT call Coze, does NOT bypass human review, does NOT modify orders.
+# Safe for local UAT; never active in production.
+
+_UAT_FIXTURE_RULES: list[dict[str, Any]] = [
+    {
+        "match": "延迟",
+        "message_type": "factory_update",
+        "order_changes": [
+            {"field_name": "current_progress", "normalized_value": 0.6, "source_quote": "生产进度60%", "confidence": 0.9},
+        ],
+        "risks": [
+            {"type": "delivery_impact_unknown", "risk_level": "high", "evidence": "交期可能延迟"},
+        ],
+        "actions": [
+            {"action_type": "confirm_with_factory", "title": "确认变更是否影响交期", "recommended_action": "联系工厂确认延迟影响", "target": "factory"},
+        ],
+    },
+    {
+        "match": "取消",
+        "message_type": "customer_request",
+        "order_changes": [],
+        "risks": [
+            {"type": "customer_cancellation", "risk_level": "critical", "evidence": "客户要求取消"},
+        ],
+        "actions": [
+            {"action_type": "reply_customer", "title": "立即处理客户取消请求", "recommended_action": "立即回复客户并确认取消原因", "target": "customer"},
+        ],
+    },
+    {
+        "match": "投诉",
+        "message_type": "complaint",
+        "order_changes": [],
+        "risks": [
+            {"type": "customer_complaint", "risk_level": "critical", "evidence": "客户投诉"},
+        ],
+        "actions": [
+            {"action_type": "reply_customer", "title": "立即处理客户投诉", "recommended_action": "立即回复客户并同步主管", "target": "customer"},
+        ],
+    },
+    {
+        "match": "样品",
+        "message_type": "factory_update",
+        "order_changes": [
+            {"field_name": "packaging_method", "normalized_value": "样品包装", "source_quote": "样品包装方式", "confidence": 0.95},
+        ],
+        "risks": [],
+        "actions": [
+            {"action_type": "check_order", "title": "确认样品进展", "recommended_action": "核对样品状态并安排后续动作", "target": "factory"},
+        ],
+    },
+    {
+        "match": "付款",
+        "message_type": "customer_request",
+        "order_changes": [
+            {"field_name": "payment_status", "normalized_value": "pending", "source_quote": "等待付款", "confidence": 0.9},
+        ],
+        "risks": [],
+        "actions": [
+            {"action_type": "check_order", "title": "核对付款状态", "recommended_action": "核对付款状态并确定下一步", "target": "finance"},
+        ],
+    },
+]
+
+
+def uat_fixture_candidate(raw: str, sender_role: str, source_time: str | None, order: dict[str, Any] | None) -> dict[str, Any]:
+    """Deterministic fixture provider for D11 local UAT (TEST/UAT ONLY).
+
+    Scans raw message for known keywords and produces fixed candidate changes.
+    Results are clearly marked as UAT_FIXTURE_PROVIDER. Never active in production.
+    """
+    matched: dict[str, Any] | None = None
+    for rule in _UAT_FIXTURE_RULES:
+        if rule["match"] in raw:
+            matched = rule
+            break
+
+    if matched is None:
+        matched = {
+            "message_type": "customer_request" if sender_role == "customer" else "factory_update",
+            "order_changes": [],
+            "risks": [],
+            "actions": [
+                {"action_type": "check_order", "title": "核对消息并安排下一步", "recommended_action": "核对订单状态并确定后续动作", "target": sender_role or "unknown"},
+            ],
+        }
+
+    order_nos = extract_order_numbers(raw)
+    match_status = "unique_match" if order else ("multiple_matches" if len(order_nos) > 1 else "no_match")
+
+    return {
+        "message_type": matched["message_type"],
+        "order_match": {
+            "status": match_status,
+            "selected_order_id": order.get("order_id") if order else None,
+            "matched_order_no": order.get("order_no") if order else None,
+            "candidate_order_nos": order_nos,
+        },
+        "fields": matched.get("order_changes", []),
+        "risk_signals": matched.get("risks", []),
+        "action_candidates": matched.get("actions", []),
+        "manual_review_required": True,
+        "_uat_fixture": True,
+        "_integration": {
+            "workflow_key": "UAT_FIXTURE_PROVIDER",
+            "fallback_reason": "D11_UAT_INTAKE_PROVIDER=fixture",
+        },
+    }
+
+
 def review_to_transaction(review: dict[str, Any], candidate: dict[str, Any], operator_id: str) -> tuple[dict[str, Any], str | None]:
     order_id = review.get("order_id") or (candidate.get("order_match") or {}).get("selected_order_id")
     changes: list[dict[str, Any]] = []
@@ -801,11 +1174,11 @@ def review_to_transaction(review: dict[str, Any], candidate: dict[str, Any], ope
 
 @app.get("/api/tasks")
 def task_list(
-    current_user_id: str = Query("USER-1"),
+    identity: CurrentIdentity = Depends(get_current_identity),
     state: str | None = Query(None),
     q: str | None = Query(None),
 ) -> dict[str, Any]:
-    data = dashboard(current_user_id=current_user_id, current_time=None)
+    data = build_dashboard(identity, current_time=None)
     items = data["items"]
     if state and state != "ALL":
         items = [x for x in items if x["action_state"] == state]
@@ -816,15 +1189,23 @@ def task_list(
 
 
 @app.patch("/api/tasks/{task_id}")
-def update_task(task_id: str, payload: AnyPayload) -> dict[str, Any]:
+def update_task(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     allowed = TASK_FIELDS | {"urgent"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         raise HTTPException(422, "没有可更新字段")
     with db() as conn:
-        if not conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        
+        require_task_access(identity, task_dict, order_dict)
+        
         timestamp = iso()
         parts, values = [], []
         for key, value in updates.items():
@@ -832,37 +1213,131 @@ def update_task(task_id: str, payload: AnyPayload) -> dict[str, Any]:
             values.append(int(value) if key in {"urgent", "pending_confirmation"} and isinstance(value, bool) else value)
         values += [timestamp, task_id]
         conn.execute(f"UPDATE tasks SET {', '.join(parts)}, updated_at=? WHERE task_id=?", values)
-        conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "task", task_id, "TASK_UPDATED_FROM_UI", json.dumps(updates, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
+        op_id = identity.user_id
+        conn.execute("INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "task", task_id, "TASK_UPDATED_FROM_UI", json.dumps(updates, ensure_ascii=False), op_id, timestamp))
+        audit_log(conn, identity, "TASK_UPDATED", "task", task_id, "SUCCESS", updates)
         conn.commit()
     return {"status": "updated", "task_id": task_id, "changes": updates}
 
 
 @app.post("/api/tasks/{task_id}/transfer")
-def transfer_task(task_id: str, payload: AnyPayload) -> dict[str, Any]:
+def transfer_task(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     owner = body.get("owner_user_id")
     if not owner:
         raise HTTPException(422, "缺少owner_user_id")
-    return update_task(task_id, AnyPayload(owner_user_id=owner, responsibility_status="assigned", operator_id=body.get("operator_id") or "USER-1"))
+    with db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
+        if not identity.is_manager():
+            raise HTTPException(403, "仅主管可转交任务")
+    return update_task(task_id, AnyPayload(owner_user_id=owner, responsibility_status="assigned"), identity)
 
 
 @app.post("/api/tasks/{task_id}/escalate")
-def escalate_task(task_id: str, payload: AnyPayload) -> dict[str, Any]:
+def escalate_task(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     with db() as conn:
-        row = conn.execute("SELECT related_order_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
+        if not identity.is_manager():
+            raise HTTPException(403, "仅主管可升级任务")
         timestamp = iso()
         conn.execute("UPDATE tasks SET risk_level='critical', urgent=1, target='manager', owner_user_id='MANAGER-1', updated_at=? WHERE task_id=?", (timestamp, task_id))
-        conn.execute("INSERT INTO risk_signals VALUES(?,?,?,?,?,?,?,?,?,?)", (new_id("RISK"), row["related_order_id"], task_id, "manager_escalation", "critical", body.get("reason") or "一线人员请求主管介入", "R_MANUAL_ESCALATION", "OPEN", timestamp, timestamp))
-        conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "task", task_id, "TASK_ESCALATED", json.dumps(body, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
+        conn.execute("INSERT INTO risk_signals VALUES(?,?,?,?,?,?,?,?,?,?)", (new_id("RISK"), order_id, task_id, "manager_escalation", "critical", body.get("reason") or "一线人员请求主管介入", "R_MANUAL_ESCALATION", "OPEN", timestamp, timestamp))
+        conn.execute("INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "task", task_id, "TASK_ESCALATED", json.dumps(body, ensure_ascii=False), identity.user_id, timestamp))
+        audit_log(conn, identity, "TASK_ESCALATED", "task", task_id, "SUCCESS", body)
         conn.commit()
     return {"status": "escalated", "task_id": task_id}
 
 
+@app.post("/api/tasks/{task_id}/contacted")
+def task_contacted(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    body = payload.model_dump()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
+        timestamp = iso()
+        contact_notes = str(body.get("notes") or body.get("contact_notes") or "")
+        waiting_on = str(body.get("waiting_on") or task_dict.get("waiting_on") or "").strip()
+        promised_reply_at = body.get("promised_reply_at") or task_dict.get("promised_reply_at")
+        next_action_at = body.get("next_action_at") or task_dict.get("next_action_at")
+        conn.execute(
+            "UPDATE tasks SET status='WAITING_EXTERNAL', last_contact_at=?, waiting_on=?, promised_reply_at=?, next_action_at=?, updated_at=? WHERE task_id=?",
+            (timestamp, waiting_on or None, promised_reply_at, next_action_at, timestamp, task_id),
+        )
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "task", task_id, "TASK_CONTACTED", json.dumps({"notes": contact_notes, "waiting_on": waiting_on}, ensure_ascii=False), identity.user_id, timestamp),
+        )
+        audit_log(conn, identity, "TASK_CONTACTED", "task", task_id, "SUCCESS", body)
+        conn.commit()
+    return {"status": "contacted", "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/complete")
+def task_complete(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    body = payload.model_dump()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
+        timestamp = iso()
+        completion_notes = str(body.get("notes") or body.get("completion_notes") or "")
+        conn.execute(
+            "UPDATE tasks SET status='DONE', updated_at=? WHERE task_id=?",
+            (timestamp, task_id),
+        )
+        conn.execute(
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "task", task_id, "TASK_COMPLETED", json.dumps({"notes": completion_notes}, ensure_ascii=False), identity.user_id, timestamp),
+        )
+        audit_log(conn, identity, "TASK_COMPLETED", "task", task_id, "SUCCESS", body)
+        conn.commit()
+    return {"status": "completed", "task_id": task_id}
+
+
+@app.get("/api/orders/{order_id}")
+def order_detail(order_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "订单不存在")
+        order_dict = dict(row)
+        # CRITICAL: Check organization access before returning
+        require_order_access(identity, order_dict, conn)
+        tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks WHERE related_order_id=? AND status!='DONE' ORDER BY updated_at DESC", (order_id,)).fetchall()]
+        for task in tasks:
+            task["evidence"] = json.loads(task.pop("evidence_json") or "[]")
+        events = [dict(r) for r in conn.execute("SELECT * FROM event_logs WHERE entity_id=? ORDER BY created_at DESC LIMIT 30", (order_id,)).fetchall()]
+    return {"order": order_dict, "tasks": tasks, "events": events}
+
+
 @app.post("/api/orders")
-def create_order(payload: AnyPayload) -> dict[str, Any]:
+def create_order(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     order_no = str(body.get("order_no") or "").strip()
     customer_name = str(body.get("customer_name") or "").strip()
@@ -893,15 +1368,18 @@ def create_order(payload: AnyPayload) -> dict[str, Any]:
     with db() as conn:
         if conn.execute("SELECT 1 FROM orders WHERE order_no=?", (order_no,)).fetchone():
             raise HTTPException(409, "订单号已存在")
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
-        operator_id = str(body.get("operator_id") or "USER-1")
+        columns = {col["name"] for col in get_table_columns(conn, "orders")}
+        operator_id = identity.user_id
         requested_owner = normalize_owner_value(body.get("owner"), fallback=operator_id)
-        effective_owner = requested_owner if is_manager(operator_id) else operator_id
+        effective_owner = requested_owner if identity.is_manager() else operator_id
+        # Force organization_id from identity - NEVER from client input
+        effective_org = identity.organization_id
         optional = {
             "sku": body.get("sku"), "quantity": body.get("quantity"), "unit": body.get("unit"),
             "factory_name": body.get("factory_name"), "owner": effective_owner,
             "specification": body.get("specification"), "material": body.get("material"),
             "color": body.get("color"), "logo_process": body.get("logo_process"),
+            "organization_id": effective_org,
         }
         values.update({k: v for k, v in optional.items() if k in columns})
         names = list(values)
@@ -909,16 +1387,30 @@ def create_order(payload: AnyPayload) -> dict[str, Any]:
         placeholders = ", ".join("?" for _ in names)
         conn.execute(f"INSERT INTO orders ({quoted}) VALUES ({placeholders})", [values[name] for name in names])
         conn.execute(
-            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
-            (new_id("EVT"), "order", order_id, "ORDER_CREATED_FROM_UI", json.dumps(body, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp),
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "order", order_id, "ORDER_CREATED_FROM_UI", json.dumps(body, ensure_ascii=False), operator_id, timestamp),
         )
+        audit_log(conn, identity, "ORDER_CREATED", "order", order_id, "SUCCESS", body)
         conn.commit()
     return {"status": "created", "order_id": order_id, "order_no": order_no}
 
 
 @app.patch("/api/orders/{order_id}")
-def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
+def update_order(order_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
+    # D12: the customer-facing requested delivery date is a formal commitment.
+    # It may no longer be changed through the generic order PATCH route; an
+    # approved D12 request must enter the frozen D10 BusinessAction/Outbox path.
+    protected_commitment_inputs = {"requested_delivery_date", "customer_delivery_date"}
+    if protected_commitment_inputs.intersection(body):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "D12_MANAGER_APPROVAL_REQUIRED",
+                "message": "客户正式交期属于受保护承诺字段，请从行动任务发起主管审批。",
+                "required_review": "MANAGER_APPROVAL",
+            },
+        )
     canonical = {
         "order_no": "order_no", "customer_name": "customer_name", "product_name": "product_name",
         "packaging_method": "packaging_method", "requested_delivery_date": "requested_delivery_date",
@@ -936,23 +1428,22 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         if not row:
             raise HTTPException(404, "订单不存在")
-        operator_id = str(body.get("operator_id") or "USER-1")
-        if not is_manager(operator_id) and not owner_matches(dict(row).get("owner"), operator_id):
-            raise HTTPException(403, "只能修改本人负责的订单")
-        columns = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+        order_dict = dict(row)
+        require_order_access(identity, order_dict, conn)
+        columns = {col["name"] for col in get_table_columns(conn, "orders")}
         updates = {}
         for source, target in canonical.items():
             if source in body and target in columns:
                 if target == "owner":
-                    if not is_manager(operator_id):
+                    if not identity.is_manager():
                         continue
-                    updates[target] = normalize_owner_value(body[source], fallback=dict(row).get("owner"))
+                    updates[target] = normalize_owner_value(body[source], fallback=order_dict.get("owner"))
                 else:
                     updates[target] = body[source]
         if not updates:
             raise HTTPException(422, "没有可更新字段")
         dynamic_fields = {"current_node", "current_progress", "latest_supplier_commitment", "contact_status", "issue_status"}
-        if dynamic_fields.intersection(updates) and row["action_readiness"] in {"BASE_ONLY", "NEEDS_STATUS"}:
+        if dynamic_fields.intersection(updates) and order_dict.get("action_readiness") in {"BASE_ONLY", "NEEDS_STATUS"}:
             updates.setdefault("action_readiness", "READY_FOR_RANKING")
             if "initialization_source" in columns:
                 updates.setdefault("initialization_source", "MANUAL_EDIT")
@@ -969,9 +1460,10 @@ def update_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         parts = [f'"{name}"=?' for name in updates]
         conn.execute(f"UPDATE orders SET {', '.join(parts)} WHERE order_id=?", [*updates.values(), order_id])
         conn.execute(
-            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
-            (new_id("EVT"), "order", order_id, "ORDER_UPDATED_FROM_UI", json.dumps(updates, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp),
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("EVT"), "order", order_id, "ORDER_UPDATED_FROM_UI", json.dumps(updates, ensure_ascii=False), identity.user_id, timestamp),
         )
+        audit_log(conn, identity, "ORDER_UPDATED", "order", order_id, "SUCCESS", updates)
         conn.commit()
     return {"status": "updated", "order_id": order_id, "changes": updates}
 
@@ -992,7 +1484,7 @@ def activation_recommendation_key(order: dict[str, Any]) -> tuple[int, str, str]
     return (0 if delivery else 1, delivery.isoformat() if delivery else "9999-12-31", str(order.get("updated_at") or ""))
 
 
-def activation_snapshot(conn: sqlite3.Connection, current_user_id: str | None = None) -> dict[str, Any]:
+def activation_snapshot(conn: Any, current_user_id: str | None = None) -> dict[str, Any]:
     orders = [dict(r) for r in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()]
     if current_user_id and not is_manager(current_user_id):
         orders = [o for o in orders if owner_matches(o.get("owner"), current_user_id)]
@@ -1041,7 +1533,7 @@ def activation_risk(order: dict[str, Any], issue_status: str) -> tuple[str, int]
 
 
 def upsert_activation_task(
-    conn: sqlite3.Connection,
+    conn: Any,
     order: dict[str, Any],
     *,
     contact_status: str,
@@ -1120,13 +1612,13 @@ def upsert_activation_task(
 
 
 @app.get("/api/activation/summary")
-def activation_summary(current_user_id: str = Query("USER-1")) -> dict[str, Any]:
+def activation_summary(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
-        return activation_snapshot(conn, current_user_id)
+        return activation_snapshot(conn, identity.user_id)
 
 
 @app.post("/api/orders/{order_id}/initialize")
-def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
+def initialize_order(order_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     current_node = str(body.get("current_node") or "").strip()
     contact_status = str(body.get("contact_status") or "UNKNOWN").upper()
@@ -1134,7 +1626,7 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
     waiting_on = str(body.get("waiting_on") or "").strip().lower() or None
     promised_reply_at = body.get("promised_reply_at")
     note = str(body.get("initialization_note") or "").strip() or None
-    operator_id = str(body.get("operator_id") or "USER-1")
+    operator_id = identity.user_id
     if contact_status not in CONTACT_STATUS_VALUES:
         raise HTTPException(422, "contact_status无效")
     if issue_status not in ISSUE_STATUS_VALUES:
@@ -1152,6 +1644,8 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
         if not order_row:
             raise HTTPException(404, "订单不存在")
         order = dict(order_row)
+        # CRITICAL: Check organization access before any modification
+        require_order_access(identity, order, conn)
         closed = current_node in {"已完成", "已出货", "已取消"} or str(body.get("order_status") or "").upper() in {"DONE", "COMPLETED", "CANCELLED", "CLOSED"}
         if closed:
             status = "CANCELLED" if current_node == "已取消" else "COMPLETED"
@@ -1185,7 +1679,7 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
                 (readiness, timestamp, timestamp, order_id),
             )
         conn.execute(
-            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
             (new_id("EVT"), "order", order_id, "ORDER_STATUS_INITIALIZED", json.dumps({
                 "current_node": current_node, "contact_status": contact_status,
                 "issue_status": issue_status, "waiting_on": waiting_on,
@@ -1202,37 +1696,187 @@ def initialize_order(order_id: str, payload: AnyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/operators")
-def operator_list() -> dict[str, Any]:
+def operator_list(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     return {"items": OPERATORS}
 
 
-@app.get("/api/tasks/{task_id}")
-def task_detail(task_id: str, current_user_id: str = Query("USER-1")) -> dict[str, Any]:
-    board = dashboard(current_user_id=current_user_id, current_time=None)
-    task = next((item for item in board["items"] if item.get("task_id") == task_id), None)
-    if not task:
-        raise HTTPException(404, "任务不存在")
-    order_id = task.get("related_order_id")
+@app.get("/api/action-workspace")
+def action_workspace_list(
+    include_closed: bool = Query(False),
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    """D11 canonical workspace list. Never reads the legacy tasks table."""
     with db() as conn:
+        return list_action_workspaces(conn, identity, include_closed=include_closed)
+
+
+@app.get("/api/action-workspace/{action_case_id}")
+def action_workspace_detail(
+    action_case_id: str,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    with db() as conn:
+        item = build_case_workspace(conn, identity, action_case_id)
+        if not item:
+            raise HTTPException(404, "行动案例不存在或无权访问")
+        return {"item": item}
+
+
+@app.post("/api/action-workspace/{action_case_id}/tasks")
+def action_workspace_create_task(
+    action_case_id: str,
+    payload: AnyPayload,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    body = payload.model_dump()
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(422, "缺少任务标题")
+    try:
+        with db() as conn:
+            task = create_case_task(
+                conn, identity, action_case_id=action_case_id, title=title,
+                recommended_action=(str(body.get("recommended_action") or "").strip() or None),
+            )
+            conn.commit()
+            item = build_case_workspace(conn, identity, action_case_id)
+        return {"task": task, "item": item}
+    except D9NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except D9StateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/action-workspace/tasks/{task_id}/start")
+def action_workspace_start_task(
+    task_id: str,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    try:
+        with db() as conn:
+            task = start_case_task(conn, identity, task_id)
+            conn.commit()
+            item = build_case_workspace(conn, identity, task["action_case_id"])
+        return {"task": task, "item": item}
+    except D9NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except D9StateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/action-workspace/tasks/{task_id}/complete")
+def action_workspace_complete_task(
+    task_id: str,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    try:
+        with db() as conn:
+            task = complete_case_task(conn, identity, task_id)
+            conn.commit()
+            item = build_case_workspace(conn, identity, task["action_case_id"])
+        return {"task": task, "item": item}
+    except D9NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except D9StateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/action-workspace/tasks/{task_id}/wait")
+def action_workspace_wait_task(
+    task_id: str,
+    payload: AnyPayload,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    body = payload.model_dump()
+    waiting_type = str(body.get("waiting_type") or "EXTERNAL_REPLY").strip()
+    due_at = str(body.get("due_at") or "").strip()
+    if not due_at:
+        raise HTTPException(422, "缺少等待截止时间 due_at")
+    try:
+        with db() as conn:
+            waiting = wait_case_task(
+                conn, identity, task_id=task_id, waiting_type=waiting_type,
+                due_at=due_at, reason=(str(body.get("reason") or "").strip() or None),
+            )
+            conn.commit()
+            item = build_case_workspace(conn, identity, waiting["action_case_id"])
+        return {"waiting": waiting, "item": item}
+    except D9NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (D9StateError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/action-workspace/waitings/{waiting_id}/reply")
+def action_workspace_waiting_reply(
+    waiting_id: str,
+    payload: AnyPayload,
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    body = payload.model_dump()
+    try:
+        with db() as conn:
+            waiting = record_case_waiting_reply(
+                conn, identity, waiting_id=waiting_id,
+                reply_id=(str(body.get("reply_id") or "").strip() or None),
+                reply_payload=body.get("reply_payload"),
+                satisfies_completion=bool(body.get("satisfies_completion", False)),
+            )
+            conn.commit()
+            item = build_case_workspace(conn, identity, waiting["action_case_id"])
+        return {"waiting": waiting, "item": item}
+    except D9NotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except D9StateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/tasks/{task_id}")
+def task_detail(task_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
         events = [dict(r) for r in conn.execute("SELECT * FROM event_logs WHERE entity_id=? ORDER BY created_at DESC LIMIT 40", (task_id,)).fetchall()]
         messages = [dict(r) for r in conn.execute("SELECT * FROM source_messages WHERE order_id=? ORDER BY created_at DESC LIMIT 20", (order_id,)).fetchall()] if order_id else []
-    return {"task": task, "events": events, "messages": messages}
+    return {"task": task_dict, "events": events, "messages": messages}
 
 
 @app.get("/api/orders")
 def order_list(
     q: str | None = Query(None),
     status: str | None = Query(None),
-    current_user_id: str = Query("USER-1"),
+    identity: CurrentIdentity = Depends(get_current_identity),
 ) -> dict[str, Any]:
     with db() as conn:
         orders = [dict(r) for r in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC").fetchall()]
         tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
         risks = [dict(r) for r in conn.execute("SELECT * FROM risk_signals WHERE status='OPEN'").fetchall()]
-    if not is_manager(current_user_id):
-        orders = [order for order in orders if owner_matches(order.get("owner"), current_user_id)]
-    result = []
+    
+    # ALWAYS filter by organization - no bypass for managers
+    scoped_orders = []
     for order in orders:
+        order_org = str(order.get("organization_id") or "").strip()
+        if order_org:
+            if identity.same_org(order_org):
+                scoped_orders.append(order)
+        else:
+            # NULL org data: only the direct owner can access it
+            # Managers CANNOT see NULL-org data from other users
+            if owner_matches(order.get("owner"), identity.user_id):
+                scoped_orders.append(order)
+    
+    # Role-based additional filtering for non-managers
+    if not identity.is_manager():
+        scoped_orders = [order for order in scoped_orders if owner_matches(order.get("owner"), identity.user_id)]
+    
+    result = []
+    for order in scoped_orders:
         otasks = [t for t in tasks if t.get("related_order_id") == order["order_id"] and t.get("status") != "DONE"]
         orisks = [r for r in risks if r.get("order_id") == order["order_id"]]
         max_risk = max((r.get("risk_level") or "none" for r in orisks), key=lambda x: RISK_ORDER.get(x, 0), default="none")
@@ -1264,24 +1908,30 @@ def order_list(
 
 
 @app.post("/api/orders/{order_id}/tasks")
-def create_order_task(order_id: str, payload: AnyPayload) -> dict[str, Any]:
+def create_order_task(order_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     title = str(body.get("title") or "").strip()
     if not title:
         raise HTTPException(422, "缺少任务标题")
     with db() as conn:
-        if not conn.execute("SELECT 1 FROM orders WHERE order_id=?", (order_id,)).fetchone():
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+        if not order_row:
             raise HTTPException(404, "订单不存在")
+        order_dict = dict(order_row)
+        require_order_access(identity, order_dict, conn)
         task_id, timestamp = new_id("TASK"), iso()
-        operator_id = str(body.get("operator_id") or "USER-1")
+        operator_id = identity.user_id
         requested_owner = normalize_owner_value(body.get("owner_user_id"), fallback=operator_id) or operator_id
-        effective_owner = requested_owner if is_manager(operator_id) else operator_id
+        effective_owner = requested_owner if identity.is_manager() else operator_id
+        # Force organization_id from identity - NEVER from client input
+        effective_org = identity.organization_id
         conn.execute(
-            """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,source_message_id,evidence_json,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task_id, order_id, title, body.get("recommended_action") or title, body.get("target") or "factory", "OPEN", effective_owner, "assigned", None, None, body.get("next_action_at"), body.get("business_deadline"), None, body.get("risk_level") or "medium", int(bool(body.get("urgent"))), 0, None, json.dumps(body.get("evidence") or [], ensure_ascii=False), timestamp, timestamp),
+            """INSERT INTO tasks(task_id,related_order_id,title,recommended_action,target,status,owner_user_id,responsibility_status,waiting_on,promised_reply_at,next_action_at,business_deadline,last_contact_at,risk_level,urgent,pending_confirmation,source_message_id,evidence_json,created_at,updated_at,organization_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, order_id, title, body.get("recommended_action") or title, body.get("target") or "factory", "OPEN", effective_owner, "assigned", None, None, body.get("next_action_at"), body.get("business_deadline"), None, body.get("risk_level") or "medium", int(bool(body.get("urgent"))), 0, None, json.dumps(body.get("evidence") or [], ensure_ascii=False), timestamp, timestamp, effective_org),
         )
-        conn.execute("INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "order", order_id, "TASK_CREATED_FROM_UI", json.dumps({"task_id": task_id, **body}, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp))
+        conn.execute("INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)", (new_id("EVT"), "order", order_id, "TASK_CREATED_FROM_UI", json.dumps({"task_id": task_id, **body}, ensure_ascii=False), operator_id, timestamp))
+        audit_log(conn, identity, "TASK_CREATED", "task", task_id, "SUCCESS", body)
         conn.execute(
             """UPDATE orders SET action_readiness='ACTION_GENERATED',
                initialization_source=COALESCE(initialization_source,'MANUAL_TASK'),
@@ -1292,52 +1942,69 @@ def create_order_task(order_id: str, payload: AnyPayload) -> dict[str, Any]:
     return {"status": "created", "task_id": task_id, "order_id": order_id}
 
 
-def analyze_intake_body(body: dict[str, Any]) -> dict[str, Any]:
+def analyze_intake_body(body: dict[str, Any], org_id: str | None = None) -> dict[str, Any]:
     raw = str(body.get("raw_content") or "").strip()
     if not raw:
         raise HTTPException(422, "消息内容不能为空")
     sender_role = str(body.get("sender_role") or "customer")
     source_channel = str(body.get("source_channel") or "email")
     source_time = str(body.get("source_time") or iso())
-    order, task = order_and_task_context(body.get("order_id"), raw)
+    order, task = order_and_task_context(body.get("order_id"), raw, org_id=org_id)
     order_id = order.get("order_id") if order else None
-    configured = coze_status().get("ready", False)
-    workflow_key = "ft02" if sender_role == "factory" else "ft01"
-    workflow_source = f"COZE_{workflow_key.upper()}"
-    debug_url = None
-    if configured:
-        try:
-            if workflow_key == "ft02":
-                run = run_workflow("ft02", build_ft02_parameters(body, order, task), record=record_coze_run)
-                candidate = normalize_ft02(run.result, order=order, task=task, run=run)
-            else:
-                run = run_workflow("ft01", build_ft01_parameters(body, order, task), record=record_coze_run)
-                candidate = normalize_ft01(run.result, order=order, run=run)
-            debug_url = run.debug_url
-        except CozeWorkflowError as exc:
-            allow = os.getenv("COZE_ALLOW_LOCAL_FALLBACK_ON_ERROR", "false").lower() == "true"
-            if not allow:
-                raise coze_http_error(exc)
-            candidate = local_candidate(raw, sender_role, source_time, order)
-            candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": str(exc), "debug_url": exc.debug_url}
-            workflow_source = "LOCAL_FALLBACK_AFTER_COZE_ERROR"
+    
+    # Determine org_id for persistence - from caller or from matched order
+    persist_org_id = org_id
+    if not persist_org_id and order:
+        persist_org_id = order.get("organization_id")
+    if not persist_org_id:
+        persist_org_id = "ORG-DEMO"
+
+    # ── D11 UAT Fixture Provider (TEST/UAT ONLY) ──────────────────────
+    # When D11_UAT_INTAKE_PROVIDER=fixture, use deterministic fixtures
+    # instead of Coze or local fallback. Never active in production.
+    uat_provider = os.getenv("D11_UAT_INTAKE_PROVIDER", "").strip().lower()
+    if uat_provider == "fixture":
+        candidate = uat_fixture_candidate(raw, sender_role, source_time, order)
+        workflow_source = "UAT_FIXTURE_PROVIDER"
+        debug_url = None
     else:
-        allow = os.getenv("COZE_ALLOW_LOCAL_WHEN_UNCONFIGURED", "false").lower() == "true"
-        if not allow:
-            raise HTTPException(503, "Coze尚未配置：请在Render添加COZE_API_TOKEN")
-        candidate = local_candidate(raw, sender_role, source_time, order)
-        candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": "COZE_NOT_CONFIGURED"}
-        workflow_source = "LOCAL_FALLBACK_NO_TOKEN"
+        configured = coze_status().get("ready", False)
+        workflow_key = "ft02" if sender_role == "factory" else "ft01"
+        workflow_source = f"COZE_{workflow_key.upper()}"
+        debug_url = None
+        if configured:
+            try:
+                if workflow_key == "ft02":
+                    run = run_workflow("ft02", build_ft02_parameters(body, order, task), record=record_coze_run)
+                    candidate = normalize_ft02(run.result, order=order, task=task, run=run)
+                else:
+                    run = run_workflow("ft01", build_ft01_parameters(body, order, task), record=record_coze_run)
+                    candidate = normalize_ft01(run.result, order=order, run=run)
+                debug_url = run.debug_url
+            except CozeWorkflowError as exc:
+                allow = os.getenv("COZE_ALLOW_LOCAL_FALLBACK_ON_ERROR", "false").lower() == "true"
+                if not allow:
+                    raise coze_http_error(exc)
+                candidate = local_candidate(raw, sender_role, source_time, order)
+                candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": str(exc), "debug_url": exc.debug_url}
+                workflow_source = "LOCAL_FALLBACK_AFTER_COZE_ERROR"
+        else:
+            allow = os.getenv("COZE_ALLOW_LOCAL_WHEN_UNCONFIGURED", "false").lower() == "true"
+            if not allow:
+                raise HTTPException(503, "Coze尚未配置：请在Render添加COZE_API_TOKEN")
+            candidate = local_candidate(raw, sender_role, source_time, order)
+            candidate["_integration"] = {"workflow_key": workflow_key, "fallback_reason": "COZE_NOT_CONFIGURED"}
+            workflow_source = "LOCAL_FALLBACK_NO_TOKEN"
     message_id, review_id, timestamp = new_id("MSG"), new_id("REV"), iso()
     with db() as conn:
         conn.execute(
-            "INSERT INTO source_messages VALUES(?,?,?,?,?,?,?,?)",
-            (message_id, order_id, source_channel, sender_role, candidate.get("message_type"), raw, source_time, timestamp),
+            "INSERT INTO source_messages(message_id,order_id,organization_id,source_channel,sender_role,message_type,raw_content,source_time,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (message_id, order_id, persist_org_id, source_channel, sender_role, candidate.get("message_type"), raw, source_time, timestamp),
         )
         conn.execute(
-            """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,workflow_source,
-               candidate_json,status,created_at) VALUES(?,?,?,?,?,?,?)""",
-            (review_id, message_id, order_id, workflow_source, json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp),
+            """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,organization_id,workflow_source,
+               candidate_json,status,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (review_id, message_id, order_id, persist_org_id, workflow_source, json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp),
         )
         conn.commit()
     return {
@@ -1348,25 +2015,26 @@ def analyze_intake_body(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/intake/analyze")
-def analyze_intake(payload: AnyPayload) -> dict[str, Any]:
+def analyze_intake(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     """Compatibility endpoint: waits for the workflow to finish."""
-    return analyze_intake_body(payload.model_dump())
+    return analyze_intake_body(payload.model_dump(), org_id=identity.organization_id)
 
 
 def process_intake_job(job_id: str) -> None:
     started_at = iso()
     with db() as conn:
-        row = conn.execute("SELECT request_json FROM intake_jobs WHERE job_id=?", (job_id,)).fetchone()
+        row = conn.execute("SELECT request_json, organization_id FROM intake_jobs WHERE job_id=?", (job_id,)).fetchone()
         if not row:
             return
         body = json.loads(row["request_json"])
+        job_org_id = row["organization_id"]
         conn.execute(
             "UPDATE intake_jobs SET status='PROCESSING', progress_message=?, started_at=?, updated_at=? WHERE job_id=?",
             ("正在调用Coze工作流并提取候选", started_at, started_at, job_id),
         )
         conn.commit()
     try:
-        result = analyze_intake_body(body)
+        result = analyze_intake_body(body, org_id=job_org_id)
         completed_at = iso()
         with db() as conn:
             conn.execute(
@@ -1400,7 +2068,7 @@ def process_intake_job(job_id: str) -> None:
 
 
 @app.post("/api/intake/jobs", status_code=202)
-def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     raw = str(body.get("raw_content") or "").strip()
     if not raw:
@@ -1409,11 +2077,15 @@ def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks) ->
     workflow_key = "ft02" if sender_role == "factory" else "ft01"
     job_id = new_id("INTAKE")
     timestamp = iso()
+    raw_order_id = body.get("order_id")
+    order_id = str(raw_order_id).strip() if raw_order_id else None
+    # P0-1: Bind organization_id from authenticated identity, NEVER from client payload
+    org_id = identity.organization_id
     with db() as conn:
         conn.execute(
-            """INSERT INTO intake_jobs(job_id,status,workflow_key,order_id,request_json,progress_message,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (job_id, "QUEUED", workflow_key, body.get("order_id"), json.dumps(body, ensure_ascii=False),
+            """INSERT INTO intake_jobs(job_id,organization_id,status,workflow_key,order_id,request_json,progress_message,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (job_id, org_id, "QUEUED", workflow_key, order_id, json.dumps(body, ensure_ascii=False),
              f"已进入后台队列，即将调用{workflow_key.upper()}", timestamp, timestamp),
         )
         conn.commit()
@@ -1425,9 +2097,13 @@ def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks) ->
 
 
 @app.get("/api/intake/jobs/{job_id}")
-def get_intake_job(job_id: str) -> dict[str, Any]:
+def get_intake_job(job_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
-        row = conn.execute("SELECT * FROM intake_jobs WHERE job_id=?", (job_id,)).fetchone()
+        # P0-3: Enforce organization isolation for intake jobs
+        row = conn.execute(
+            "SELECT * FROM intake_jobs WHERE job_id=? AND organization_id=?",
+            (job_id, identity.organization_id)
+        ).fetchone()
     if not row:
         raise HTTPException(404, "识别任务不存在")
     item = dict(row)
@@ -1438,7 +2114,7 @@ def get_intake_job(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/reviews/import")
-def import_review(payload: AnyPayload) -> dict[str, Any]:
+def import_review(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     raw_result = body.get("result_json") or body.get("candidate")
     if isinstance(raw_result, str):
@@ -1447,20 +2123,64 @@ def import_review(payload: AnyPayload) -> dict[str, Any]:
     elif isinstance(raw_result, dict): candidate = raw_result
     else: raise HTTPException(422, "缺少result_json")
     order_id = body.get("order_id") or (candidate.get("order_match") or {}).get("selected_order_id")
+    
+    with db() as conn:
+        # P0-H: Validate source_message_id belongs to current organization
+        source_message_id = body.get("source_message_id")
+        if source_message_id:
+            msg_row = conn.execute(
+                "SELECT organization_id FROM source_messages WHERE message_id=?",
+                (source_message_id,)
+            ).fetchone()
+            if not msg_row:
+                raise HTTPException(404, "源消息不存在")
+            if msg_row["organization_id"] != identity.organization_id:
+                raise HTTPException(404, "源消息不存在")
+        
+        # P0-H: Validate order belongs to current organization (if order_id provided)
+        if order_id:
+            order_row = conn.execute("SELECT organization_id FROM orders WHERE order_id=?", (order_id,)).fetchone()
+            if order_row and order_row["organization_id"]:
+                require_same_org(identity, order_row["organization_id"])
+        
+        # P0-H: Cross-validate Review / SourceMessage / Order org consistency
+        org_id = identity.organization_id
+        if source_message_id:
+            msg_org = conn.execute(
+                "SELECT organization_id FROM source_messages WHERE message_id=?",
+                (source_message_id,)
+            ).fetchone()
+            if msg_org and msg_org["organization_id"] != org_id:
+                raise HTTPException(404, "源消息不存在")
+    
     with db() as conn:
         review_id, timestamp = new_id("REV"), iso()
-        conn.execute("INSERT INTO candidate_reviews(review_id,source_message_id,order_id,workflow_source,candidate_json,status,created_at) VALUES(?,?,?,?,?,?,?)", (review_id, body.get("source_message_id"), order_id, body.get("workflow_source") or "COZE_IMPORT", json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp))
+        # P0-4: Use organization_id from identity, not from client payload
+        org_id = identity.organization_id
+        conn.execute(
+            """INSERT INTO candidate_reviews(review_id,source_message_id,order_id,organization_id,workflow_source,candidate_json,status,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (review_id, body.get("source_message_id"), order_id, org_id, body.get("workflow_source") or "COZE_IMPORT", json.dumps(candidate, ensure_ascii=False), "PENDING", timestamp)
+        )
         conn.commit()
     return {"status": "imported", "review_id": review_id}
 
 
 @app.get("/api/reviews")
-def review_list(status: str | None = Query(None)) -> dict[str, Any]:
+def review_list(status: str | None = Query(None), identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
-        sql = "SELECT r.*, m.raw_content, m.sender_role, m.source_channel, o.order_no, o.customer_name FROM candidate_reviews r LEFT JOIN source_messages m ON m.message_id=r.source_message_id LEFT JOIN orders o ON o.order_id=r.order_id"
+        # P0-4: Filter by candidate_reviews.organization_id directly, not by order org
+        # P0-I: Add m.organization_id = r.organization_id defense-in-depth on JOIN
+        sql = "SELECT r.*, m.raw_content, m.sender_role, m.source_channel, o.order_no, o.customer_name, o.organization_id as order_org FROM candidate_reviews r LEFT JOIN source_messages m ON m.message_id=r.source_message_id AND m.organization_id=r.organization_id LEFT JOIN orders o ON o.order_id=r.order_id"
         params: list[Any] = []
+        conditions = []
         if status and status != "ALL":
-            sql += " WHERE r.status=?"; params.append(status)
+            conditions.append("r.status=?")
+            params.append(status)
+        # P0-4: Strict organization isolation - only show reviews from current user's org
+        conditions.append("r.organization_id=?")
+        params.append(identity.organization_id)
+        sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY CASE r.status WHEN 'PENDING' THEN 0 ELSE 1 END, r.created_at DESC"
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     for row in rows: row["candidate"] = json.loads(row.pop("candidate_json"))
@@ -1468,28 +2188,54 @@ def review_list(status: str | None = Query(None)) -> dict[str, Any]:
 
 
 @app.get("/api/reviews/{review_id}")
-def review_detail(review_id: str) -> dict[str, Any]:
+def review_detail(review_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
-        row = conn.execute("SELECT r.*, m.raw_content, m.sender_role, m.source_channel, o.order_no, o.customer_name FROM candidate_reviews r LEFT JOIN source_messages m ON m.message_id=r.source_message_id LEFT JOIN orders o ON o.order_id=r.order_id WHERE r.review_id=?", (review_id,)).fetchone()
-        if not row: raise HTTPException(404, "候选记录不存在")
+        # P0-4: Enforce organization isolation on candidate_reviews
+        # P0-I: Add m.organization_id = r.organization_id defense-in-depth on JOIN
+        row = conn.execute(
+            "SELECT r.*, m.raw_content, m.sender_role, m.source_channel, o.order_no, o.customer_name FROM candidate_reviews r LEFT JOIN source_messages m ON m.message_id=r.source_message_id AND m.organization_id=r.organization_id LEFT JOIN orders o ON o.order_id=r.order_id WHERE r.review_id=? AND r.organization_id=?",
+            (review_id, identity.organization_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "候选记录不存在")
+        # Additional check: if linked order, verify order org matches review org
+        order_id = row["order_id"]
+        if order_id:
+            order_row = conn.execute("SELECT organization_id FROM orders WHERE order_id=?", (order_id,)).fetchone()
+            if order_row and order_row["organization_id"]:
+                require_same_org(identity, order_row["organization_id"])
     result = dict(row); result["candidate"] = json.loads(result.pop("candidate_json")); return result
 
 
 @app.post("/api/reviews/{review_id}/confirm")
-def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
+def confirm_review(review_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
-    operator_id = body.get("operator_id") or "USER-1"
+    operator_id = identity.user_id
     with db() as conn:
-        row = conn.execute("SELECT * FROM candidate_reviews WHERE review_id=?", (review_id,)).fetchone()
+        # P0-4: Also check organization_id on candidate_reviews itself
+        row = conn.execute(
+            "SELECT * FROM candidate_reviews WHERE review_id=? AND organization_id=?",
+            (review_id, identity.organization_id)
+        ).fetchone()
         if not row:
             raise HTTPException(404, "候选记录不存在")
         review = dict(row)
         if review["status"] == "CONFIRMED":
             return {"status": "DUPLICATE_SKIPPED", "review_id": review_id, "order_id": review.get("order_id")}
         candidate = body.get("candidate") or json.loads(review["candidate_json"])
+        if review.get("status") == "REJECTED":
+            raise HTTPException(409, detail={"code": "REVIEW_REJECTED", "message": "该候选已被拒绝"})
+        if review.get("status") == "APPROVAL_PENDING" and not identity.is_manager():
+            raise HTTPException(403, detail={"code": "MANAGER_REVIEW_REQUIRED", "message": "该事项已进入主管审批"})
+        if candidate_requires_manager(candidate) and not identity.is_manager():
+            raise HTTPException(409, detail={"code": "MANAGER_REVIEW_REQUIRED", "message": "高风险或正式业务事实变更需要主管审批"})
         order_id = review.get("order_id") or (candidate.get("order_match") or {}).get("selected_order_id")
         if not order_id:
             raise HTTPException(422, "候选未唯一关联订单，请先选择订单")
+        # ENFORCE: Organization boundary for the order
+        order_row = conn.execute("SELECT organization_id FROM orders WHERE order_id=?", (order_id,)).fetchone()
+        if order_row and order_row["organization_id"]:
+            require_same_org(identity, order_row["organization_id"])
         order = rowdict(conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone())
         task_id = (candidate.get("_integration") or {}).get("task_id")
         task = rowdict(conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()) if task_id else None
@@ -1500,7 +2246,7 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
             raise HTTPException(503, "Coze尚未配置，无法从网页调用FT03；请先在Render设置COZE_API_TOKEN")
         plan, _ = review_to_transaction(review, candidate, operator_id)
         with db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_transaction(conn)
             local_result = apply_writeback(conn, {"order_id": order_id, "operator_id": operator_id}, plan)
             task_id = create_or_update_action_task(conn, review, candidate, order_id)
             timestamp = iso()
@@ -1548,7 +2294,7 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
         })
     task_id = None
     with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        begin_transaction(conn)
         task_id = create_or_update_action_task(conn, review, candidate, order_id)
         timestamp = iso()
         conn.execute(
@@ -1558,7 +2304,7 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
         if review.get("source_message_id"):
             conn.execute("UPDATE source_messages SET order_id=? WHERE message_id=?", (order_id, review["source_message_id"]))
         conn.execute(
-            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
             (new_id("EVT"), "order", order_id, "COZE_FT03_CONFIRMED_FROM_UI",
              json.dumps({"review_id": review_id, "task_id": task_id, "workflow_run_id": run.run_id}, ensure_ascii=False),
              operator_id, timestamp),
@@ -1579,31 +2325,54 @@ def confirm_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
 
 
 @app.post("/api/reviews/{review_id}/reject")
-def reject_review(review_id: str, payload: AnyPayload) -> dict[str, Any]:
+def reject_review(review_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
+    operator_id = identity.user_id
     with db() as conn:
-        changed = conn.execute("UPDATE candidate_reviews SET status='REJECTED', reviewer_id=?, reviewed_at=? WHERE review_id=?", (body.get("operator_id") or "USER-1", iso(), review_id)).rowcount
+        # P0-G: Enforce organization isolation - must be same org to reject
+        row = conn.execute(
+            "SELECT * FROM candidate_reviews WHERE review_id=? AND organization_id=?",
+            (review_id, identity.organization_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "候选记录不存在")
+        review = dict(row)
+        # P0-G removed: no need to check order org separately since we already verified review org
+        changed = conn.execute(
+            "UPDATE candidate_reviews SET status='REJECTED', reviewer_id=?, reviewed_at=? WHERE review_id=? AND organization_id=?",
+            (operator_id, iso(), review_id, identity.organization_id)
+        ).rowcount
         if not changed: raise HTTPException(404, "候选记录不存在")
         conn.commit()
     return {"status": "REJECTED", "review_id": review_id}
 
 
 @app.post("/api/drafts/{draft_id}/review")
-def review_draft_locally(draft_id: str, payload: AnyPayload) -> dict[str, Any]:
+def review_draft_locally(draft_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     """Persist a human draft decision locally without another model call."""
     body = payload.model_dump()
     action = str(body.get("action") or "").strip().lower()
     if action not in {"approve", "reject", "save_edit", "copy_and_record"}:
         raise HTTPException(400, "不支持的草稿操作")
-    operator_id = str(body.get("operator_id") or "USER-1")
+    operator_id = identity.user_id
     timestamp = iso()
     with db() as conn:
-        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='communication_drafts'").fetchone():
+        if not table_exists(conn, "communication_drafts"):
             raise HTTPException(404, "草稿记录表不存在，请重新生成草稿")
         row = conn.execute("SELECT * FROM communication_drafts WHERE draft_id=?", (draft_id,)).fetchone()
         if not row:
             raise HTTPException(404, "草稿不存在或已过期，请重新生成")
         record = dict(row)
+        # Drafts are always order-scoped. Re-check the authenticated user's order
+        # access before revealing or mutating a draft so a leaked draft_id cannot
+        # cross the organization boundary.
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (record.get("order_id"),)).fetchone()
+        if not order_row:
+            raise HTTPException(404, "草稿不存在或已过期，请重新生成")
+        try:
+            require_order_access(identity, dict(order_row), conn)
+        except HTTPException as exc:
+            raise HTTPException(404, "草稿不存在或已过期，请重新生成") from exc
         subject = body.get("edited_subject") if body.get("edited_subject") is not None else record.get("edited_subject") or record.get("ai_subject") or ""
         draft = body.get("edited_draft") if body.get("edited_draft") is not None else record.get("edited_draft") or record.get("ai_draft") or ""
         note = str(body.get("note") or "").strip()
@@ -1643,21 +2412,62 @@ def review_draft_locally(draft_id: str, payload: AnyPayload) -> dict[str, Any]:
         )
         task_update = None
         task_id = body.get("task_id")
-        if action == "copy_and_record" and task_id:
-            if not conn.execute("SELECT task_id FROM tasks WHERE task_id=?", (task_id,)).fetchone():
-                raise HTTPException(404, "关联任务不存在，尚未记录为已联系")
+        if action == "copy_and_record" and task_id and not duplicate:
             waiting_on = str(body.get("waiting_on") or "").strip() or None
             promised_reply_at = body.get("promised_reply_at")
             next_action_at = body.get("next_action_at") or promised_reply_at
-            conn.execute(
-                """UPDATE tasks SET status='OPEN',waiting_on=?,promised_reply_at=?,next_action_at=?,
-                   last_contact_at=?,updated_at=? WHERE task_id=?""",
-                (waiting_on, promised_reply_at, next_action_at, timestamp, timestamp, task_id),
-            )
-            task_update = {"updated": True, "task_id": task_id, "waiting_on": waiting_on, "promised_reply_at": promised_reply_at}
+
+            # D11 canonical tasks live in d9_action_case_tasks. A copied draft is
+            # a real contact action, so TODO -> IN_PROGRESS -> WAITING must use the
+            # frozen D9 FSM instead of the legacy tasks table.
+            d9_row = None
+            if table_exists(conn, "d9_action_case_tasks"):
+                d9_row = conn.execute(
+                    "SELECT * FROM d9_action_case_tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+            if d9_row:
+                d9_task = dict(d9_row)
+                if d9_task.get("organization_id") != identity.organization_id:
+                    raise HTTPException(404, "关联任务不存在，尚未记录为已联系")
+                if not next_action_at:
+                    raise HTTPException(422, "请选择承诺回复时间，再记录为等待回复")
+                try:
+                    if d9_task.get("status") == "TODO":
+                        start_case_task(conn, identity, task_id)
+                    elif d9_task.get("status") not in {"IN_PROGRESS", "WAITING"}:
+                        raise HTTPException(409, f"当前任务状态 {d9_task.get('status')} 不能记录等待")
+                    waiting_type = "SUPPLIER_REPLY" if waiting_on in {"factory", "supplier"} else "CUSTOMER_REPLY"
+                    waiting = wait_case_task(
+                        conn, identity, task_id=task_id, waiting_type=waiting_type,
+                        due_at=str(next_action_at), reason="沟通草稿已复制并记录人工联系",
+                    )
+                    task_update = {
+                        "updated": True, "task_id": task_id,
+                        "waiting_id": waiting.get("waiting_id"),
+                        "waiting_on": waiting_on, "promised_reply_at": promised_reply_at,
+                    }
+                except D9NotFoundError as exc:
+                    raise HTTPException(404, str(exc)) from exc
+                except D9StateError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+            else:
+                # Backward-compatible legacy communication task path. It remains
+                # tenant-scoped and is not used by the D11 action workspace.
+                legacy = conn.execute(
+                    "SELECT task_id FROM tasks WHERE task_id=? AND organization_id=?",
+                    (task_id, identity.organization_id),
+                ).fetchone()
+                if not legacy:
+                    raise HTTPException(404, "关联任务不存在，尚未记录为已联系")
+                conn.execute(
+                    """UPDATE tasks SET status='OPEN',waiting_on=?,promised_reply_at=?,next_action_at=?,
+                       last_contact_at=?,updated_at=? WHERE task_id=? AND organization_id=?""",
+                    (waiting_on, promised_reply_at, next_action_at, timestamp, timestamp, task_id, identity.organization_id),
+                )
+                task_update = {"updated": True, "task_id": task_id, "waiting_on": waiting_on, "promised_reply_at": promised_reply_at}
         if not duplicate:
             conn.execute(
-                "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
                 (new_id("EVT"), "communication_draft", draft_id, event_type,
                  json.dumps({"action": action, "task_id": task_id, "risk_override": override, "note": note}, ensure_ascii=False),
                  operator_id, timestamp),
@@ -1667,8 +2477,9 @@ def review_draft_locally(draft_id: str, payload: AnyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/management")
-def management_dashboard() -> dict[str, Any]:
-    data = dashboard(current_user_id="MANAGER-1", current_time=None)
+def management_dashboard(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    require_manager(identity)
+    data = build_dashboard(identity)
     items = data["items"]
     workload: dict[str, dict[str, Any]] = {}
     waiting: dict[str, int] = {}
@@ -1691,15 +2502,17 @@ def management_dashboard() -> dict[str, Any]:
 
 
 @app.get("/api/settings")
-def get_settings(user_id: str = Query("USER-1")) -> dict[str, Any]:
-    defaults = {"theme": "upstream", "compact": False, "show_demo": False, "current_user_id": "USER-1", "notifications": {"urgent": True, "waiting_overdue": True, "writeback": True, "daily_summary": False}}
+def get_settings(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    user_id = identity.user_id
+    defaults = {"theme": "upstream", "compact": False, "show_demo": False, "current_user_id": user_id, "notifications": {"urgent": True, "waiting_overdue": True, "writeback": True, "daily_summary": False}}
     with db() as conn:
         row = conn.execute("SELECT settings_json,updated_at FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
     return {"user_id": user_id, "settings": json.loads(row["settings_json"]) if row else defaults, "updated_at": row["updated_at"] if row else None}
 
 
 @app.put("/api/settings")
-def put_settings(payload: AnyPayload, user_id: str = Query("USER-1")) -> dict[str, Any]:
+def put_settings(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    user_id = identity.user_id
     settings = payload.model_dump().get("settings") or payload.model_dump()
     timestamp = iso()
     with db() as conn:
@@ -1709,7 +2522,7 @@ def put_settings(payload: AnyPayload, user_id: str = Query("USER-1")) -> dict[st
 
 
 @app.get("/api/coze/status")
-def api_coze_status() -> dict[str, Any]:
+def api_coze_status(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     status = coze_status()
     with db() as conn:
         recent = [dict(r) for r in conn.execute(
@@ -1720,8 +2533,8 @@ def api_coze_status() -> dict[str, Any]:
 
 
 @app.post("/api/coze/ft04/refresh")
-def api_ft04_refresh(payload: AnyPayload) -> dict[str, Any]:
-    user_id = payload.model_dump().get("current_user_id") or "USER-1"
+def api_ft04_refresh(payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    user_id = identity.user_id
     try:
         result = run_ft04_refresh(user_id, raise_on_error=True)
     except CozeWorkflowError as exc:
@@ -1733,12 +2546,9 @@ def _mark_interrupted_intake_jobs() -> None:
     """Close stale intake jobs after a restart without assuming a legacy schema."""
     timestamp = iso()
     with db() as conn:
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_jobs'"
-        ).fetchone()
-        if not table:
+        if not table_exists(conn, "intake_jobs"):
             return
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(intake_jobs)")}
+        columns = {col["name"] for col in get_table_columns(conn, "intake_jobs")}
         required = {"status", "progress_message", "error_json", "completed_at", "updated_at"}
         if not required.issubset(columns):
             print(f"[startup-warning] intake_jobs legacy schema; skip stale-job cleanup: missing={sorted(required - columns)}")
@@ -1811,7 +2621,7 @@ def health() -> dict[str, Any]:
 
 @app.get("/ready")
 def ready() -> dict[str, Any]:
-    """Application readiness endpoint for diagnostics; returns 503 until SQLite is usable."""
+    """Application readiness endpoint; returns 503 until the selected database backend is usable."""
     if not APP_STARTUP_STATE["database_ready"]:
         raise HTTPException(
             503,
@@ -1825,7 +2635,7 @@ def ready() -> dict[str, Any]:
     try:
         with db() as conn:
             conn.execute("SELECT 1").fetchone()
-    except sqlite3.Error as exc:
+    except Exception as exc:
         APP_STARTUP_STATE["database_ready"] = False
         APP_STARTUP_STATE["startup_error"] = f"{type(exc).__name__}: {exc}"
         raise HTTPException(503, {"status": "degraded", "database_ready": False,
@@ -1835,7 +2645,8 @@ def ready() -> dict[str, Any]:
 
 
 @app.get("/api/system/storage")
-def system_storage() -> dict[str, Any]:
+def system_storage(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    require_manager(identity)
     init_db()
     status = storage_status()
     with db() as conn:
@@ -1845,59 +2656,120 @@ def system_storage() -> dict[str, Any]:
     return status
 
 
-def clear_business_data(conn: sqlite3.Connection) -> None:
+def clear_business_data(conn: Any) -> None:
     # Clear all user-created business and audit data, including optional modules.
     # Tables are discovered first so this remains compatible when a patch module
     # is not installed in a particular deployment.
-    existing = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.execute("PRAGMA foreign_keys = OFF")
     tables = [
+        "d12_human_reviews", "d15_execution_trace_events", "d15_outbox_execution_state", "d10_outbox_events", "d10_idempotency_records", "d10_audit_events", "d10_business_actions",
+        "d9_trace_events", "d9_action_case_waitings", "d9_action_case_tasks", "action_cases",
         "communication_events", "communication_workflow_runs", "communication_drafts",
         "communication_task_candidates", "order_import_rows", "order_import_batches", "intake_jobs",
         "bulk_update_candidates", "bulk_update_batches", "analytics_events",
         "agent_chat_jobs", "agent_tool_calls", "approval_requests", "anomaly_candidates", "daily_inspection_reports", "agent_runs", "logistics_events", "order_dependencies",
         "task_rankings", "workflow_runs", "user_settings", "candidate_reviews",
         "idempotency_records", "event_logs", "confirmation_snapshots",
-        "commitment_history", "risk_signals", "tasks", "source_messages", "orders"
+        "commitment_history", "risk_signals", "tasks", "source_messages", "order_lines", "orders"
     ]
     for table in tables:
-        if table in existing:
+        if table_exists(conn, table):
             conn.execute(f'DELETE FROM "{table}"')
     conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 @app.post("/api/reset")
-def reset() -> dict[str, Any]:
+def reset(
+    identity: CurrentIdentity = Depends(get_current_identity_optional),
+    x_floworder_agent_key: str | None = Header(None),
+) -> dict[str, Any]:
+    """Reset business data. Requires manager token or agent API key."""
+    agent_key = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip() or agent_api.AGENT_API_KEY
+    if identity is not None:
+        require_manager(identity)
+    elif x_floworder_agent_key and agent_key and hmac.compare_digest(x_floworder_agent_key, agent_key):
+        pass
+    else:
+        raise HTTPException(401, "RESET_AUTH_REQUIRED")
+    if os.getenv("ENABLE_DEMO_ADMIN_ACTIONS", "false").lower() != "true":
+        raise HTTPException(403, "RESET_DEMO_ADMIN_ACTIONS_DISABLED")
     with db() as conn:
         clear_business_data(conn)
     return {"status": "cleared", "at": iso()}
 
 
 @app.post("/api/demo/seed")
-def seed_demo() -> dict[str, Any]:
+def seed_demo(
+    identity: CurrentIdentity = Depends(get_current_identity_optional),
+    x_floworder_agent_key: str | None = Header(None),
+) -> dict[str, Any]:
+    """Seed demo data. Requires manager token or agent API key."""
+    agent_key = os.getenv("FLOWORDER_AGENT_API_KEY", "").strip() or agent_api.AGENT_API_KEY
+    if identity is not None:
+        require_manager(identity)
+    elif x_floworder_agent_key and agent_key and hmac.compare_digest(x_floworder_agent_key, agent_key):
+        pass
+    else:
+        raise HTTPException(401, "SEED_AUTH_REQUIRED")
+    if os.getenv("ENABLE_DEMO_ADMIN_ACTIONS", "false").lower() != "true":
+        raise HTTPException(403, "SEED_DEMO_ADMIN_ACTIONS_DISABLED")
     with db() as conn:
         reset_demo_data(conn)
     return {"status": "seeded", "at": iso()}
 
 
-@app.get("/api/dashboard")
-def dashboard(
-    current_user_id: str = Query("USER-1"),
-    current_time: str | None = Query(None),
-) -> dict[str, Any]:
+def build_dashboard(identity: CurrentIdentity, current_time: str | None = None) -> dict[str, Any]:
+    """Internal dashboard builder. Requires a validated CurrentIdentity."""
     current = parse_dt(current_time) or now_cn()
+    user_id = identity.user_id
     with db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM tasks").fetchall()]
         order_rows = [dict(r) for r in conn.execute("SELECT * FROM orders").fetchall()]
-        if not is_manager(current_user_id):
-            rows = [row for row in rows if normalize_owner_value(row.get("owner_user_id")) == current_user_id]
+        
+        # ENFORCE: Organization boundary filtering
+        scoped_orders = []
+        for order in order_rows:
+            order_org = str(order.get("organization_id") or "").strip()
+            if order_org:
+                if identity.same_org(order_org):
+                    scoped_orders.append(order)
+            else:
+                if owner_matches(order.get("owner"), identity.user_id):
+                    scoped_orders.append(order)
+        order_rows = scoped_orders
+        
+        scoped_tasks = []
+        scoped_order_ids = {o["order_id"] for o in scoped_orders}
+        for task in rows:
+            task_org = str(task.get("organization_id") or "").strip()
+            if task_org:
+                if identity.same_org(task_org):
+                    scoped_tasks.append(task)
+            else:
+                related_order_id = task.get("related_order_id")
+                if related_order_id and related_order_id in scoped_order_ids:
+                    scoped_tasks.append(task)
+                elif owner_matches(task.get("owner_user_id"), identity.user_id):
+                    scoped_tasks.append(task)
+        rows = scoped_tasks
+        
+        if not identity.is_manager():
+            rows = [row for row in rows if normalize_owner_value(row.get("owner_user_id")) == identity.user_id]
             assigned_order_ids = {row.get("related_order_id") for row in rows if row.get("related_order_id")}
-            order_rows = [order for order in order_rows if owner_matches(order.get("owner"), current_user_id) or order.get("order_id") in assigned_order_ids]
+            order_rows = [order for order in order_rows if owner_matches(order.get("owner"), identity.user_id) or order.get("order_id") in assigned_order_ids]
         orders = {r["order_id"]: r for r in order_rows}
         latest = conn.execute(
-            "SELECT MAX(calculated_at) AS last_at FROM task_rankings WHERE current_user_id=?", (current_user_id,)
+            "SELECT MAX(calculated_at) AS last_at FROM task_rankings WHERE current_user_id=?", (identity.user_id,)
         ).fetchone()
         latest_task = conn.execute("SELECT MAX(updated_at) AS last_task_at FROM tasks").fetchone()
-    rankings = coze_rankings(current_user_id)
+        attention_flag = d16.resolve_feature_flag(
+            conn,
+            flag_key=d16.FLAG_ATTENTION_DASHBOARD,
+            organization_id=identity.organization_id,
+            user_id=identity.user_id,
+        )
+    rankings = coze_rankings(identity.user_id)
     cache_seconds = int(os.getenv("COZE_FT04_CACHE_SECONDS", "120"))
     stale = True
     if latest and latest["last_at"]:
@@ -1909,11 +2781,11 @@ def dashboard(
             or bool(task_dt and task_dt > last_dt)
         )
     if coze_status().get("ready") and (not rankings or stale):
-        run_ft04_refresh(current_user_id)
-        rankings = coze_rankings(current_user_id)
+        run_ft04_refresh(identity.user_id)
+        rankings = coze_rankings(identity.user_id)
     items = []
     for row in rows:
-        local = decide_task(row, current, current_user_id)
+        local = decide_task(row, current, identity.user_id)
         rank = rankings.get(row.get("task_id"))
         if rank:
             local.update({
@@ -1934,6 +2806,10 @@ def dashboard(
         items.append(local)
     items.sort(key=lambda x: x["priority_score"], reverse=True)
     top = [x for x in items if x["action_state"] not in {"DONE", "NOT_MY_RESPONSIBILITY"} and not x["ranking_suppressed"]][:5]
+    attention_disabled = not bool(attention_flag.get("effective_enabled"))
+    if attention_disabled:
+        # Safe OFF: preserve the ordinary workspace list, but hide the prioritized attention surface.
+        top = []
     summary = {
         "total": len(items),
         "do_now": sum(x["action_state"] == "DO_NOW" for x in items),
@@ -1944,26 +2820,31 @@ def dashboard(
         "escalate": sum(x["action_state"] == "ESCALATE" for x in items),
     }
     with db() as conn:
-        activation = activation_snapshot(conn, current_user_id)
+        activation = activation_snapshot(conn, identity.user_id)
     return {
         "current_time": iso(current), "summary": summary, "items": items, "top_actions": top,
         "ranking_source": "COZE_FT04" if rankings else "LOCAL_FALLBACK", "activation": activation,
+        "feature_flags": {"attention_dashboard": attention_flag},
+        "attention_dashboard_disabled": attention_disabled,
     }
 
 
+@app.get("/api/dashboard")
+def dashboard(
+    current_time: str | None = Query(None),
+    identity: CurrentIdentity = Depends(get_current_identity),
+) -> dict[str, Any]:
+    return build_dashboard(identity, current_time)
+
+
 @app.get("/api/orders/{order_id}")
-def order_detail(order_id: str, current_user_id: str = Query("USER-1")) -> dict[str, Any]:
+def order_detail(order_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
         order = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         if not order:
             raise HTTPException(404, "订单不存在")
-        if not is_manager(current_user_id) and not owner_matches(dict(order).get("owner"), current_user_id):
-            assigned = conn.execute(
-                "SELECT 1 FROM tasks WHERE related_order_id=? AND owner_user_id=? LIMIT 1",
-                (order_id, current_user_id),
-            ).fetchone()
-            if not assigned:
-                raise HTTPException(403, "当前身份无权查看该订单")
+        order_dict = dict(order)
+        require_order_access(identity, order_dict, conn)
         tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks WHERE related_order_id=? ORDER BY created_at DESC", (order_id,))]
         risks = [dict(r) for r in conn.execute("SELECT * FROM risk_signals WHERE order_id=? ORDER BY created_at DESC", (order_id,))]
         messages = [dict(r) for r in conn.execute("SELECT * FROM source_messages WHERE order_id=? ORDER BY created_at DESC", (order_id,))]
@@ -1972,13 +2853,13 @@ def order_detail(order_id: str, current_user_id: str = Query("USER-1")) -> dict[
     for task in tasks:
         task["evidence"] = json.loads(task.pop("evidence_json") or "[]")
     return {
-        "order": dict(order), "tasks": tasks, "risks": risks,
+        "order": order_dict, "tasks": tasks, "risks": risks,
         "messages": messages, "commitments": commitments, "events": events,
     }
 
 
 @app.post("/api/tasks/{task_id}/contacted")
-def contacted(task_id: str, payload: AnyPayload) -> dict[str, Any]:
+def contacted(task_id: str, payload: AnyPayload, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     body = payload.model_dump()
     promised_reply_at = body.get("promised_reply_at")
     waiting_on = body.get("waiting_on") or "factory"
@@ -1988,6 +2869,11 @@ def contacted(task_id: str, payload: AnyPayload) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
         timestamp = iso()
         conn.execute(
             """UPDATE tasks SET waiting_on=?, promised_reply_at=?, next_action_at=?,
@@ -1995,23 +2881,33 @@ def contacted(task_id: str, payload: AnyPayload) -> dict[str, Any]:
             (waiting_on, promised_reply_at, promised_reply_at, timestamp, timestamp, task_id),
         )
         conn.execute(
-            "INSERT INTO event_logs VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO event_logs(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
             (new_id("EVT"), "task", task_id, "CONTACT_RECORDED",
-             json.dumps(body, ensure_ascii=False), body.get("operator_id") or "USER-1", timestamp),
+             json.dumps(body, ensure_ascii=False), identity.user_id, timestamp),
         )
+        audit_log(conn, identity, "TASK_CONTACTED", "task", task_id, "SUCCESS", body)
         conn.commit()
     return {"status": "updated", "task_id": task_id, "waiting_on": waiting_on, "promised_reply_at": promised_reply_at}
 
 
 @app.post("/api/tasks/{task_id}/complete")
-def complete(task_id: str) -> dict[str, Any]:
+def complete(task_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
     with db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "任务不存在")
+        task_dict = dict(row)
+        order_id = task_dict.get("related_order_id")
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if order_id else None
+        order_dict = dict(order_row) if order_row else None
+        require_task_access(identity, task_dict, order_dict)
         timestamp = iso()
         changed = conn.execute(
             "UPDATE tasks SET status='DONE', updated_at=? WHERE task_id=?", (timestamp, task_id)
         ).rowcount
         if not changed:
             raise HTTPException(404, "任务不存在")
+        audit_log(conn, identity, "TASK_COMPLETED", "task", task_id, "SUCCESS", {})
         conn.commit()
     return {"status": "done", "task_id": task_id}
 
@@ -2036,7 +2932,7 @@ def writeback(
         plan = raw_plan
     with db() as conn:
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_transaction(conn)
             result = apply_writeback(conn, wrapper, plan)
             conn.commit()
             return result
@@ -2049,12 +2945,14 @@ def writeback(
 
 
 @app.post("/api/demo/apply-ft01")
-def demo_ft01() -> dict[str, Any]:
+def demo_ft01(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    require_manager(identity)
+    if os.getenv("ENABLE_DEMO_ADMIN_ACTIONS", "false").lower() != "true":
+        raise HTTPException(403, "DEMO_ADMIN_ACTIONS_DISABLED")
     payload = json.loads((BASE_DIR / "demo_payloads" / "FT01_confirmed_writeback.json").read_text(encoding="utf-8"))
     with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        begin_transaction(conn)
         result = apply_writeback(conn, payload, json.loads(payload["transaction_json"]))
-        # Create a task if not already present.
         exists = conn.execute("SELECT 1 FROM tasks WHERE task_id='TASK-PO1001-CONFIRM'").fetchone()
         if not exists:
             timestamp = iso()
@@ -2076,10 +2974,13 @@ def demo_ft01() -> dict[str, Any]:
 
 
 @app.post("/api/demo/apply-ft02")
-def demo_ft02() -> dict[str, Any]:
+def demo_ft02(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+    require_manager(identity)
+    if os.getenv("ENABLE_DEMO_ADMIN_ACTIONS", "false").lower() != "true":
+        raise HTTPException(403, "DEMO_ADMIN_ACTIONS_DISABLED")
     payload = json.loads((BASE_DIR / "demo_payloads" / "FT02_confirmed_writeback.json").read_text(encoding="utf-8"))
     with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        begin_transaction(conn)
         result = apply_writeback(conn, payload, json.loads(payload["transaction_json"]))
         timestamp = iso()
         conn.execute(

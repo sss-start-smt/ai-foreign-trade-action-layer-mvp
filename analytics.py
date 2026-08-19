@@ -14,6 +14,11 @@ def now_iso() -> str:
 
 
 def ensure_analytics_schema(conn) -> None:
+    if getattr(conn, "is_pg", False):
+        from database import table_exists
+        if not table_exists(conn, "analytics_events"):
+            raise RuntimeError("PostgreSQL schema missing analytics_events; run `alembic upgrade head`.")
+        return
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS analytics_events (

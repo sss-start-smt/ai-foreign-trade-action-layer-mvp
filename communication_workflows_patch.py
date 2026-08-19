@@ -3,7 +3,6 @@ from __future__ import annotations
 import hmac
 import json
 import os
-import sqlite3
 import time
 import urllib.error
 import urllib.request
@@ -12,10 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
+from database import db, table_exists, get_table_column_names, get_table_columns
+from auth import CurrentIdentity, get_current_identity, require_manager, require_order_access
 
 PATCH_VERSION = "2.0.0-ft05-ft06-site-uiux"
 DEFAULT_API_BASE = "https://api.coze.cn"
@@ -50,6 +51,7 @@ ORDER_FIELD_ALIASES: dict[str, list[str]] = {
     "risk_level": ["risk_level"],
     "status": ["status"],
     "updated_at": ["updated_at"],
+    "organization_id": ["organization_id"],
 }
 
 TASK_FIELD_ALIASES: dict[str, list[str]] = {
@@ -67,6 +69,7 @@ TASK_FIELD_ALIASES: dict[str, list[str]] = {
     "risk_level": ["risk_level", "priority"],
     "source_quote": ["source_quote", "evidence"],
     "updated_at": ["updated_at"],
+    "organization_id": ["organization_id"],
 }
 
 MESSAGE_FIELD_ALIASES: dict[str, list[str]] = {
@@ -105,7 +108,7 @@ class FT06RunRequest(BaseModel):
     order_no: str | None = None
     fact_catalog: list[dict[str, Any]] | None = None
     order_context: dict[str, Any] | None = None
-    task_context: dict[str, Any] | None = None
+    task_context: dict[str, Any] | list[dict[str, Any]] | None = None
     communication_history: list[dict[str, Any]] | None = None
     user_instruction: str = ""
     organization_id: str | None = None
@@ -152,37 +155,6 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
 
 
-def _db_path() -> str:
-    configured = os.environ.get("DB_PATH")
-    if configured:
-        return configured
-    for candidate in ("data/action_layer.db", "action_layer.db", "data/app.db", "app.db"):
-        if Path(candidate).exists():
-            return candidate
-    Path("data").mkdir(exist_ok=True)
-    return "data/action_layer.db"
-
-
-def _connect() -> sqlite3.Connection:
-    path = Path(_db_path())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
-
-
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
-
-
-def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
-    if not _table_exists(conn, table):
-        return set()
-    return {row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')}
-
-
 def _resolve_column(existing: Iterable[str], aliases: Mapping[str, list[str]], canonical: str) -> str | None:
     names = set(existing)
     for candidate in aliases.get(canonical, [canonical]):
@@ -214,7 +186,13 @@ def _json_loads(value: Any, fallback: Any = None) -> Any:
     return current
 
 
-def _ensure_patch_schema(conn: sqlite3.Connection) -> None:
+def _ensure_patch_schema(conn: Any) -> None:
+    if getattr(conn, "is_pg", False):
+        required = ("communication_task_candidates", "communication_drafts", "communication_workflow_runs", "communication_events")
+        missing = [name for name in required if not table_exists(conn, name)]
+        if missing:
+            raise RuntimeError(f"PostgreSQL communication schema missing {missing}; run `alembic upgrade head`.")
+        return
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS communication_task_candidates (
@@ -301,7 +279,7 @@ def _ensure_patch_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _safe_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def _safe_row(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
@@ -315,10 +293,10 @@ def _canonicalize_row(row: Mapping[str, Any], aliases: Mapping[str, list[str]]) 
     return output
 
 
-def _find_order(conn: sqlite3.Connection, order_id: str | None, order_no: str | None) -> dict[str, Any] | None:
-    if not _table_exists(conn, "orders"):
+def _find_order(conn: Any, order_id: str | None, order_no: str | None) -> dict[str, Any] | None:
+    if not table_exists(conn, "orders"):
         return None
-    columns = _column_names(conn, "orders")
+    columns = get_table_column_names(conn, "orders")
     id_col = _resolve_column(columns, ORDER_FIELD_ALIASES, "order_id")
     no_col = _resolve_column(columns, ORDER_FIELD_ALIASES, "order_no")
     row = None
@@ -329,10 +307,10 @@ def _find_order(conn: sqlite3.Connection, order_id: str | None, order_no: str | 
     return _canonicalize_row(dict(row), ORDER_FIELD_ALIASES) if row else None
 
 
-def _list_orders(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
-    if not _table_exists(conn, "orders"):
+def _list_orders(conn: Any, limit: int = 200) -> list[dict[str, Any]]:
+    if not table_exists(conn, "orders"):
         return []
-    columns = _column_names(conn, "orders")
+    columns = get_table_column_names(conn, "orders")
     updated = _resolve_column(columns, ORDER_FIELD_ALIASES, "updated_at")
     no_col = _resolve_column(columns, ORDER_FIELD_ALIASES, "order_no")
     order_by = f'"{updated}" DESC' if updated else (f'"{no_col}" ASC' if no_col else "rowid DESC")
@@ -340,10 +318,10 @@ def _list_orders(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, A
     return [_canonicalize_row(dict(row), ORDER_FIELD_ALIASES) for row in rows]
 
 
-def _list_tasks(conn: sqlite3.Connection, order: Mapping[str, Any] | None = None, open_only: bool = False) -> list[dict[str, Any]]:
-    if not _table_exists(conn, "tasks"):
+def _list_tasks(conn: Any, order: Mapping[str, Any] | None = None, open_only: bool = False) -> list[dict[str, Any]]:
+    if not table_exists(conn, "tasks"):
         return []
-    columns = _column_names(conn, "tasks")
+    columns = get_table_column_names(conn, "tasks")
     where: list[str] = []
     params: list[Any] = []
     if order:
@@ -372,10 +350,10 @@ def _list_tasks(conn: sqlite3.Connection, order: Mapping[str, Any] | None = None
     return [_canonicalize_row(dict(row), TASK_FIELD_ALIASES) for row in rows]
 
 
-def _list_messages(conn: sqlite3.Connection, order: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    if not _table_exists(conn, "source_messages"):
+def _list_messages(conn: Any, order: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not table_exists(conn, "source_messages"):
         return []
-    columns = _column_names(conn, "source_messages")
+    columns = get_table_column_names(conn, "source_messages")
     where: list[str] = []
     params: list[Any] = []
     if order:
@@ -586,7 +564,7 @@ def _run_coze_workflow(workflow_code: str, workflow_id: str, parameters: dict[st
         try:
             output = _workflow_http_request(workflow_id, parameters, mode)
             duration_ms = int((time.perf_counter() - started) * 1000)
-            with _connect() as conn:
+            with db() as conn:
                 _ensure_patch_schema(conn)
                 conn.execute(
                     "INSERT INTO communication_workflow_runs(run_id,workflow_code,workflow_id,request_id,status,input_json,output_json,debug_url,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -610,7 +588,7 @@ def _run_coze_workflow(workflow_code: str, workflow_id: str, parameters: dict[st
             if mode != modes[-1]:
                 continue
     duration_ms = int((time.perf_counter() - started) * 1000)
-    with _connect() as conn:
+    with db() as conn:
         _ensure_patch_schema(conn)
         conn.execute(
             "INSERT INTO communication_workflow_runs(run_id,workflow_code,workflow_id,request_id,status,input_json,error_code,error_message,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -629,6 +607,133 @@ def _run_coze_workflow(workflow_code: str, workflow_id: str, parameters: dict[st
         )
         conn.commit()
     raise RuntimeError(str(last_error) if last_error else "Coze调用失败")
+
+
+def _normalize_ft06_task_context(value: Any) -> list[dict[str, Any]]:
+    """Normalize FT06 task context without assuming dict/list shape.
+
+    D11 V0.4 sends one current task as a dict, while older communication code can
+    supply {"open_tasks": [...]} or a plain list.  Treat all three forms as the
+    same bounded list before building provider parameters.
+    """
+    if isinstance(value, dict):
+        open_tasks = value.get("open_tasks")
+        items = open_tasks if isinstance(open_tasks, list) else [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    allowed = (
+        "task_id", "title", "status", "task_type", "action_target", "target",
+        "recommended_action", "evidence", "due_at", "waiting_for", "waiting_on",
+        "promised_reply_at", "risk_level",
+    )
+    return [
+        {key: task.get(key) for key in allowed if task.get(key) not in (None, "")}
+        for task in items[:10]
+        if isinstance(task, dict)
+    ]
+
+
+def _d11_uat_ft06_fixture_enabled() -> bool:
+    explicit = os.environ.get("D11_UAT_COMMUNICATION_PROVIDER", "").strip().lower()
+    intake = os.environ.get("D11_UAT_INTAKE_PROVIDER", "").strip().lower()
+    return explicit == "fixture" or (not explicit and intake == "fixture")
+
+
+def _fact_value(facts: list[dict[str, Any]], *names: str) -> Any:
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        fact_type = str(fact.get("fact_type") or fact.get("type") or fact.get("name") or "")
+        if fact_type in names:
+            return fact.get("value")
+    return None
+
+
+def _uat_ft06_fixture_result(
+    payload: FT06RunRequest,
+    order: dict[str, Any],
+    fact_catalog: list[dict[str, Any]],
+    task_context: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Deterministic D11 UAT-only draft generator.
+
+    This validates the product interaction (facts -> draft -> human review ->
+    waiting) without claiming model quality.  It never sends anything outside
+    FlowOrder and never mutates order facts.
+    """
+    order_no = str(order.get("order_no") or payload.order_no or "当前订单")
+    customer = str(order.get("customer_name") or "客户")
+    due = (
+        order.get("requested_delivery_date")
+        or order.get("customer_delivery_date")
+        or _fact_value(fact_catalog, "customer_delivery_date")
+    )
+    commitment = (
+        order.get("latest_supplier_commitment")
+        or order.get("supplier_completion_commitment_date")
+        or _fact_value(fact_catalog, "supplier_completion_commitment_date")
+    )
+    task = task_context[0] if task_context else {}
+    task_title = str(task.get("title") or task.get("recommended_action") or "")
+    instruction = payload.user_instruction.strip()
+
+    facts_used = [f"订单 {order_no}", f"客户：{customer}"]
+    if due:
+        facts_used.append(f"客户交期：{due}")
+    if commitment:
+        facts_used.append(f"供应商承诺：{commitment}")
+    if task_title:
+        facts_used.append(f"当前任务：{task_title}")
+
+    if payload.recipient_role == "supplier" or payload.draft_type == "SUPPLIER_PROGRESS_FOLLOWUP":
+        subject = f"请确认订单 {order_no} 当前进度"
+        due_text = f"客户交期为 {due}。" if due else ""
+        body = (
+            f"您好，关于订单 {order_no}，想请您协助确认当前准确进度。{due_text}"
+            "请同步关键物料到货情况、当前补救方案，以及可以明确承诺的完成时间。"
+            "如现计划存在风险，也请直接说明影响和预计恢复时间，便于我们及时协调。"
+        )
+        questions = ["当前准确进度是什么？", "关键物料预计何时到货？", "可以明确承诺的完成时间是什么？"]
+    elif payload.recipient_role == "internal" or payload.draft_type == "CHANGE_HISTORY_SUMMARY":
+        subject = f"订单 {order_no} 当前跟进摘要"
+        body = f"订单 {order_no} 当前跟进摘要：" + "；".join(facts_used) + "。"
+        questions = []
+    else:
+        subject = f"关于订单 {order_no} 的进度更新"
+        if commitment:
+            progress_text = f"目前供应商记录的完成承诺为 {commitment}。"
+        else:
+            progress_text = "目前供应商的明确完成时间仍在核实中。"
+        due_text = f"我们记录的客户交期为 {due}。" if due else ""
+        body = (
+            f"您好，关于订单 {order_no}，向您同步当前进展。{due_text}{progress_text}"
+            "我们正在继续确认生产与出货安排，确认后会及时更新；在正式确认前不会做未经核实的交期承诺。"
+        )
+        questions = ["是否还有需要我们同步确认的事项？"]
+
+    if instruction:
+        body += f"\n\n本次沟通重点：{instruction}"
+
+    return {
+        "run_status": "draft_ready",
+        "approval_status": "NEEDS_CONFIRMATION",
+        "draft_result": {
+            "subject": subject,
+            "draft": body,
+            "facts_used": facts_used,
+            "missing_facts_required_for_generation": [],
+            "questions_to_ask": questions,
+            "blocking_risk_flags": [],
+        },
+        "_uat_fixture": True,
+        "_integration": {
+            "workflow_key": "D11_UAT_FT06_FIXTURE",
+            "provider": "fixture",
+            "evidence_level": "UAT_ONLY_NOT_MODEL_QUALITY",
+        },
+    }
 
 
 def _extract_ft06_fields(result: dict[str, Any]) -> dict[str, Any]:
@@ -654,7 +759,7 @@ def _extract_ft06_fields(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _append_event(conn: sqlite3.Connection, entity_type: str, entity_id: str, event_type: str, payload: Any, operator_id: str | None) -> None:
+def _append_event(conn: Any, entity_type: str, entity_id: str, event_type: str, payload: Any, operator_id: str | None) -> None:
     _ensure_patch_schema(conn)
     conn.execute(
         "INSERT INTO communication_events(event_id,entity_type,entity_id,event_type,payload_json,operator_id,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -698,10 +803,10 @@ def _candidate_confirmed_payload(candidate: dict[str, Any], order: dict[str, Any
     }
 
 
-def _existing_idempotency_keys(conn: sqlite3.Connection) -> list[str]:
-    if not _table_exists(conn, "idempotency_records"):
+def _existing_idempotency_keys(conn: Any) -> list[str]:
+    if not table_exists(conn, "idempotency_records"):
         return []
-    columns = _column_names(conn, "idempotency_records")
+    columns = get_table_column_names(conn, "idempotency_records")
     key_col = "idempotency_key" if "idempotency_key" in columns else None
     if not key_col:
         return []
@@ -721,10 +826,10 @@ def _parse_persistence_status(result: dict[str, Any]) -> str:
     return ""
 
 
-def _update_task_waiting_state(conn: sqlite3.Connection, task_id: str, waiting_on: str | None, promised_reply_at: str | None, next_action_at: str | None) -> dict[str, Any]:
-    if not _table_exists(conn, "tasks"):
+def _update_task_waiting_state(conn: Any, task_id: str, waiting_on: str | None, promised_reply_at: str | None, next_action_at: str | None) -> dict[str, Any]:
+    if not table_exists(conn, "tasks"):
         return {"updated": False, "reason": "tasks_table_missing"}
-    columns = _column_names(conn, "tasks")
+    columns = get_table_column_names(conn, "tasks")
     id_col = _resolve_column(columns, TASK_FIELD_ALIASES, "task_id")
     if not id_col:
         return {"updated": False, "reason": "task_id_column_missing"}
@@ -1193,8 +1298,11 @@ function openKeyDialog() {
 
 async function api(url, options = {}) {
   const key = sessionStorage.getItem("communicationAdminKey") || "";
+  const tokenMap = {"USER-1":"tok-user-1","USER-2":"tok-user-2","USER-3":"tok-user-3","MANAGER-1":"tok-manager-1","OPERATOR-A1":"tok-operator-a1","OPERATOR-A2":"tok-operator-a2","MANAGER-A":"tok-manager-a","OPERATOR-B1":"tok-operator-b1","OPERATOR-B2":"tok-operator-b2","MANAGER-B":"tok-manager-b"};
+  const currentUserId = localStorage.getItem("currentUserId") || "USER-1";
   const headers = {
     "Content-Type": "application/json",
+    "X-Auth-Token": tokenMap[currentUserId] || "tok-user-1",
     ...(key ? { "X-Communication-Key": key } : {}),
     ...(options.headers || {})
   };
@@ -1731,9 +1839,9 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         return Response(ENTRY_JS, media_type="application/javascript")
 
     @app.get("/api/communication/capabilities")
-    def communication_capabilities():
+    def communication_capabilities(identity: CurrentIdentity = Depends(get_current_identity)):
         config = _configuration()
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             recent = [
                 dict(row)
@@ -1758,32 +1866,43 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         }
 
     @app.get("/api/communication/orders")
-    def communication_orders(limit: int = Query(default=200, ge=1, le=500)):
-        with _connect() as conn:
+    def communication_orders(limit: int = Query(default=200, ge=1, le=500), identity: CurrentIdentity = Depends(get_current_identity)):
+        accessible = []
+        with db() as conn:
             _ensure_patch_schema(conn)
-            orders = _list_orders(conn, limit)
-        return {"orders": orders}
+            for order in _list_orders(conn, min(limit * 3, 500)):
+                try:
+                    require_order_access(identity, order, conn)
+                except HTTPException:
+                    continue
+                accessible.append(order)
+                if len(accessible) >= limit:
+                    break
+        return {"orders": accessible}
 
     @app.post("/api/workflows/ft05/run")
     def run_ft05(
         payload: FT05RunRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
         config = _configuration()
         request_id = payload.request_id or _new_id("FT05RUN")
         source_message_id = payload.source_message_id or _new_id("MSG")
         received_at = payload.received_at or _now_iso()
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
-            order_context = payload.order_context
-            if order_context is None:
-                order = _find_order(conn, payload.order_id, payload.order_no)
-                if order is None:
-                    raise HTTPException(status_code=404, detail="未找到关联订单，请先导入订单或选择正确订单")
-                order_context = order
-            order_list = order_context if isinstance(order_context, list) else [order_context]
+            supplied_context = payload.order_context
+            context_probe = supplied_context[0] if isinstance(supplied_context, list) and supplied_context else (supplied_context if isinstance(supplied_context, dict) else {})
+            order = _find_order(conn, payload.order_id or context_probe.get("order_id"), payload.order_no or context_probe.get("order_no"))
+            if order is None:
+                raise HTTPException(status_code=404, detail="未找到关联订单，请先导入订单或选择正确订单")
+            require_order_access(identity, order, conn)
+            # Security: workflow facts are rebuilt from the authorized DB order; client-supplied order_context cannot widen scope.
+            order_context = order
+            order_list = [order_context]
             selected_order = order_list[0] if len(order_list) == 1 else None
             open_tasks = payload.existing_open_tasks
             if open_tasks is None:
@@ -1825,7 +1944,7 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
             candidate_id = _new_id("FTC")
             order_no = candidate.get("related_order_no") or (selected_order or {}).get("order_no")
             order_id = (selected_order or {}).get("order_id")
-            with _connect() as conn:
+            with db() as conn:
                 _ensure_patch_schema(conn)
                 conn.execute(
                     "INSERT INTO communication_task_candidates(candidate_id,request_id,source_message_id,order_id,order_no,communication_text,sender_role,channel,result_json,task_candidate_json,run_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1861,18 +1980,21 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         payload: FT06RunRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
         config = _configuration()
         request_id = payload.request_id or _new_id("FT06RUN")
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
-            order = payload.order_context or _find_order(conn, payload.order_id, payload.order_no)
+            probe = payload.order_context if isinstance(payload.order_context, dict) else {}
+            order = _find_order(conn, payload.order_id or probe.get("order_id"), payload.order_no or probe.get("order_no"))
             if not order:
                 raise HTTPException(status_code=404, detail="未找到关联订单，请先导入订单或选择正确订单")
+            require_order_access(identity, order, conn)
             tasks = _list_tasks(conn, order, open_only=True)
             fact_catalog = payload.fact_catalog if payload.fact_catalog is not None else _fact_catalog_from_order(order)
-            task_context = payload.task_context if payload.task_context is not None else _task_context_from_tasks(tasks)
+            raw_task_context = payload.task_context if payload.task_context is not None else _task_context_from_tasks(tasks)
             history = payload.communication_history if payload.communication_history is not None else _list_messages(conn, order)
 
             # FT06按草稿类型只保留最小必要上下文。事实目录保留已确认事实，
@@ -1881,13 +2003,7 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
                 fact for fact in (fact_catalog or [])
                 if not isinstance(fact, dict) or fact.get("confirmed", True) is not False
             ][:40]
-            task_context = [
-                {key: task.get(key) for key in (
-                    "task_id", "title", "status", "task_type", "action_target",
-                    "due_at", "waiting_for", "promised_reply_at", "risk_level"
-                ) if task.get(key) not in (None, "")}
-                for task in (task_context or [])[:10]
-            ]
+            task_context = _normalize_ft06_task_context(raw_task_context)
             history = [
                 {key: message.get(key) for key in (
                     "message_id", "sender_role", "channel", "raw_content",
@@ -1907,19 +2023,24 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
             "task_context_json": _json_dumps(task_context),
             "communication_history_json": _json_dumps(history),
             "user_instruction": payload.user_instruction,
-            "organization_id": payload.organization_id or config["organization_id"],
+            # Tenant context comes from authenticated identity, never from client payload.
+            "organization_id": identity.organization_id,
             "request_id": request_id,
             "order_id": str(order.get("order_id") or payload.order_id or ""),
         }
-        try:
-            call = _run_coze_workflow("FT06", config["ft06_id"], parameters, request_id)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        result = call["result"]
+        if _d11_uat_ft06_fixture_enabled():
+            result = _uat_ft06_fixture_result(payload, order, fact_catalog, task_context)
+            call = {"result": result, "debug_url": None}
+        else:
+            try:
+                call = _run_coze_workflow("FT06", config["ft06_id"], parameters, request_id)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            result = call["result"]
         fields = _extract_ft06_fields(result)
         draft_id = _new_id("FTD")
         now = _now_iso()
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             conn.execute(
                 "INSERT INTO communication_drafts(draft_id,request_id,order_id,order_no,draft_type,recipient_role,channel,result_json,ai_subject,ai_draft,facts_used_json,missing_facts_json,questions_to_ask_json,risk_flags_json,run_status,approval_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1970,12 +2091,13 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         payload: CandidateCommitRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
         config = _configuration()
         if not config["ft03_id"]:
             raise HTTPException(status_code=503, detail="COZE_FT03_WORKFLOW_ID未配置，无法正式写回任务")
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             row = conn.execute("SELECT * FROM communication_task_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
             if not row:
@@ -1992,17 +2114,18 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
             order = _find_order(conn, record.get("order_id"), record.get("order_no"))
             if not order:
                 raise HTTPException(status_code=404, detail="关联订单不存在")
+            require_order_access(identity, order, conn)
             existing_tasks = _list_tasks(conn, order, open_only=False)
             idempotency_keys = _existing_idempotency_keys(conn)
 
-        confirmed_payload = _candidate_confirmed_payload(candidate, order, payload.operator_id)
+        confirmed_payload = _candidate_confirmed_payload(candidate, order, identity.user_id)
         ft03_parameters = {
             "extraction_run_id": record["request_id"],
             "operation_time": _now_iso(),
             "adapter_configured": "YES",
             "confirmed_payload_json": _json_dumps(confirmed_payload),
             "existing_task_state_json": _json_dumps({"tasks": existing_tasks}),
-            "operator_id": payload.operator_id,
+            "operator_id": identity.user_id,
             "source_document_id": record["source_message_id"] or candidate_id,
             "existing_idempotency_keys_json": _json_dumps(idempotency_keys),
             "confirmation_version": payload.confirmation_version,
@@ -2011,26 +2134,26 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         try:
             call = _run_coze_workflow("FT03_FROM_FT05", config["ft03_id"], ft03_parameters, record["request_id"])
         except Exception as exc:
-            with _connect() as conn:
+            with db() as conn:
                 _ensure_patch_schema(conn)
                 conn.execute(
                     "UPDATE communication_task_candidates SET review_status='FT03_FAILED',reviewer_id=?,review_note=?,reviewed_at=? WHERE candidate_id=?",
-                    (payload.operator_id, f"{payload.note} | {exc}".strip(" |"), _now_iso(), candidate_id),
+                    (identity.user_id, f"{payload.note} | {exc}".strip(" |"), _now_iso(), candidate_id),
                 )
-                _append_event(conn, "task_candidate", candidate_id, "FT03_CALL_FAILED", {"error": str(exc)}, payload.operator_id)
+                _append_event(conn, "task_candidate", candidate_id, "FT03_CALL_FAILED", {"error": str(exc)}, identity.user_id)
                 conn.commit()
             raise HTTPException(status_code=502, detail=f"FT03调用失败，候选未标记成功：{exc}") from exc
 
         ft03_result = call["result"]
         persistence_status = _parse_persistence_status(ft03_result)
         success = persistence_status in ("committed", "duplicate_skipped", "persistence_confirmed")
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             conn.execute(
                 "UPDATE communication_task_candidates SET review_status=?,reviewer_id=?,review_note=?,ft03_result_json=?,reviewed_at=? WHERE candidate_id=?",
                 (
                     "COMMITTED" if success else "FT03_UNVERIFIED",
-                    payload.operator_id,
+                    identity.user_id,
                     payload.note,
                     _json_dumps(ft03_result),
                     _now_iso(),
@@ -2043,7 +2166,7 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
                 candidate_id,
                 "FT03_COMMITTED" if success else "FT03_RESULT_UNVERIFIED",
                 ft03_result,
-                payload.operator_id,
+                identity.user_id,
             )
             conn.commit()
         if not success:
@@ -2062,17 +2185,25 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         payload: CandidateRejectRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
+            existing = conn.execute("SELECT order_id,order_no FROM communication_task_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="任务候选不存在")
+            order = _find_order(conn, existing["order_id"], existing["order_no"])
+            if not order:
+                raise HTTPException(status_code=404, detail="关联订单不存在")
+            require_order_access(identity, order, conn)
             cursor = conn.execute(
                 "UPDATE communication_task_candidates SET review_status='REJECTED',reviewer_id=?,review_note=?,reviewed_at=? WHERE candidate_id=?",
-                (payload.operator_id, payload.note, _now_iso(), candidate_id),
+                (identity.user_id, payload.note, _now_iso(), candidate_id),
             )
             if cursor.rowcount == 0:
                 raise HTTPException(status_code=404, detail="任务候选不存在")
-            _append_event(conn, "task_candidate", candidate_id, "HUMAN_REJECTED", {"note": payload.note}, payload.operator_id)
+            _append_event(conn, "task_candidate", candidate_id, "HUMAN_REJECTED", {"note": payload.note}, identity.user_id)
             conn.commit()
         return {"ok": True, "message": "任务候选已驳回"}
 
@@ -2082,17 +2213,22 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         payload: DraftReviewRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
         action = payload.action.strip().lower()
         if action not in ("approve", "reject", "save_edit", "copy_and_record"):
             raise HTTPException(status_code=400, detail="action仅支持approve/reject/save_edit/copy_and_record")
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             row = conn.execute("SELECT * FROM communication_drafts WHERE draft_id=?", (draft_id,)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="草稿不存在")
             record = dict(row)
+            order = _find_order(conn, record.get("order_id"), record.get("order_no"))
+            if not order:
+                raise HTTPException(status_code=404, detail="关联订单不存在")
+            require_order_access(identity, order, conn)
             subject = payload.edited_subject if payload.edited_subject is not None else record.get("edited_subject") or record.get("ai_subject") or ""
             draft = payload.edited_draft if payload.edited_draft is not None else record.get("edited_draft") or record.get("ai_draft") or ""
             blocked_by_workflow = str(record.get("approval_status") or "").upper().startswith("BLOCKED")
@@ -2134,7 +2270,7 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
                 message = "已复制最终文本并记录人工触达；系统没有自动发送"
             conn.execute(
                 "UPDATE communication_drafts SET edited_subject=?,edited_draft=?,final_text=?,human_status=?,reviewer_id=?,review_note=?,approved_at=?,copied_at=?,updated_at=? WHERE draft_id=?",
-                (subject, draft, final_text, human_status, payload.operator_id, payload.note, approved_at, copied_at, now, draft_id),
+                (subject, draft, final_text, human_status, identity.user_id, payload.note, approved_at, copied_at, now, draft_id),
             )
             task_update = None
             if action == "copy_and_record" and payload.task_id:
@@ -2158,7 +2294,7 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
                 "risk_override_confirmed": payload.risk_override_confirmed,
                 "risk_override_note": payload.note if payload.risk_override_confirmed else "",
             }
-            _append_event(conn, "communication_draft", draft_id, event_type, event_payload, payload.operator_id)
+            _append_event(conn, "communication_draft", draft_id, event_type, event_payload, identity.user_id)
             conn.commit()
         return {
             "ok": True,
@@ -2174,22 +2310,24 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         payload: RankingRefreshRequest,
         x_communication_key: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None),
+        identity: CurrentIdentity = Depends(get_current_identity),
     ):
         _require_admin_key(x_communication_key, x_api_key)
+        require_manager(identity)
         config = _configuration()
         if not config["ft04_id"]:
             raise HTTPException(status_code=503, detail="COZE_FT04_WORKFLOW_ID未配置")
-        with _connect() as conn:
+        with db() as conn:
             _ensure_patch_schema(conn)
             orders = _list_orders(conn, 500)
             tasks = _list_tasks(conn, None, open_only=False)
             risks: list[dict[str, Any]] = []
-            if _table_exists(conn, "risk_signals"):
+            if table_exists(conn, "risk_signals"):
                 risks = [dict(row) for row in conn.execute("SELECT * FROM risk_signals ORDER BY rowid DESC LIMIT 500")]
         parameters = {
             "timezone": payload.timezone,
             "current_time": payload.current_time or _now_iso(),
-            "current_user_id": payload.current_user_id,
+            "current_user_id": identity.user_id,
             "orders_json": _json_dumps(orders),
             "risk_signals_json": _json_dumps(risks),
             "workday_policy_json": "{}",
@@ -2204,8 +2342,8 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
         return {"ok": True, "result": call["result"], "debug_url": call.get("debug_url")}
 
     @app.get("/api/communication/history")
-    def communication_history(limit: int = Query(default=30, ge=1, le=200)):
-        with _connect() as conn:
+    def communication_history(limit: int = Query(default=30, ge=1, le=200), identity: CurrentIdentity = Depends(get_current_identity)):
+        with db() as conn:
             _ensure_patch_schema(conn)
             candidates = [
                 dict(row)
@@ -2225,6 +2363,17 @@ def register_communication_workflows_patch(app: FastAPI) -> None:
                     (limit,),
                 )
             ]
+            def visible(item: dict[str, Any]) -> bool:
+                order = _find_order(conn, item.get("order_id"), item.get("order_no"))
+                if not order:
+                    return False
+                try:
+                    require_order_access(identity, order, conn)
+                    return True
+                except HTTPException:
+                    return False
+            candidates = [item for item in candidates if visible(item)]
+            drafts = [item for item in drafts if visible(item)]
         return {"candidates": candidates, "drafts": drafts}
 
 
