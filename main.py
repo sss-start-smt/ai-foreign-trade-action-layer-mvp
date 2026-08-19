@@ -277,6 +277,34 @@ PG_REQUIRED_TABLES = {
 }
 
 
+def _prepare_legacy_sqlite_before_schema(conn: Any) -> None:
+    """Repair legacy SQLite columns that current schema.sql indexes reference.
+
+    CREATE TABLE IF NOT EXISTS does not add newly introduced columns to an existing
+    SQLite table.  The current schema.sql creates idx_orders_org immediately after
+    the table declarations, so an older persistent DB without organization_id would
+    fail before ensure_activation_schema() got a chance to migrate it.
+
+    Keep this preflight deliberately narrow and additive: it never drops or rewrites
+    user data; it only adds missing activation/tenant columns to tables that already
+    exist.  The full schema script and normal migration helpers still run afterwards.
+    """
+    if table_exists(conn, "orders"):
+        order_columns = {col["name"] for col in get_table_columns(conn, "orders")}
+        for name, definition in ACTIVATION_COLUMNS.items():
+            if name not in order_columns:
+                conn.execute(f'ALTER TABLE orders ADD COLUMN "{name}" {definition}')
+
+    for table_name in ("tasks", "event_logs", "approval_requests"):
+        if not table_exists(conn, table_name):
+            continue
+        columns = {col["name"] for col in get_table_columns(conn, table_name)}
+        if "organization_id" not in columns:
+            conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "organization_id" TEXT')
+
+    conn.commit()
+
+
 def init_db() -> None:
     with db() as conn:
         if getattr(conn, "is_pg", False):
@@ -289,6 +317,7 @@ def init_db() -> None:
                     f"Missing tables: {missing_tables}"
                 )
         else:
+            _prepare_legacy_sqlite_before_schema(conn)
             conn.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
         ensure_activation_schema(conn)
         count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]

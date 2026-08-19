@@ -1,0 +1,19 @@
+{
+  "version": "D19_LEGACY_SQLITE_STARTUP_FIX_V4",
+  "files": [
+    "main.py",
+    "tests/test_d19_legacy_sqlite_startup.py",
+    "D19_LEGACY_SQLITE_STARTUP_FIX_V4_GUIDE.md"
+  ],
+  "confirmed_online_error": "OperationalError: no such column: organization_id",
+  "migration_type": "additive SQLite compatibility preflight",
+  "destructive_changes": false,
+  "verification": {
+    "focused_tests": "6 passed",
+    "legacy_order_preserved": true,
+    "legacy_order_org_backfill": "ORG-A",
+    "d19_demo_orders": 17,
+    "d19_open_demo_tasks": 14
+  },
+  "railway_variable_required": "SEED_D19_DEMO_DATA=true"
+}
