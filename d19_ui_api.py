@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import timedelta
 from typing import Any
 
@@ -46,6 +47,31 @@ def confirmation_severity(candidate: dict[str, Any] | None) -> str:
 
 def register_d19_ui_api(app: Any) -> None:
     router = APIRouter()
+
+    @router.get("/api/d19/demo/status")
+    def demo_seed_status(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+        enabled = os.getenv("SEED_D19_DEMO_DATA", "false").lower() == "true"
+        with db() as conn:
+            count = int(conn.execute(
+                "SELECT COUNT(*) FROM orders WHERE order_id LIKE 'ORD-D19-DEMO-%' AND organization_id=?",
+                (identity.organization_id,),
+            ).fetchone()[0] or 0)
+        return {"enabled": enabled, "order_count": count, "organization_id": identity.organization_id}
+
+    @router.post("/api/d19/demo/ensure")
+    def ensure_demo_seed(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
+        enabled = os.getenv("SEED_D19_DEMO_DATA", "false").lower() == "true"
+        if not enabled:
+            return {"enabled": False, "status": "DISABLED", "order_count": 0}
+        if identity.organization_id != "ORG-A":
+            raise HTTPException(403, {"code": "DEMO_SEED_SCOPE_DENIED", "message": "当前组织不允许初始化 D19 演示数据"})
+        try:
+            from d19_demo_seed import seed_d19_demo
+            result = seed_d19_demo()
+        except Exception as exc:
+            print(f"[d19-demo-ensure-warning] {type(exc).__name__}: {exc}")
+            raise HTTPException(500, {"code": "DEMO_SEED_FAILED", "message": "演示数据初始化失败，请检查部署日志"})
+        return {"enabled": True, "status": "READY", **result.to_dict()}
 
     @router.post("/api/d19/reviews/{review_id}/submit-manager-review")
     def submit_manager_review(review_id: str, identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:

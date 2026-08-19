@@ -132,10 +132,12 @@
   }
 
   async function enterApp() {
+    applyRole();
+    // Keep the static shell hidden until real API data is loaded. This avoids
+    // flashing the HTML design-time sample orders before the backend response.
+    await loadCoreData();
     $('#loginScreen')?.classList.add('hidden');
     $('#authenticatedApp')?.classList.remove('hidden');
-    applyRole();
-    await loadCoreData();
     navigate('today');
   }
 
@@ -169,9 +171,27 @@
   }
 
   async function loadCoreData() {
-    const [settingsRes, dashboardRes, ordersRes] = await Promise.all([
+    let [settingsRes, dashboardRes, ordersRes] = await Promise.all([
       request('/api/settings'), request('/api/dashboard'), request('/api/orders')
     ]);
+
+    // Railway can serve the app before the background startup seed has finished
+    // (or after a seed warning). In demo mode, an empty order set gets one safe,
+    // idempotent ensure attempt against the SAME database used by this request.
+    if (!Array.isArray(ordersRes.items) || ordersRes.items.length === 0) {
+      try {
+        const ensured = await request('/api/d19/demo/ensure', {method:'POST', body:'{}'});
+        if (ensured?.enabled && Number(ensured?.order_count || 0) > 0) {
+          [dashboardRes, ordersRes] = await Promise.all([
+            request('/api/dashboard'), request('/api/orders')
+          ]);
+        }
+      } catch (e) {
+        console.warn('[d19-demo-ensure]', e);
+        toast(e?.message || '演示数据初始化失败', 'error');
+      }
+    }
+
     state.settings = settingsRes.settings || {};
     state.dashboard = dashboardRes;
     state.orders = ordersRes.items || [];
