@@ -42,13 +42,15 @@ const localSet=(key,value)=>{try{window.localStorage.setItem(key,value);return t
 const sessionGet=key=>{try{return window.sessionStorage.getItem(key)}catch{return null}};
 const sessionSet=(key,value)=>{try{window.sessionStorage.setItem(key,value);return true}catch{return false}};
 const currentUser=()=>localGet('currentUserId')||'USER-1';
+const DEMO_TOKEN_MAP={'USER-1':'tok-user-1','USER-2':'tok-user-2','USER-3':'tok-user-3','MANAGER-1':'tok-manager-1','OPERATOR-A1':'tok-operator-a1','MANAGER-A':'tok-manager-a','OPERATOR-B1':'tok-operator-b1','MANAGER-B':'tok-manager-b'};
+const demoTokenForUser=(userId)=>DEMO_TOKEN_MAP[userId]||'tok-user-1';
 const operatorNames={'USER-1':'李梅','USER-2':'王晓','USER-3':'陈琳','MANAGER-1':'周主管'};
 const stateLabels={DO_NOW:'立即处理',DO_TODAY:'今天处理',WAITING_EXTERNAL:'等待外部',NEEDS_CONFIRMATION:'需要确认',SCHEDULED:'已计划',ESCALATE:'主管介入',NOT_MY_RESPONSIBILITY:'非本人负责',DONE:'已完成'};
 const riskLabels={critical:'严重',high:'高风险',medium:'中风险',low:'低风险',none:'无明显风险'};
 const readinessLabels={BASE_ONLY:'仅有基础订单',NEEDS_STATUS:'待补充进展',READY_FOR_RANKING:'可生成行动',ACTION_GENERATED:'已有行动',CLOSED:'已完成'};
 const contactStatusLabels={NOT_CONTACTED:'尚未联系',WAITING_REPLY:'已联系，等待回复',REPLIED:'已收到回复',UNKNOWN:'不清楚'};
 const draftTypeLabels={CUSTOMER_REPLY:'客户回复',CUSTOMER_CONFIRMATION_REMINDER:'催客户确认',SUPPLIER_PROGRESS_FOLLOWUP:'催工厂进度',DELIVERY_STATUS_REPLY:'回复交期状态',CHANGE_HISTORY_SUMMARY:'汇总客户变更'};
-const FRONTEND_VERSION='6.1.3.7-visual-fidelity';
+const FRONTEND_VERSION='6.1.4.11-action-workspace';
 const pageMeta={
   today:['TODAY WORKBENCH','今日工作台'],
   agent:['AGENT ASSISTANT','Agent助手'],
@@ -75,7 +77,7 @@ let communicationRun=null;
 async function api(url,options={}){
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),options.timeoutMs||120000);
-  const headers={'Content-Type':'application/json',...(options.headers||{})};
+  const headers={'Content-Type':'application/json','X-Auth-Token':demoTokenForUser(currentUser()),...(options.headers||{})};
   const commKey=sessionGet('communicationAdminKey');
   if(commKey&&(url.startsWith('/api/workflows/ft05')||url.startsWith('/api/workflows/ft06')||url.startsWith('/api/communication/')))headers['X-Communication-Key']=commKey;
   try{
@@ -106,7 +108,7 @@ function readinessNextAction(o){const r=o.action_readiness||'BASE_ONLY';if(readi
 function parseRoute(){const raw=location.hash.replace(/^#/,'')||'today';const [path,q='']=raw.split('?');const parts=path.split('/').filter(Boolean);return{name:parts[0]||'today',id:parts[1]||null,query:Object.fromEntries(new URLSearchParams(q))}}
 function go(path){location.hash=path}
 function bindRouteButtons(root=document){$$('[data-route]',root).forEach(b=>b.onclick=()=>{go(b.dataset.route);$('#sidebar').classList.remove('open')});$$('[data-go]',root).forEach(b=>b.onclick=()=>go(b.dataset.go));$$('[data-metric-go]',root).forEach(card=>{const open=()=>go(card.dataset.metricGo);card.onclick=open;card.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open()}}})}
-function setPageMeta(name){const meta=pageMeta[name]||pageMeta.today;$('#pageEyebrow').textContent=meta[0];$('#pageTitle').textContent=meta[1];$$('[data-route]').forEach(b=>b.classList.toggle('active',b.dataset.route===name||(name==='orderDetail'&&b.dataset.route==='orders')));$('#globalSearch').placeholder='搜索订单、任务、客户或会话'}
+/* setPageMeta moved to V0.3 implementation at line 515 */
 function matchTask(t){if(!search)return true;const o=t.order||{};return [t.title,t.recommended_action,t.action_state,o.order_no,o.customer_name,o.product_name].join(' ').toLowerCase().includes(search.toLowerCase())}
 function matchOrder(o){if(!search)return true;return [o.order_no,o.customer_name,o.product_name,o.current_node,o.factory_name].join(' ').toLowerCase().includes(search.toLowerCase())}
 function emptyState(title,desc,actions=''){return `<div class="empty-state"><div class="empty-icon">${icon('inbox')}</div><h3>${esc(title)}</h3><p>${esc(desc)}</p>${actions?`<div class="empty-actions">${actions}</div>`:''}</div>`}
@@ -118,11 +120,11 @@ function currentOperator(){return{user_id:currentUser(),name:operatorNames[curre
 async function init(){
   bindShell();
   try{
-    const [health,settingData,reviews,operators]=await Promise.all([api('/health'),api(`/api/settings?user_id=${currentUser()}`),api('/api/reviews?status=PENDING'),api('/api/operators')]);
+    const [health,settingData,reviews,d12Reviews,operators]=await Promise.all([api('/health'),api(`/api/settings?user_id=${currentUser()}`),api('/api/reviews?status=PENDING'),api('/api/d12/reviews?status=PENDING').catch(()=>({items:[],count:0})),api('/api/operators')]);
     settings=settingData.settings||settings;
     if(settings.current_user_id&&settings.current_user_id!==currentUser())localSet('currentUserId',settings.current_user_id);
     cache.operators=operators.items||[];
-    updateProfile();updateHealth(health);updateBadges(null,reviews.pending||0);
+    updateProfile();updateHealth(health);updateBadges(null,Number(reviews.pending||0)+Number(d12Reviews.count||0));
   }catch(err){updateHealth(null,err.message)}
   await renderRoute();
 }
@@ -155,22 +157,35 @@ function bindShell(){
 function updateProfile(){const op=currentOperator();$('#profileName').textContent=op.name;$('#profileRole').textContent=`${op.role} · 演示`;$('#profileAvatar').textContent=op.name.slice(0,1);$$('[data-route="manage"]').forEach(el=>el.hidden=op.user_id!=='MANAGER-1');const settingsLabel=$('[data-route="settings"] span:last-of-type');if(settingsLabel)settingsLabel.textContent=op.user_id==='MANAGER-1'?'设置与连接':'身份与设置';document.body.dataset.role=op.user_id==='MANAGER-1'?'manager':'operator'}
 async function updateHealth(h,error=''){
   const set=(dot,value,tone,text)=>{if(dot){dot.className=`status-dot ${tone||''}`.trim()}if(value)value.textContent=text};
-  const systemDot=$('#systemStatusDot'),systemValue=$('#systemStatusValue'),agentDot=$('#agentStatusDot'),agentValue=$('#agentStatusValue'),scheduleDot=$('#scheduleStatusDot'),scheduleValue=$('#scheduleStatusValue');
-  if(!h){set(systemDot,systemValue,'','异常');set(agentDot,agentValue,'','未知');set(scheduleDot,scheduleValue,'','未知');return}
-  set(systemDot,systemValue,'ok','在线');
-  try{const s=await api('/api/agent/status',{timeoutMs:12000});set(agentDot,agentValue,s.coze_agent?.configured?'ok':'warn',s.coze_agent?.configured?'已配置':'未配置');set(scheduleDot,scheduleValue,s.daily_schedule?.scheduler_verified?'ok':'warn',s.daily_schedule?.scheduler_verified?'已验证':s.daily_schedule?.configured?'待验证':'未配置')}catch{set(agentDot,agentValue,h.agent?.configured?'ok':'warn',h.agent?.configured?'已配置':'未配置');set(scheduleDot,scheduleValue,'warn','待验证')}
+  const systemDot=$('#systemStatusDot'),systemValue=$('#systemStatusValue');
+  if(!h){set(systemDot,systemValue,'','数据异常');return}
+  set(systemDot,systemValue,'ok','正常 · 最近更新 '+(h.latest_data_update_minutes||'10')+' 分钟前');
 }
 function updateBadges(todayCount,reviewCount,agentCount=null){if(todayCount!=null){$('#todayBadge').hidden=!todayCount;$('#todayBadge').textContent=todayCount}if(reviewCount!=null){$('#reviewBadge').hidden=!reviewCount;$('#reviewBadge').textContent=reviewCount}if(agentCount!=null&&$('#agentBadge')){$('#agentBadge').hidden=!agentCount;$('#agentBadge').textContent=agentCount}}
-async function renderRoute(resetSearch=true,preserveSearchFocus=false){
-  route=parseRoute();if(resetSearch){search='';$('#globalSearch').value=''}setPageMeta(route.name==='orders'&&route.id?'orderDetail':route.name);const root=$('#pageRoot');const cursor=$('#globalSearch').selectionStart||search.length;root.innerHTML='<div class="loading-state"><span></span><p>正在载入真实业务数据…</p></div>';
-  try{
-    const pages={today:pageToday,agent:pageAgent,tasks:pageTasks,orders:route.id?pageOrderDetail:pageOrders,activation:pageActivation,intake:pageIntake,confirm:pageConfirm,manage:pageManage,settings:pageSettings};
-    await (pages[route.name]||pageToday)(root);bindRouteButtons(root);if(preserveSearchFocus){const input=$('#globalSearch');input.focus({preventScroll:true});try{input.setSelectionRange(cursor,cursor)}catch{}}else root.focus({preventScroll:true});
-  }catch(err){root.innerHTML=`<section class="panel">${emptyState('页面加载失败',err.message,`<button class="btn primary" onclick="location.reload()">重新加载</button>`)}</section>`;console.error(err)}
-}
+/* renderRoute moved to V0.3 implementation at line 522 */
 
 async function dashboardData(){return cache.dashboard||(cache.dashboard=await api(`/api/dashboard?current_user_id=${encodeURIComponent(currentUser())}`))}
 async function ordersData(){return cache.orders||(cache.orders=await api(`/api/orders?current_user_id=${encodeURIComponent(currentUser())}`))}
+
+async function workspaceData(){return cache.workspace||(cache.workspace=await api('/api/action-workspace'))}
+const d11TaskLabels={TODO:'待开始',IN_PROGRESS:'处理中',WAITING:'等待中',DONE:'已完成',CANCELLED:'已取消'};
+const d11CaseLabels={ACTIONABLE:'可继续处理',WAITING_ONLY:'等待外部',NO_OPEN_TASK:'暂无开放任务',CLOSED:'已关闭'};
+function d11TaskTone(status){return({TODO:'amber',IN_PROGRESS:'red',WAITING:'blue',DONE:'green',CANCELLED:'muted'}[status]||'muted')}
+function d11CaseTone(state){return({ACTIONABLE:'red',WAITING_ONLY:'blue',NO_OPEN_TASK:'muted',CLOSED:'green'}[state]||'muted')}
+function d11CaseTitle(w){const c=w.action_case||{};return c.title||c.latest_recommended_action||c.intent_type||'未命名行动案例'}
+function d11EvidenceText(evidence){if(!Array.isArray(evidence)||!evidence.length)return'暂无额外证据';return evidence.map(x=>typeof x==='string'?x:(x.reason||x.message||x.rule_id||JSON.stringify(x))).filter(Boolean).join('；')}
+function matchWorkspace(w){if(!search)return true;const c=w.action_case||{},o=w.order||{};const tasks=[...(w.actionable_tasks||[]),...(w.waiting_tasks||[]),...(w.history_tasks||[])];return [d11CaseTitle(w),c.intent_type,c.latest_recommended_action,o.order_no,o.customer_name,...tasks.flatMap(t=>[t.title,t.recommended_action])].join(' ').toLowerCase().includes(search.toLowerCase())}
+function d11WaitingText(t){const w=t?.active_waiting;if(!w)return'—';return `${w.reason||w.waiting_type||'等待外部'} · ${fdt(w.due_at)}`}
+function d11BusinessActionText(t){const a=t?.business_action,o=t?.outbox;if(!a)return'';const target=a.target_id||a.target_type||'业务对象';const status=a.status==='ACCEPTED'?'系统已接受，尚未确认外部执行':a.status;const ex=o?.durable_execution;if(ex){const map={SUCCESS:'已确认外部执行成功',FAILED_SAFE:'本次未执行',RETRYABLE:'可安全有限重试',RESULT_UNCERTAIN:'结果未知·已暂停自动重试',HUMAN_REQUIRED:'需要人工处理',PENDING:'待执行',IN_FLIGHT:'正在处理'};return `${a.action_type} · ${target} · ${status} · ${map[ex.state]||ex.state}`}const out=o?.status==='PENDING'?'待执行（不等于ERP成功）':o?.status||'无Outbox';return `${a.action_type} · ${target} · ${status} · ${out}`}
+function d11CaseRow(w,buttonLabel='打开案例'){
+  const c=w.action_case||{},o=w.order||{},state=w.workspace_state;const actionable=w.actionable_tasks||[],waiting=w.waiting_tasks||[];
+  const next=actionable[0]||waiting[0];const waitingDue=waiting.map(t=>t.active_waiting?.due_at).filter(Boolean).sort()[0];
+  const desc=actionable.length?`${actionable.length} 个可执行任务${actionable.length>1?'（不替你排序）':''}`:waiting.length?`正在等待 · ${waitingDue?relative(waitingDue):'未设置到期时间'}`:'暂无开放任务';
+  return `<div class="action-row" style="display:flex;gap:14px;align-items:center;padding:14px 0;border-bottom:1px solid var(--line)"><span class="metric-icon" style="width:34px;height:34px;border-radius:9px;background:var(--surface-2);display:inline-flex;align-items:center;justify-content:center;color:var(--ink-2)">${icon(state==='WAITING_ONLY'?'clock':'tasks')}</span><div style="flex:1;min-width:0"><strong style="font-size:13.5px">${esc(d11CaseTitle(w))}</strong><br><small class="demo-note">${esc(o.order_no||'未关联订单')}${o.customer_name?` · ${esc(o.customer_name)}`:''} · ${esc(desc)}</small>${next?.title?`<br><small class="demo-note">当前：${esc(next.title)}</small>`:''}</div><span class="tag ${d11CaseTone(state)}">${esc(d11CaseLabels[state]||state)}</span><button class="btn link" data-case-detail="${esc(c.action_case_id)}">${esc(buttonLabel)}</button></div>`
+}
+function d11TaskRow(w,t){const c=w.action_case||{},o=w.order||{};return `<tr><td><strong>${esc(t.title||'未命名任务')}</strong><br><small class="demo-note">${esc(d11CaseTitle(w))}</small></td><td>${esc(o.order_no||'—')}</td><td>${esc(t.recommended_action||'—')}</td><td>${esc(d11WaitingText(t))}</td><td><span class="tag ${d11TaskTone(t.status)}">${esc(d11TaskLabels[t.status]||t.status)}</span></td><td><button class="btn link" data-case-detail="${esc(c.action_case_id)}">打开案例</button></td></tr>`}
+function bindD11CaseButtons(root=document){$$('[data-case-detail]',root).forEach(b=>b.onclick=e=>{e.stopPropagation();openCaseDrawer(b.dataset.caseDetail)})}
+function invalidateWorkspace(){cache.workspace=null;cache.dashboard=null}
 
 
 function uiMetric(label,value,color,ic,delta='',up=false,goTo=''){
@@ -282,7 +297,7 @@ function confirmApprovalCard(x){const category=/MESSAGE|SEND|DRAFT/i.test(x.acti
 async function confirmReviewDirect(id){if(!confirm('确认后将写回正式订单并重新排序，确定继续吗？'))return;try{const x=await api(`/api/reviews/${encodeURIComponent(id)}`);await api(`/api/reviews/${encodeURIComponent(id)}/confirm`,{method:'POST',body:JSON.stringify({candidate:x.candidate||{},operator_id:currentUser()}),timeoutMs:240000});cache={operators:cache.operators};toast('候选已确认并写回','success');renderRoute(false)}catch(e){toast(e.message,'error')}}
 async function rejectReviewDirect(id){if(!confirm('确定驳回这条候选吗？'))return;try{await api(`/api/reviews/${encodeURIComponent(id)}/reject`,{method:'POST',body:JSON.stringify({operator_id:currentUser()})});toast('候选已驳回','success');renderRoute(false)}catch(e){toast(e.message,'error')}}
 async function openReviewEditor(id){try{const x=await api(`/api/reviews/${encodeURIComponent(id)}`),c=x.candidate||{};openModal({eyebrow:'HUMAN REVIEW',title:x.order_no||'消息变化候选',subtitle:'确认前可编辑字段值；确认后才写回订单。',body:`<div class="quote">${esc(x.raw_content||'无原文')}</div><div class="candidate-section" id="modalCandidateFields">${(c.fields||[]).map((f,i)=>`<label class="field"><span>${esc(fieldLabel(f.field_name))}</span><input data-index="${i}" value="${esc(f.normalized_value??'')}"></label>`).join('')||'<p>没有字段候选</p>'}</div>`,actions:x.status==='PENDING'?`<button class="btn" data-close-modal>取消</button><button class="btn primary" id="modalConfirmReview">确认并写回</button>`:'<button class="btn primary" data-close-modal>关闭</button>'});$('#modalConfirmReview')?.addEventListener('click',async()=>{const edited=JSON.parse(JSON.stringify(c));$$('#modalCandidateFields input').forEach(inp=>{const f=edited.fields[Number(inp.dataset.index)];f.normalized_value=['current_progress','current_progress_percentage'].includes(f.field_name)?Number(inp.value):inp.value});try{await api(`/api/reviews/${encodeURIComponent(id)}/confirm`,{method:'POST',body:JSON.stringify({candidate:edited,operator_id:currentUser()}),timeoutMs:240000});closeModal();cache={operators:cache.operators};toast('候选已确认并写回','success');renderRoute(false)}catch(e){toast(e.message,'error')}})}catch(e){toast(e.message,'error')}}
-async function decideApproval(id,decision){if(!confirm(decision==='APPROVE'?'确定批准该动作吗？':'确定驳回该动作吗？'))return;try{await api(`/api/agent/approvals/${encodeURIComponent(id)}/decision`,{method:'POST',body:JSON.stringify({decision,operator_id:currentUser(),current_role:currentUser()==='MANAGER-1'?'manager':'operator'})});toast(decision==='APPROVE'?'审批已通过':'审批已驳回','success');renderRoute(false)}catch(e){toast(e.message,'error')}}
+async function decideApproval(id,decision){if(!confirm(decision==='APPROVE'?'确定批准该动作吗？':'确定驳回该动作吗？'))return;try{const result=await api(`/api/agent/approvals/${encodeURIComponent(id)}/decision`,{method:'POST',body:JSON.stringify({decision,operator_id:currentUser(),current_role:currentUser()==='MANAGER-1'?'manager':'operator'})});if(decision==='APPROVE'&&result?.result?.d12_review_required){toast('旧审批已记录，但客户正式交期不会直接修改；请从订单当前行动发起主管审批','info')}else{toast(decision==='APPROVE'?'审批已通过':'审批已驳回','success')}renderRoute(false)}catch(e){toast(e.message,'error')}}
 
 
 function taskRecommendedDraft(t){const text=`${t.title||''} ${t.recommended_action||''}`;if(t.target==='factory'||t.waiting_on==='factory'||/工厂|供应商|生产|物料|进度/.test(text))return 'SUPPLIER_PROGRESS_FOLLOWUP';if(/交期|交货|延期|按时/.test(text))return 'DELIVERY_STATUS_REPLY';if(/确认|版本|包装|样品|唛头|设计/.test(text))return 'CUSTOMER_CONFIRMATION_REMINDER';return 'CUSTOMER_REPLY'}
@@ -305,42 +320,16 @@ function bindTaskActions(root,tasks){
   $$('[data-task-draft]',root).forEach(b=>b.onclick=e=>{e.stopPropagation();const t=tasks.find(x=>x.task_id===b.dataset.taskDraft);openCommunicationDrawer({mode:'ft06',task:t,order:t?.order,draftType:taskRecommendedDraft(t)})});
   $$('[data-task-replied]',root).forEach(b=>b.onclick=async e=>{e.stopPropagation();await markTaskReplied(b.dataset.taskReplied)});
 }
-async function pageToday(root){
-  const role=currentUser()==='MANAGER-1'?'manager':'operator';
-  const [d,reviews,agent]=await Promise.all([dashboardData(),api('/api/reviews?status=PENDING').catch(()=>({items:[],pending:0})),api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`).catch(()=>({reports:[],candidates:[],approvals:[],summary:{}}))]);
-  const a=d.activation||{total_orders:0,needs_initialization:0,action_generated:0};
-  const pendingReviews=(reviews.items||[]).filter(x=>x.status==='PENDING');
-  const pendingOrderIds=new Set(pendingReviews.map(x=>x.order_id).filter(Boolean));
-  const all=(d.items||[]).filter(matchTask);
-  const execution=(d.top_actions||[]).filter(t=>!t.pending_confirmation&&!pendingOrderIds.has(t.order_id)&&['DO_NOW','DO_TODAY','SCHEDULED','ESCALATE'].includes(t.action_state)).slice(0,5);
-  const waiting=all.filter(t=>t.action_state==='WAITING_EXTERNAL').sort((x,y)=>String(x.promised_reply_at||'9999').localeCompare(String(y.promised_reply_at||'9999'))).slice(0,3);
-  const latest=agent.reports?.[0]?.report||null;
-  const agentPending=Number(agent.summary?.pending_approval_count||0)+Number(agent.summary?.candidate_count||0);
-  const pendingCount=Number(reviews.pending||0)+agentPending;
-  updateBadges(execution.length,pendingCount);
-  const first=!a.total_orders;
-  const quick=first?`<div class="quick-entries"><a class="quick-entry" href="/import-orders"><span class="metric-icon">${icon('upload')}</span>导入订单底座</a><a class="quick-entry" href="/api/import/template.xlsx"><span class="metric-icon">${icon('copy')}</span>下载Excel模板</a><div class="quick-entry" id="todayNewOrder"><span class="metric-icon">${icon('plus')}</span>新建订单</div></div>`:`<div class="quick-entries"><div class="quick-entry" id="todayNewTask"><span class="metric-icon">${icon('plus')}</span>新建任务</div><div class="quick-entry" data-go="intake"><span class="metric-icon">${icon('upload')}</span>录入消息</div><div class="quick-entry" data-go="agent"><span class="metric-icon">${icon('spark')}</span>新会话</div></div>`;
-  const executionBody=first?`<p>先导入订单号、客户、产品、客户正式交期和负责人，建立可追踪的订单底座。</p><div class="flow"><span class="step">① 导入订单底座</span><span class="arrow">→</span><span class="step">② 补充动态进展</span><span class="arrow">→</span><span class="step">③ 生成今日行动</span></div><div class="row-actions" style="margin-top:12px"><a class="btn primary" href="/import-orders">导入订单底座</a><a class="btn secondary" href="/api/import/template.xlsx">下载模板</a></div>`:(execution.map(t=>uiActionRow(t,'处理')).join('')||'<p class="demo-note">已确认的正式任务会按优先级出现在这里。</p>');
-  root.innerHTML=`<div class="page-stack">
-    <div class="metric-grid">${uiMetric('优先行动',first?0:execution.length,'red','today')}${uiMetric('今日到期',first?0:all.filter(x=>x.action_state==='DO_TODAY').length,'amber','clock','__reserve__')}${uiMetric('超时等待',first?0:all.filter(x=>x.action_state==='WAITING_EXTERNAL'&&x.promised_reply_at&&new Date(x.promised_reply_at)<=new Date()).length,'blue','clock')}${uiMetric('待我确认',first?0:pendingCount,'amber','review')}</div>
-    ${quick}
-    <h4 class="section-title">当前行动</h4>
-    <div class="proto-2col"><section class="panel"><div class="panel-head"><h3>当前执行队列</h3><span class="tag muted">${first?'先建立订单底座':'仅含已确认的正式任务'}</span></div><div class="panel-body">${executionBody}</div></section><section class="panel"><div class="panel-head"><h3>等待即将到期</h3><span class="tag warning">${first?0:waiting.length} 项</span></div><div class="panel-body">${first?'<p class="demo-note">导入订单并生成正式任务后，临近承诺回复时间的事项会显示在这里。</p>':(waiting.map(t=>uiActionRow(t,'查看')).join('')||'<p class="demo-note">暂无临近或超时等待。</p>')}</div></section></div>
-    <h4 class="section-title">监控与待确认</h4>
-    <div class="proto-2col"><section class="panel"><div class="panel-head"><h3>最近一次 Agent 运行</h3><span class="tag ${latest?'success':'muted'}">${latest?'已完成':'暂无运行'}</span></div><div class="panel-body"><div class="agent-run-summary"><div class="summary-cell"><small>扫描订单</small><strong>${Number(latest?.screened_order_count||0)}</strong></div><div class="summary-cell"><small>风险订单</small><strong>${Number(latest?.risk_order_count||0)}</strong></div><div class="summary-cell"><small>新增待确认</small><strong>${agentPending}</strong></div></div><div class="run-row"><span class="r-label">任务草稿</span><span class="r-val">${Number(agent.summary?.pending_approval_count||0)} 项 · 等待确认</span></div><div class="run-row"><span class="r-label">运行时间</span><span class="r-val">${esc(latest?.generated_at?fdt(latest.generated_at):'尚未运行')}</span></div><p class="demo-note" style="margin-top:10px">这里只展示运行摘要；具体候选统一进入确认中心，避免与当前行动重复。</p><div class="row-actions" style="margin-top:10px"><button class="btn link" data-go="agent">查看运行结果</button></div></div></section><section class="panel"><div class="panel-head"><h3>待本人确认</h3><span class="tag danger">${first?0:pendingCount} 项</span></div><div class="panel-body">${first?'<p class="demo-note">消息变化、异常候选和Agent审批会统一进入确认中心。</p>':(pendingReviews.slice(0,3).map(todayReviewRow).join('')||'<p class="demo-note">当前没有待确认事项。</p>')}<div class="row-actions" style="margin-top:10px"><button class="btn primary" data-go="confirm">去确认中心</button></div></div></section></div>
-  </div>`;
-  $('#todayNewTask',root)?.addEventListener('click',()=>openTaskModal());
-  $('#todayNewOrder',root)?.addEventListener('click',openNewOrderModal);
-  bindTaskActions(root,[...execution,...waiting]);bindRouteButtons(root)
-}
 
 async function pageTasks(root){
-  const d=await dashboardData();let items=(d.items||[]).filter(matchTask);const filter=route.query.state||activeTaskFilter||'ALL';activeTaskFilter=filter;const filtered=items.filter(t=>filter==='ALL'||t.action_state===filter||(filter==='URGENT_GROUP'&&['DO_NOW','ESCALATE'].includes(t.action_state)));
-  const unassigned=items.filter(t=>!t.owner_user_id).length;const completed=items.filter(t=>t.status==='DONE'||t.action_state==='DONE').length;
-  root.innerHTML=`<div class="page-stack"><div class="proto-3col">${uiMetric('进行中',items.filter(x=>x.status!=='DONE'&&x.action_state!=='DONE').length,'blue','tasks')}${uiMetric('待分派',unassigned,'amber','user')}${uiMetric('本周完成',completed,'green','check','__reserve__')}</div><section class="panel"><div class="panel-head"><h3>全部任务</h3><div class="row-actions"><input class="btn secondary" id="taskPageSearch" style="height:36px;width:160px;text-align:left" placeholder="搜索任务 / 订单" value="${esc(search)}" /><select class="btn secondary" id="taskFilter"><option value="ALL">全部状态</option><option value="URGENT_GROUP" ${filter==='URGENT_GROUP'?'selected':''}>立即/升级</option><option value="DO_TODAY" ${filter==='DO_TODAY'?'selected':''}>今天处理</option><option value="WAITING_EXTERNAL" ${filter==='WAITING_EXTERNAL'?'selected':''}>等待外部</option><option value="NEEDS_CONFIRMATION" ${filter==='NEEDS_CONFIRMATION'?'selected':''}>待确认</option><option value="DONE" ${filter==='DONE'?'selected':''}>已完成</option></select><button class="btn secondary" id="refreshRanking">刷新排序</button><button class="btn primary" id="newTaskButton">新建任务</button></div></div><div class="panel-body" style="padding:0"><table class="data-table"><thead><tr><th>任务</th><th>来源</th><th>负责人</th><th>截止</th><th>等待对象</th><th>状态</th><th></th></tr></thead><tbody>${filtered.map(taskTableRow).join('')||'<tr><td colspan="7">没有匹配任务</td></tr>'}</tbody></table></div></section></div>`;
+  const wd=await workspaceData();const workspaces=(wd.items||[]).filter(matchWorkspace);let rows=[];for(const w of workspaces){for(const t of [...(w.actionable_tasks||[]),...(w.waiting_tasks||[]),...(w.history_tasks||[]),...(w.blocked_open_tasks||[])])rows.push({w,t})}
+  const filter=route.query.state||activeTaskFilter||'ALL';activeTaskFilter=filter;const filtered=rows.filter(({t})=>filter==='ALL'||t.status===filter);
+  const todo=rows.filter(x=>x.t.status==='TODO').length,doing=rows.filter(x=>x.t.status==='IN_PROGRESS').length,waiting=rows.filter(x=>x.t.status==='WAITING').length,done=rows.filter(x=>x.t.status==='DONE').length;
+  root.innerHTML=`<div class="page-stack"><div class="metric-grid">${uiMetric('待开始',todo,'amber','tasks')}${uiMetric('处理中',doing,'red','today')}${uiMetric('等待中',waiting,'blue','clock')}${uiMetric('已完成',done,'green','check')}</div><section class="panel"><div class="panel-head"><div><h3>正式 Task</h3><p class="demo-note">每个 Task 都属于一个 Action Case；不再展示 legacy tasks 表。</p></div><div class="row-actions"><input class="btn secondary" id="taskPageSearch" style="height:36px;width:170px;text-align:left" placeholder="搜索案例 / 任务 / 订单" value="${esc(search)}" /><select class="btn secondary" id="taskFilter"><option value="ALL">全部状态</option><option value="TODO" ${filter==='TODO'?'selected':''}>待开始</option><option value="IN_PROGRESS" ${filter==='IN_PROGRESS'?'selected':''}>处理中</option><option value="WAITING" ${filter==='WAITING'?'selected':''}>等待中</option><option value="DONE" ${filter==='DONE'?'selected':''}>已完成</option><option value="CANCELLED" ${filter==='CANCELLED'?'selected':''}>已取消</option></select></div></div><div class="panel-body" style="padding:0"><table class="data-table"><thead><tr><th>任务 / Action Case</th><th>订单</th><th>建议行动</th><th>等待</th><th>状态</th><th></th></tr></thead><tbody>${filtered.map(({w,t})=>d11TaskRow(w,t)).join('')||'<tr><td colspan="6">没有匹配的正式任务</td></tr>'}</tbody></table></div></section></div>`;
   $('#taskPageSearch',root).oninput=e=>{search=e.target.value;$('#globalSearch').value=search;clearTimeout(searchTimer);searchTimer=setTimeout(()=>renderRoute(false,true),160)};
-  $('#taskFilter',root).onchange=e=>{activeTaskFilter=e.target.value;go(`tasks?state=${encodeURIComponent(e.target.value)}`)};$('#newTaskButton',root).onclick=()=>openTaskModal();$('#refreshRanking',root).onclick=async()=>{try{await api('/api/coze/ft04/refresh',{method:'POST',body:JSON.stringify({current_user_id:currentUser()})});cache.dashboard=null;toast('行动排序已刷新','success');renderRoute(false)}catch(e){toast(e.message,'error')}};bindTaskActions(root,filtered)
+  $('#taskFilter',root).onchange=e=>{activeTaskFilter=e.target.value;go(`tasks?state=${encodeURIComponent(e.target.value)}`)};bindD11CaseButtons(root)
 }
+
 
 async function pageActivation(root){
   const [a,d]=await Promise.all([api(`/api/activation/summary?current_user_id=${encodeURIComponent(currentUser())}`),ordersData()]);const recommended=(a.recommended_orders||[]).filter(matchOrder);
@@ -351,11 +340,6 @@ async function pageActivation(root){
 function orderPriorityScore(o){const risk={none:0,low:1,medium:2,high:3,critical:4}[o.max_risk||'none']||0;const readiness={ACTION_GENERATED:4,READY_FOR_RANKING:3,NEEDS_STATUS:2,BASE_ONLY:1,CLOSED:0}[o.action_readiness||'BASE_ONLY']||0;return risk*10000+Number(o.open_task_count||0)*1000+readiness*100}
 function orderSortReason(o){if(['critical','high'].includes(o.max_risk))return `${riskLabels[o.max_risk]}，优先查看`;if(Number(o.open_task_count||0)>0)return `${o.open_task_count}项开放任务`;if(readinessNeedsInput(o.action_readiness))return '待补充进展';const date=o.requested_delivery_date||o.customer_delivery_date;return date?`客户交期 ${fdate(date)}`:'按最近更新时间'}
 function sortOrders(items,mode){const rows=[...items];if(mode==='DELIVERY')return rows.sort((a,b)=>String(a.requested_delivery_date||a.customer_delivery_date||'9999').localeCompare(String(b.requested_delivery_date||b.customer_delivery_date||'9999')));if(mode==='UPDATED')return rows.sort((a,b)=>String(b.updated_at||'').localeCompare(String(a.updated_at||'')));if(mode==='ORDER_NO')return rows.sort((a,b)=>String(a.order_no||'').localeCompare(String(b.order_no||''),'zh-CN'));return rows.sort((a,b)=>orderPriorityScore(b)-orderPriorityScore(a)||String(a.next_action_at||a.requested_delivery_date||'9999').localeCompare(String(b.next_action_at||b.requested_delivery_date||'9999')))}
-async function pageOrders(root){
-  const d=await ordersData();const raw=d.items.filter(matchOrder);const items=sortOrders(raw,activeOrderSort);const riskCount=raw.filter(o=>!['none',null,undefined].includes(String(o.max_risk))).length;const waitingCount=raw.filter(o=>o.contact_status==='WAITING_REPLY'||o.waiting_on).length;
-  root.innerHTML=`<div class="page-stack"><div class="proto-3col">${uiMetric('进行中订单',Number(d.summary?.active||raw.length),'blue','orders')}${uiMetric('风险订单',riskCount,'red','alert')}${uiMetric('等待中订单',waitingCount,'amber','clock')}</div><div class="row-actions" style="margin:2px 0 4px"><a class="btn primary" href="/import-orders">导入订单底座</a><button class="btn secondary" id="newOrder">新建订单</button><select class="btn secondary" id="orderSort"><option value="ACTION" ${activeOrderSort==='ACTION'?'selected':''}>按行动优先</option><option value="DELIVERY" ${activeOrderSort==='DELIVERY'?'selected':''}>按截止排序</option><option value="UPDATED" ${activeOrderSort==='UPDATED'?'selected':''}>按最近更新</option><option value="ORDER_NO" ${activeOrderSort==='ORDER_NO'?'selected':''}>按订单号</option></select></div><section class="panel"><div class="panel-head"><h3>订单列表</h3><span class="tag muted">${items.length} 笔 · 当前可见</span></div><div class="panel-body" style="padding:0">${items.length?`<table class="data-table"><thead><tr><th>订单 / 客户</th><th>当前节点</th><th>负责人</th><th>客户正式交期</th><th>当前风险</th><th>下一步</th><th>等待</th><th></th></tr></thead><tbody>${items.map(orderTableRow).join('')}</tbody></table>`:`<div style="padding:20px"><p class="demo-note">还没有订单。请先导入订单底座或新建一笔订单。</p><div class="row-actions" style="margin-top:12px"><a class="btn primary" href="/import-orders">导入订单底座</a><a class="btn secondary" href="/api/import/template.xlsx">下载Excel模板</a></div></div>`}</div></section></div>`;
-  $('#newOrder',root).onclick=openNewOrderModal;$('#orderSort',root).onchange=e=>{activeOrderSort=e.target.value;renderRoute(false)};$$('[data-order-detail]',root).forEach(b=>b.onclick=()=>go(`orders/${b.dataset.orderDetail}`))
-}
 
 async function pageOrderDetail(root){
   const d=await api(`/api/orders/${encodeURIComponent(route.id)}?current_user_id=${encodeURIComponent(currentUser())}`);const o=d.order;const tasks=d.tasks.filter(t=>t.status!=='DONE').map(t=>({...t,action_state:deriveTaskStateForDetail(t),order:o}));const risks=d.risks||[];const p=progressValue(o.current_progress);const risk=maxRiskFromList(risks);const needsInput=readinessNeedsInput(o.action_readiness||'BASE_ONLY');
@@ -379,17 +363,6 @@ async function pageIntake(root){
   form.onsubmit=async e=>{e.preventDefault();const btn=$('#analyzeButton',root);const body=Object.fromEntries(new FormData(form));btn.disabled=true;btn.textContent='正在提交…';try{const job=await api('/api/intake/jobs',{method:'POST',body:JSON.stringify(body),timeoutMs:15000});$('#intakeState',root).textContent='排队中';$('#intakeResult',root).innerHTML='<p class="demo-note">消息已进入后台识别队列。</p>';pollJob(job.job_id,body)}catch(err){toast(err.message,'error')}finally{btn.disabled=false;btn.textContent='分析消息'}}
 }
 
-async function pageConfirm(root){
-  const role=currentUser()==='MANAGER-1'?'manager':'operator';const [reviews,agent]=await Promise.all([api('/api/reviews'),api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`).catch(()=>({candidates:[],approvals:[],summary:{}}))]);
-  const reviewItems=(reviews.items||[]).filter(x=>!search||[x.order_no,x.customer_name,x.raw_content,x.workflow_source].join(' ').toLowerCase().includes(search.toLowerCase()));
-  const anomalies=(agent.candidates||[]).filter(x=>!search||[x.order_no,x.customer_name,x.recommended_action].join(' ').toLowerCase().includes(search.toLowerCase()));
-  const approvals=(agent.approvals||[]).filter(x=>!search||[x.order_no,x.action_type,x.approval_id].join(' ').toLowerCase().includes(search.toLowerCase()));
-  const pendingReviews=reviewItems.filter(x=>x.status==='PENDING');const pendingAnomalies=anomalies.filter(x=>['ANOMALY_CANDIDATE','PENDING_CONFIRMATION'].includes(x.status));const pendingApprovals=approvals.filter(x=>x.status==='PENDING');
-  const pending=pendingReviews.length+pendingAnomalies.length+pendingApprovals.length;const confirmed=reviewItems.filter(x=>x.status==='CONFIRMED').length+anomalies.filter(x=>x.status==='CONFIRMED').length+approvals.filter(x=>x.status==='APPROVED').length;const rejected=reviewItems.filter(x=>x.status==='REJECTED').length+anomalies.filter(x=>x.status==='REJECTED').length+approvals.filter(x=>x.status==='REJECTED').length;const today=new Date().toISOString().slice(0,10);const todayNew=[...reviewItems,...anomalies,...approvals].filter(x=>String(x.created_at||x.generated_at||'').slice(0,10)===today).length;updateBadges(null,pending);
-  const cards=[...pendingReviews.map(confirmReviewCard),...pendingAnomalies.map(confirmAnomalyCard),...pendingApprovals.map(confirmApprovalCard)];
-  root.innerHTML=`<div class="page-stack"><div class="metric-grid">${uiMetric('待确认',pending,'red','review')}${uiMetric('今日新增',todayNew,'blue','spark')}${uiMetric('已确认',confirmed,'green','check','__reserve__')}${uiMetric('已驳回',rejected,'muted','close')}</div><section class="panel"><div class="panel-head"><h3>确认队列</h3><span class="tag danger">${pending} 项待处理</span></div><div class="panel-body"><div class="confirm-filters"><button class="confirm-filter active" data-confirm-filter="全部">全部</button><button class="confirm-filter" data-confirm-filter="数据变更">数据变更</button><button class="confirm-filter" data-confirm-filter="任务草稿">任务草稿</button><button class="confirm-filter" data-confirm-filter="异常确认">异常确认</button><button class="confirm-filter" data-confirm-filter="对外动作">对外动作</button></div><div class="confirm-list">${cards.join('')||'<p class="demo-note">当前没有待确认事项。</p>'}</div></div></section></div>`;
-  $$('[data-confirm-filter]',root).forEach(filter=>filter.onclick=()=>{const type=filter.dataset.confirmFilter;$$('[data-confirm-filter]',root).forEach(x=>x.classList.toggle('active',x===filter));$$('[data-confirm-type]',root).forEach(card=>card.hidden=type!=='全部'&&card.dataset.confirmType!==type)});$$('[data-review-open]',root).forEach(b=>b.onclick=()=>openReviewEditor(b.dataset.reviewOpen));$$('[data-review-confirm]',root).forEach(b=>b.onclick=()=>confirmReviewDirect(b.dataset.reviewConfirm));$$('[data-review-reject]',root).forEach(b=>b.onclick=()=>rejectReviewDirect(b.dataset.reviewReject));$$('[data-anomaly-confirm]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyConfirm,'CONFIRM'));$$('[data-anomaly-reject]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyReject,'REJECT'));$$('[data-approval-approve]',root).forEach(b=>b.onclick=()=>decideApproval(b.dataset.approvalApprove,'APPROVE'));$$('[data-approval-reject]',root).forEach(b=>b.onclick=()=>decideApproval(b.dataset.approvalReject,'REJECT'));if(route.query.review)setTimeout(()=>openReviewEditor(route.query.review),0);bindRouteButtons(root)
-}
 
 function fieldLabel(name){return({packaging_method:'包装方式',requested_delivery_date:'客户正式交期',latest_supplier_commitment:'工厂完成承诺',current_progress:'当前进度',current_node:'当前节点',customer_name:'客户名称',product_name:'产品名称'}[name]||name)}
 
@@ -488,7 +461,7 @@ function openQuickInitializeModal(o,onDone=null){
 async function openNewOrderModal(){
   const m=openModal({eyebrow:'CREATE ORDER',title:'新建订单',subtitle:'建立真实订单底座后，任务和沟通才能获得可靠上下文。',body:`<div class="form-grid"><label class="field"><span>订单号 *</span><input name="order_no" required placeholder="例如 PO-2026-001"></label><label class="field"><span>客户名称 *</span><input name="customer_name" required></label><label class="field"><span>产品名称</span><input name="product_name"></label><label class="field"><span>SKU</span><input name="sku"></label><label class="field"><span>数量</span><input name="quantity" type="number" step="any"></label><label class="field"><span>单位</span><input name="unit" placeholder="pcs"></label><label class="field"><span>客户正式交期</span><input name="customer_delivery_date" type="date"></label><label class="field"><span>当前节点</span><input name="current_node" placeholder="例如 资料确认"></label><label class="field"><span>工厂名称</span><input name="factory_name"></label>${currentUser()==='MANAGER-1'?`<label class="field"><span>负责人</span><select name="owner"><option value="">待分配</option>${(cache.operators||[]).filter(o=>o.user_id!=='MANAGER-1').map(o=>`<option value="${esc(o.user_id)}">${esc(o.name)}</option>`).join('')}</select></label>`:`<label class="field"><span>负责人</span><input value="${esc(operatorNames[currentUser()]||currentUser())}" disabled><input name="owner" type="hidden" value="${esc(currentUser())}"></label>`}</div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="createOrderSubmit">创建订单</button>'});$('#createOrderSubmit',m).onclick=async()=>{const body=Object.fromEntries($$('input,select',$('#modalBody')).map(el=>[el.name,el.value]));if(!body.order_no.trim()||!body.customer_name.trim())return toast('请填写订单号和客户名称','error');if(body.quantity!=='')body.quantity=Number(body.quantity);try{const r=await api('/api/orders',{method:'POST',body:JSON.stringify({...body,operator_id:currentUser()})});cache.orders=null;closeModal();toast('订单已创建','success');go(`orders/${r.order_id}`)}catch(e){toast(e.message,'error')}}
 }
-function openEditOrderModal(o){const m=openModal({eyebrow:'EDIT ORDER',title:`编辑 ${o.order_no}`,subtitle:'修改正式订单事实会进入审计日志。',body:`<div class="form-grid"><label class="field"><span>订单号</span><input name="order_no" value="${esc(o.order_no||'')}"></label><label class="field"><span>客户名称</span><input name="customer_name" value="${esc(o.customer_name||'')}"></label><label class="field"><span>产品名称</span><input name="product_name" value="${esc(o.product_name||'')}"></label><label class="field"><span>SKU</span><input name="sku" value="${esc(o.sku||'')}"></label><label class="field"><span>包装方式</span><input name="packaging_method" value="${esc(o.packaging_method||'')}"></label><label class="field"><span>当前节点</span><input name="current_node" value="${esc(o.current_node||'')}"></label><label class="field"><span>客户正式交期</span><input name="customer_delivery_date" type="date" value="${esc((o.requested_delivery_date||o.customer_delivery_date||'').slice(0,10))}"></label><label class="field"><span>工厂完成承诺</span><input name="supplier_completion_commitment_date" type="date" value="${esc((o.latest_supplier_commitment||'').slice(0,10))}"></label><label class="field"><span>当前进度 %</span><input name="current_progress" type="number" min="0" max="100" value="${Math.round(progressValue(o.current_progress))}"></label><label class="field"><span>工厂名称</span><input name="factory_name" value="${esc(o.factory_name||'')}"></label>${currentUser()==='MANAGER-1'?`<label class="field"><span>负责人</span><select name="owner">${(cache.operators||[]).filter(op=>op.user_id!=='MANAGER-1').map(op=>`<option value="${esc(op.user_id)}" ${op.user_id===(o.owner||'')?'selected':''}>${esc(op.name)}</option>`).join('')}</select></label>`:''}</div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="saveOrder">保存修改</button>'});$('#saveOrder',m).onclick=async()=>{const body=Object.fromEntries($$('input,select',$('#modalBody')).map(el=>[el.name,el.value]));body.current_progress=body.current_progress===''?null:Number(body.current_progress)/100;try{await api(`/api/orders/${o.order_id}`,{method:'PATCH',body:JSON.stringify({...body,operator_id:currentUser()})});cache={operators:cache.operators};closeModal();toast('订单已更新','success');renderRoute(false)}catch(e){toast(e.message,'error')}}}
+function openEditOrderModal(o){const m=openModal({eyebrow:'EDIT ORDER',title:`编辑 ${o.order_no}`,subtitle:'事实记录可以直接更新；客户正式交期属于对外承诺，需要从当前行动发起主管审批。',body:`<div class="form-grid"><label class="field"><span>订单号</span><input name="order_no" value="${esc(o.order_no||'')}"></label><label class="field"><span>客户名称</span><input name="customer_name" value="${esc(o.customer_name||'')}"></label><label class="field"><span>产品名称</span><input name="product_name" value="${esc(o.product_name||'')}"></label><label class="field"><span>SKU</span><input name="sku" value="${esc(o.sku||'')}"></label><label class="field"><span>包装方式</span><input name="packaging_method" value="${esc(o.packaging_method||'')}"></label><label class="field"><span>当前节点</span><input name="current_node" value="${esc(o.current_node||'')}"></label><label class="field"><span>客户正式交期</span><input type="date" disabled value="${esc((o.requested_delivery_date||o.customer_delivery_date||'').slice(0,10))}"><small>如需修改，请从订单当前行动发起主管审批。</small></label><label class="field"><span>工厂完成承诺</span><input name="supplier_completion_commitment_date" type="date" value="${esc((o.latest_supplier_commitment||'').slice(0,10))}"><small>这是事实记录，不等于修改客户正式承诺。</small></label><label class="field"><span>当前进度 %</span><input name="current_progress" type="number" min="0" max="100" value="${Math.round(progressValue(o.current_progress))}"></label><label class="field"><span>工厂名称</span><input name="factory_name" value="${esc(o.factory_name||'')}"></label>${currentUser()==='MANAGER-1'?`<label class="field"><span>负责人</span><select name="owner">${(cache.operators||[]).filter(op=>op.user_id!=='MANAGER-1').map(op=>`<option value="${esc(op.user_id)}" ${op.user_id===(o.owner||'')?'selected':''}>${esc(op.name)}</option>`).join('')}</select></label>`:''}</div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="saveOrder">保存修改</button>'});$('#saveOrder',m).onclick=async()=>{const body=Object.fromEntries($$('input[name],select[name]',$('#modalBody')).map(el=>[el.name,el.value]));body.current_progress=body.current_progress===''?null:Number(body.current_progress)/100;try{await api(`/api/orders/${o.order_id}`,{method:'PATCH',body:JSON.stringify({...body,operator_id:currentUser()})});cache={operators:cache.operators};closeModal();toast('订单已更新','success');renderRoute(false)}catch(e){toast(e.message,'error')}}}
 async function openTaskModal(order=null){const orders=(await ordersData()).items;const m=openModal({eyebrow:'CREATE TASK',title:'新建任务',subtitle:'任务会进入真实行动排序，并可在任务中生成沟通。',body:`<div class="form-grid"><label class="field full"><span>关联订单 *</span><select name="order_id"><option value="">请选择订单</option>${orders.map(o=>`<option value="${esc(o.order_id)}" ${order?.order_id===o.order_id?'selected':''}>${esc(o.order_no)} · ${esc(o.customer_name||'')}</option>`).join('')}</select></label><label class="field full"><span>任务标题 *</span><input name="title" placeholder="例如：确认面料到厂时间"></label><label class="field full"><span>建议行动</span><textarea name="recommended_action" rows="3"></textarea></label><label class="field"><span>沟通对象</span><select name="target"><option value="factory">工厂/供应商</option><option value="customer">客户</option><option value="manager">主管</option><option value="internal">内部</option></select></label>${currentUser()==='MANAGER-1'?`<label class="field"><span>负责人</span><select name="owner_user_id">${(cache.operators||[]).filter(o=>o.user_id!=='MANAGER-1').map(o=>`<option value="${esc(o.user_id)}">${esc(o.name)}</option>`).join('')}</select></label>`:`<label class="field"><span>负责人</span><input value="${esc(operatorNames[currentUser()]||currentUser())}" disabled><input name="owner_user_id" type="hidden" value="${esc(currentUser())}"></label>`}<label class="field"><span>下一行动时间</span><input name="next_action_at" type="datetime-local"></label><label class="field"><span>风险等级</span><select name="risk_level"><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option><option value="critical">严重</option></select></label></div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="createTask">创建任务</button>'});$('#createTask',m).onclick=async()=>{const body=Object.fromEntries($$('input,select,textarea',$('#modalBody')).map(el=>[el.name,el.value]));if(!body.order_id||!body.title.trim())return toast('请选择订单并填写任务标题','error');if(body.next_action_at)body.next_action_at=new Date(body.next_action_at).toISOString();try{await api(`/api/orders/${body.order_id}/tasks`,{method:'POST',body:JSON.stringify({...body,operator_id:currentUser()})});cache.dashboard=null;closeModal();toast('任务已创建','success');renderRoute(false)}catch(e){toast(e.message,'error')}}}
 function openCommunicationKeyModal(){const m=openModal({eyebrow:'SECURITY',title:'沟通工作流操作密钥',subtitle:'仅保存在当前浏览器会话，不会写入页面或日志。',body:`<label class="field"><span>COMMUNICATION_ADMIN_KEY</span><input id="communicationKeyInput" type="password" value="${esc(sessionGet('communicationAdminKey')||'')}" placeholder="Render中配置的密钥"></label>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="saveCommunicationKey">保存</button>'});$('#saveCommunicationKey',m).onclick=()=>{const v=$('#communicationKeyInput',m).value.trim();if(!v)return toast('请输入操作密钥','error');sessionSet('communicationAdminKey',v);closeModal();toast('操作密钥已保存到本次会话','success')}}
 
@@ -521,3 +494,443 @@ function renderFT06Result(r){const p=$('#ft06Result'),result=r.result||{},d=r.dr
 async function reviewDraft(action,button){const p=$('#communicationPanel'),blocked=String(communicationRun.result?.approval_status||'').startsWith('BLOCKED'),override=Boolean($('#riskOverride',p)?.checked),note=$('#riskNote',p)?.value||'';if(blocked&&['approve','copy_and_record'].includes(action)&&!override)return toast('该草稿已被系统阻断。请先修改，或明确选择人工放行并填写依据','error');if(blocked&&override&&(!note.trim()||/具体依据：\s*$/.test(note)))return toast('请补充你决定人工放行的具体依据','error');const subject=$('#draftSubject',p).value,body=$('#draftBody',p).value;if(!body.trim())return toast('草稿正文不能为空','error');const reply=$('#replyAt',p).value;const original=button.textContent;button.disabled=true;button.textContent=action==='copy_and_record'?'正在复制并记录…':action==='approve'?'正在保存确认…':'正在保存…';$('#draftActionFeedback',p).textContent='正在保存到订单记录，请勿重复点击。';try{if(action==='copy_and_record'){try{await navigator.clipboard.writeText([subject,body].filter(Boolean).join('\n\n'))}catch{}}const result=await api(`/api/drafts/${communicationRun.draft_id}/review`,{method:'POST',body:JSON.stringify({action,operator_id:currentUser(),edited_subject:subject,edited_draft:body,note,risk_override_confirmed:override,task_id:communicationContext.task?.task_id||null,waiting_on:$('#waitingOn',p).value,promised_reply_at:reply?new Date(reply).toISOString():null,next_action_at:reply?new Date(reply).toISOString():null}),timeoutMs:60000});if(action==='copy_and_record'){cache.dashboard=null;$('#draftActionFeedback',p).textContent=result.task_update?.updated?'已复制，并将任务记录为等待回复。':'已复制并保存草稿；当前没有关联任务，因此未改变任务状态。';toast(result.duplicate_skipped?'该操作已经记录，无需重复提交':(result.task_update?.updated?'已复制并记录人工触达，任务进入等待状态':'草稿已复制并保存'),'success');setTimeout(()=>{closeDrawer();renderRoute(false)},650)}else{$('#draftActionFeedback',p).textContent=action==='approve'?'已保存人工确认，网站没有自动发送。':'修改已保存。';toast(action==='approve'?'草稿已人工确认，尚未发送':'修改已保存','success')}}catch(e){$('#draftActionFeedback',p).textContent=e.message;toast(e.message,'error')}finally{button.disabled=false;button.textContent=original}}
 
 window.addEventListener('load',init);
+
+/* ==========================================================
+   D11 V0.2 — user-behaviour IA after real-user UAT
+   The backend remains D8/D9/D10 canonical; operator UI translates
+   it into: what changed -> what to do -> order flow -> daily recap.
+   ========================================================== */
+pageMeta.today=['TODAY FOLLOW-UP','今日跟单'];
+pageMeta.confirm=['DECISIONS','待确认'];
+pageMeta.orders=['ORDERS','订单'];
+pageMeta.recap=['DAILY WRAP-UP','复盘'];
+pageMeta.manage=['TEAM WORKBENCH','团队工作台'];
+
+function setPageMeta(name){
+  const meta=pageMeta[name]||pageMeta.today;
+  $('#pageEyebrow').textContent=meta[0];$('#pageTitle').textContent=meta[1];
+  $$('[data-route]').forEach(b=>b.classList.toggle('active',b.dataset.route===name||(name==='orderDetail'&&b.dataset.route==='orders')));
+  $('#globalSearch').placeholder='搜索订单、客户或当前事项';
+}
+
+async function renderRoute(resetSearch=true,preserveSearchFocus=false){
+  route=parseRoute();if(resetSearch){search='';$('#globalSearch').value=''}
+  setPageMeta(route.name==='orders'&&route.id?'orderDetail':route.name);
+  const root=$('#pageRoot');const cursor=$('#globalSearch').selectionStart||search.length;
+  root.innerHTML='<div class="loading-state"><span></span><p>正在整理你的跟单信息…</p></div>';
+  try{
+    const pages={today:pageToday,confirm:pageConfirm,orders:route.id?pageOrderDetail:pageOrders,recap:pageRecap,manage:pageManage,settings:pageSettings,activation:pageActivation,intake:pageIntake,agent:pageAgent,tasks:pageTasks};
+    await (pages[route.name]||pageToday)(root);bindRouteButtons(root);
+    if(preserveSearchFocus){const input=$('#globalSearch');input.focus({preventScroll:true});try{input.setSelectionRange(cursor,cursor)}catch{}}else root.focus({preventScroll:true});
+  }catch(err){root.innerHTML=`<section class="panel">${emptyState('页面加载失败',err.message,`<button class="btn primary" onclick="location.reload()">重新加载</button>`)}</section>`;console.error(err)}
+}
+
+function d11v2Evidence(w){const e=w?.risk_context?.evidence||[];return Array.isArray(e)?e.map(x=>typeof x==='string'?x:(x.reason||x.message||x.evidence||'')).filter(Boolean):[]}
+function d11v2IssueTitle(w){
+  const c=w?.action_case||{},order=w?.order||{};let title=String(c.title||c.latest_recommended_action||'当前事项');
+  title=title.replace(/^解决\s*/,'').replace(new RegExp(String(order.order_no||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'g'),'').replace(/^\s*[-·:]?\s*/,'').trim();
+  if(!title||title.length>26){const intent=String(c.intent_type||'').toUpperCase();if(intent.includes('DELIVERY'))return'交期异常';if(intent.includes('SUPPLIER'))return'供应商进度异常';return'当前跟单事项'}
+  return title;
+}
+function d11v2BucketScore(v){return({ESCALATE:700,DO_NOW:650,DO_TODAY:550,NEEDS_CONFIRMATION:520,SCHEDULED:350,WAITING_EXTERNAL:200}[String(v||'').toUpperCase()]||300)}
+function d11v2SeverityScore(v){return({CRITICAL:80,HIGH:60,MEDIUM:35,LOW:10}[String(v||'').toUpperCase()]||0)}
+function d11v2CaseScore(w){const c=w.action_case||{};let score=d11v2BucketScore(c.latest_action_bucket)+d11v2SeverityScore(c.latest_severity);if(w.workspace_state==='ACTIONABLE')score+=100;if((w.waiting_tasks||[]).some(t=>t.active_waiting?.due_at&&new Date(t.active_waiting.due_at)<=new Date()))score+=180;return score}
+function d11v2SortCases(items){return [...items].sort((a,b)=>d11v2CaseScore(b)-d11v2CaseScore(a)||String(a.order?.requested_delivery_date||'9999').localeCompare(String(b.order?.requested_delivery_date||'9999')))}
+function d11v2NextAction(w){const a=w.actionable_tasks||[],wt=w.waiting_tasks||[];if(a.length===1)return a[0].title||a[0].recommended_action||'继续推进';if(a.length>1)return `${a.length} 件事情都可以继续推进`;if(wt.length)return `等待${wt[0].active_waiting?.reason||wt[0].active_waiting?.waiting_type||'外部回复'}`;return '查看订单进展'}
+function d11v2Reason(w){const e=d11v2Evidence(w);if(e.length)return e.join('；');return w?.risk_context?.recommended_action||w?.action_case?.latest_recommended_action||'系统已识别到需要继续关注的订单变化。'}
+function d11v2WaitingDue(w){return (w.waiting_tasks||[]).map(t=>t.active_waiting?.due_at).filter(Boolean).sort()[0]||null}
+function d11v2IsOverdue(w){return (w.waiting_tasks||[]).some(t=>t.active_waiting?.due_at&&new Date(t.active_waiting.due_at)<=new Date())}
+function d11v2OrderStage(o,w){
+  const text=String(o?.current_node||'').toLowerCase();
+  if(/交付|完成|签收/.test(text))return 4;if(/出货|出运|物流|装船/.test(text))return 3;if(/生产|加工|排产/.test(text))return 2;if(/采购|备料|物料|打样/.test(text))return 1;
+  const intent=String(w?.action_case?.intent_type||'').toUpperCase();if(intent.includes('DELIVERY')||intent.includes('SUPPLIER'))return 2;return 0;
+}
+function d11v2FlowHtml(o,w){const labels=['接单','备货/采购','生产','出货','交付'],idx=d11v2OrderStage(o,w);return `<div class="d11v2-flow">${labels.map((x,i)=>`<div class="d11v2-flow-step ${i<idx?'done':i===idx?'current':''}">${esc(x)}</div>`).join('')}</div>`}
+function d11v2HumanStage(o,w){const idx=d11v2OrderStage(o,w);return ['接单','备货/采购','生产','出货','交付'][idx]||'接单'}
+function d11v2FindOrder(w){return w?.order||{}}
+function d11v2CaseButton(w,label='查看'){const id=w?.action_case?.action_case_id||'';return `<button class="btn link" data-case-detail="${esc(id)}">${esc(label)}</button>`}
+
+function d11v2ChangeRow({time='最近',orderNo='',title='',body='',impact=''}){return `<div class="d11v2-change"><div class="meta"><span>${esc(time)}${orderNo?` · ${esc(orderNo)}`:''}</span></div><strong>${esc(title)}</strong><p>${esc(body)}</p>${impact?`<span class="d11v2-impact">${esc(impact)}</span>`:''}</div>`}
+function d11v2ActionRow(w,index){const o=w.order||{},urgent=d11v2CaseScore(w)>=700,reason=d11v2Reason(w);return `<div class="d11v2-action ${urgent?'urgent':''}"><span class="d11v2-rank">${index+1}</span><div class="d11v2-action-copy"><strong>${esc(o.order_no||'未编号')} · ${esc(d11v2NextAction(w))}</strong><p>${esc(reason)}</p><small>${esc(o.customer_name||'未知客户')}${o.requested_delivery_date?` · 客户交期 ${esc(fdate(o.requested_delivery_date))}`:''}</small></div>${d11v2CaseButton(w,'继续处理')}</div>`}
+
+function d11v4ChangeItem(c){return `<div class="d11v4-change"><div class="d11v4-change-meta"><span>${esc(c.time)}${c.orderNo?' · '+esc(c.orderNo):''}</span></div><strong>${esc(c.title)}</strong><p>${esc(c.body)}</p>${c.impact?`<span class="d11v4-change-impact">${esc(c.impact)}</span>`:''}</div>`}
+function d11v4ActionItem(w,idx){const o=w.order||{},urgent=d11v2CaseScore(w)>=700;return `<div class="d11v4-action ${urgent?'urgent':''}"><span class="d11v4-rank">${idx+1}</span><div class="d11v4-action-copy"><strong>${esc(o.order_no||'未编号')} · ${esc(d11v2IssueTitle(w))}</strong><p>${esc(d11v2Reason(w))}</p><small>${esc(o.customer_name||'未知客户')}${o.requested_delivery_date?' · 客户交期 '+esc(fdate(o.requested_delivery_date)):''}</small></div>${d11v2CaseButton(w,'继续处理')}</div>`}
+
+async function d11v4SubmitInfo(root,workspaces){
+  const box=$('#d11v4InfoInput',root),btn=$('#d11v4InfoSubmit',root),status=$('#d11v4InfoStatus',root);const raw=(box?.value||'').trim();if(!raw)return toast('请先粘贴一条客户、供应商或电话沟通内容','error');
+  const selectedRole=($('.d11v4-src-btn.active',root)?.dataset?.senderRole)||'customer';
+  const sourceChannel=selectedRole==='factory'?'wechat':'email';
+  btn.disabled=true;btn.textContent='正在识别…';status.textContent='正在识别这条信息影响哪个订单，以及是否需要你确认。';
+  const body={sender_role:selectedRole,source_channel:sourceChannel,raw_content:raw,source_time:new Date().toISOString()};
+  try{
+    const job=await api('/api/intake/jobs',{method:'POST',body:JSON.stringify(body),timeoutMs:15000});
+    for(let i=0;i<45;i++){
+      await new Promise(r=>setTimeout(r,i<8?800:1400));const j=await api(`/api/intake/jobs/${encodeURIComponent(job.job_id)}`,{timeoutMs:12000});
+      if(j.status==='COMPLETED'){
+        const rid=j.result?.review_id;cache.dashboard=null;status.innerHTML=`已识别出一项订单变化。确认后会更新行动排序。${rid?` <button class="btn link" data-go="confirm?review=${esc(rid)}">去确认</button>`:''}`;box.value='';bindRouteButtons(status);toast('新信息已识别，等待你确认','success');return;
+      }
+      if(j.status==='FAILED'){
+        const msg=j.error?.message||j.progress_message||'';
+        if(msg.includes('Coze尚未配置')||msg.includes('COZE')){
+          throw new Error('暂时无法分析这条信息，智能识别服务尚未就绪。内容已暂存，请稍后重试。');
+        }
+        throw new Error('暂时无法分析这条信息，请稍后重试。原始内容尚未写入订单。');
+      }
+      status.textContent=j.progress_message||'正在核对订单和变化…';
+    }
+    throw new Error('识别仍在后台进行，请稍后刷新查看待确认');
+  }catch(e){
+    const msg=e.message||'';
+    if(msg.includes('Coze尚未配置')||msg.includes('COZE')||msg.includes('503')||msg.includes('Service Unavailable')){
+      status.textContent='暂时无法分析这条信息，智能识别服务尚未就绪。内容已暂存，请稍后重试。';
+    }else if(msg.includes('无法分析')||msg.includes('尚未写入')){
+      status.textContent=msg;
+    }else{
+      status.textContent='暂时无法分析这条信息，请稍后重试。原始内容尚未写入订单。';
+    }
+    toast(status.textContent,'error');
+  }finally{btn.disabled=false;btn.textContent='分析这条信息'}
+}
+
+async function pageToday(root){
+  const [wd,reviews]=await Promise.all([workspaceData(),api('/api/reviews?status=PENDING').catch(()=>({items:[],pending:0}))]);
+  const cases=d11v2SortCases((wd.items||[]).filter(matchWorkspace));const actionable=cases.filter(w=>w.workspace_state==='ACTIONABLE'||d11v2IsOverdue(w));const waiting=cases.filter(w=>w.workspace_state==='WAITING_ONLY'&&!d11v2IsOverdue(w));const pending=(reviews.items||[]).filter(x=>x.status==='PENDING');updateBadges(actionable.length,pending.length);
+  const changes=[];
+  pending.slice(0,5).forEach(x=>changes.push({time:fdt(x.created_at||x.source_time||new Date()),orderNo:x.order_no||'',title:'有一条新信息等待确认',body:(x.raw_content||'').slice(0,110),impact:'确认后才会更新订单与行动'}));
+  const changeList=changes.slice(0,5);
+  const completedToday=[];
+  cases.forEach(w=>(w.history_tasks||[]).filter(t=>String(t.updated_at||'').slice(0,10)===todayISO()).forEach(t=>completedToday.push({w,t})));
+  const todayCompletedCount=completedToday.length;const todayResolvedCount=completedToday.filter(({t})=>t.status==='COMPLETED').length;
+  const recentCompleted=completedToday.slice(-3).reverse();
+  const changesHtml=changeList.length?changeList.map(d11v4ChangeItem).join(''):'<div class="d11v4-empty-inline">当前没有新的关键变化。</div>';
+  const copilotHtml=`<aside class="d11v4-copilot"><div class="d11v4-copilot-header"><strong>跟单 Copilot</strong></div><div class="d11v4-copilot-changes">${changesHtml}</div><div class="d11v4-copilot-input"><textarea id="d11v4InfoInput" placeholder="粘贴客户邮件、供应商回复或电话结果……"></textarea><div class="d11v4-source-pick"><button type="button" class="d11v4-src-btn active" data-sender-role="customer">客户</button><button type="button" class="d11v4-src-btn" data-sender-role="factory">工厂/供应商</button></div><div class="d11v4-input-actions"><small id="d11v4InfoStatus">系统会识别可能受影响的订单；确认变化后，再更新订单与行动排序。</small><button class="btn primary" id="d11v4InfoSubmit">分析这条信息</button></div></div></aside>`;
+  const actionHtml=actionable.length?actionable.map((w,i)=>d11v4ActionItem(w,i)).join(''):'<div class="d11v4-empty-inline">当前没有需要你主动处理的订单。</div>';
+  const waitingHtml=waiting.length?waiting.map(w=>{
+    const due=fdt(d11v2WaitingDue(w));const reason=esc(w.waiting_tasks?.[0]?.active_waiting?.reason||'外部回复');
+    return `<div class="d11v4-wait-row"><div><strong>${esc(w.order?.order_no||'未编号')} · ${reason}</strong><small>最晚 ${due}</small></div>${d11v2CaseButton(w,'查看')}</div>`;
+  }).join(''):'<div class="d11v4-wait-zero" id="waitingZero">正在等待 0 当前没有等待中的订单</div>';
+  const completedHtml=`<div class="d11v4-completed-row">今天已处理 <strong>${todayCompletedCount}</strong> 项${todayResolvedCount?` · 解决异常 <strong>${todayResolvedCount}</strong> 项`:''}${recentCompleted.length?` · 最近：${recentCompleted.map(({t})=>esc(t.title||'')).join('、')}`:''}</div>`;
+  root.innerHTML=`<div class="d11v4-grid">${copilotHtml}<section class="d11v4-stack"><div class="d11v4-section d11v4-primary"><div class="d11v4-section-head"><div><h3>现在先做</h3></div><span class="tag danger">${actionable.length} 个订单需要行动</span></div><div class="d11v4-section-body">${actionHtml}</div></div><div class="d11v4-section d11v4-waiting"><div class="d11v4-section-head"><h3>正在等待</h3></div><div class="d11v4-section-body">${waitingHtml}</div></div><div class="d11v4-section d11v4-completed">${completedHtml}</div></section></div>`;
+  bindD11CaseButtons(root);$('#d11v4InfoSubmit',root)?.addEventListener('click',()=>d11v4SubmitInfo(root,cases));
+  $$('.d11v4-src-btn',root).forEach(btn=>btn.addEventListener('click',()=>{
+    $$('.d11v4-src-btn',root).forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+  }));
+  const wz=document.getElementById('waitingZero');if(wz)wz.addEventListener('click',()=>renderRoute(false,'recap'));
+}
+
+function d11v2ReviewDecisionCard(x){return `<div class="d11v2-decision" data-review-card="${esc(x.review_id)}"><div class="d11v2-decision-head"><div><h3>${esc(x.order_no||'待关联订单')} · 新信息带来的订单变化</h3><p>${esc((x.raw_content||'').slice(0,180))}</p></div><span class="tag warning">需要你确认</span></div><div class="d11v2-question">确认这条信息与订单的对应关系和变化内容后，系统才会更新事实并重新整理行动。</div><div class="review-actions" style="margin-top:11px"><button class="btn secondary" data-review-open="${esc(x.review_id)}">查看并修改</button><button class="btn primary" data-review-confirm="${esc(x.review_id)}">确认变化</button><button class="btn ghost" data-review-reject="${esc(x.review_id)}">不是这样</button></div></div>`}
+function d11v2AgentDecisionCard(x,type='candidate'){const id=x.candidate_id||x.approval_id||'';const title=x.order_no?`${x.order_no} · ${x.recommended_action||'业务事项'}`:(x.title||'业务事项');const desc=x.reason||x.evidence||x.recommended_action||'这项业务决定需要人工确认后才能继续。';const actions=type==='approval'?`<button class="btn primary" data-approval-approve="${esc(id)}">同意</button><button class="btn ghost" data-approval-reject="${esc(id)}">不同意</button>`:`<button class="btn primary" data-anomaly-confirm="${esc(id)}">确认</button><button class="btn ghost" data-anomaly-reject="${esc(id)}">不是这样</button>`;return `<div class="d11v2-decision"><div class="d11v2-decision-head"><div><h3>${esc(title)}</h3><p>${esc(desc)}</p></div><span class="tag warning">需要决定</span></div><div class="review-actions" style="margin-top:11px">${actions}</div></div>`}
+
+function d11v4ConfirmItem(item, type='review'){
+  const id = item.review_id || item.candidate_id || item.approval_id || '';
+  const orderNo = item.order_no || '';
+  const customer = item.customer_name || '';
+  const body = (item.raw_content || item.reason || '').slice(0, 200);
+  const question = type === 'review' ? '确认这条信息与订单的对应关系和变化内容？' : (item.recommended_action ? `是否执行：${item.recommended_action}？` : '请确认是否继续推进？');
+  const evidence = type === 'review' ? `原始消息：${esc(item.raw_content || '无')}<br>系统判断：${esc(item.summary || item.reason || '系统自动生成')}<br>可能影响：更新订单事实并重新排序行动` : '';
+  const actions = type === 'review' 
+    ? `<button class="btn primary" data-review-confirm="${esc(id)}">接受</button><button class="btn secondary" data-review-reject="${esc(id)}">继续协调</button><button class="btn link d11v4-evidence-toggle">查看依据</button>`
+    : `<button class="btn primary" data-${type}-approve="${esc(id)}">接受</button><button class="btn secondary" data-${type}-reject="${esc(id)}">继续协调</button><button class="btn link d11v4-evidence-toggle">查看依据</button>`;
+  return `<div class="d11v4-confirm-item" data-confirm-id="${esc(id)}">
+    <div class="d11v4-confirm-header">
+      <span class="d11v4-confirm-title">${esc(orderNo)}${customer?' · '+esc(customer):''}</span>
+      <span class="tag warning">${type==='review'?'信息确认':type==='approval'?'主管审批':'系统建议'}</span>
+    </div>
+    <div class="d11v4-confirm-body">${esc(body)}</div>
+    <div class="d11v4-confirm-question">${esc(question)}</div>
+    <div class="d11v4-confirm-actions">${actions}</div>
+    ${evidence?`<div class="d11v4-confirm-evidence"><strong>查看依据</strong><p>${evidence}</p></div>`:''}
+  </div>`;
+}
+function d12ActionText(item){
+  const labels={UPDATE_EXPECTED_DELIVERY_DATE:'修改客户正式交期',UPDATE_CUSTOMER_COMMITMENT:'修改客户正式承诺',ACCEPT_DELAY:'接受延期方案',HIGH_RISK_OVERRIDE:'高风险例外处理',RECORD_CONTACT:'记录已联系',SET_WAITING:'进入等待反馈',UPDATE_INTERNAL_PLAN:'更新内部跟进计划',RECORD_SUPPLIER_COMMITMENT:'记录供应商最新承诺',LINK_MESSAGE_ORDER:'确认消息与订单关联'};
+  return labels[String(item.action_type||'').toUpperCase()]||'业务动作确认';
+}
+function d12ConfirmItem(item){
+  const id=item.review_id||'';const isManager=currentUser()==='MANAGER-1';const needsManager=item.required_review==='MANAGER_APPROVAL';const canDecide=needsManager?isManager:(isManager||item.requested_by===currentUser());
+  const payload=safeJson(item.payload_json,{});const state=safeJson(item.state_snapshot_json,{});const nextDate=payload.expected_delivery_date||payload.requested_delivery_date||payload.customer_delivery_date||'';
+  const title=`${item.order_no||'订单'} · ${d12ActionText(item)}`;
+  const body=item.reason|| (nextDate?`拟调整为 ${nextDate}`:'这项业务动作需要人工确认后才能继续。');
+  const why=needsManager?'这会改变对客户的正式承诺，因此需要主管审批。':'这属于当前跟单员授权范围，可以由本人确认。';
+  const question=needsManager?(isManager?'是否批准这次正式业务变更？':'已提交主管审批，批准前不会进入正式执行队列。'):'确认这项动作并记录到待执行队列？';
+  const tag=needsManager?'需要主管审批':'我可以确认';
+  const actions=canDecide?`<button class="btn primary" data-d12-approve="${esc(id)}">${needsManager?'批准':'确认'}</button><button class="btn secondary" data-d12-reject="${esc(id)}">${needsManager?'驳回':'取消'}</button><button class="btn link d11v4-evidence-toggle">查看依据</button>`:`<span class="tag muted">等待主管处理</span><button class="btn link d11v4-evidence-toggle">查看依据</button>`;
+  const evidence=`${esc(why)}<br>${state.requested_delivery_date?`当前正式交期：${esc(state.requested_delivery_date)}<br>`:''}${nextDate?`拟变更为：${esc(nextDate)}<br>`:''}通过后只会记录业务动作并进入待执行队列，不代表ERP或外部系统已经完成。`;
+  return `<div class="d11v4-confirm-item" data-confirm-id="${esc(id)}"><div class="d11v4-confirm-header"><span class="d11v4-confirm-title">${esc(title)}</span><span class="tag ${needsManager?'danger':'warning'}">${tag}</span></div><div class="d11v4-confirm-body">${esc(body)}</div><div class="d11v4-confirm-question">${esc(question)}</div><div class="d11v4-confirm-actions">${actions}</div><div class="d11v4-confirm-evidence"><strong>为什么需要这样确认</strong><p>${evidence}</p></div></div>`;
+}
+async function decideD12Review(id,decision){
+  const approve=decision==='APPROVE';if(!confirm(approve?'确认继续这项业务动作吗？':'确定不继续这项业务动作吗？'))return;
+  try{
+    await api(`/api/d12/reviews/${encodeURIComponent(id)}/decision`,{method:'POST',body:JSON.stringify({decision})});
+    if(approve){const result=await api(`/api/d12/reviews/${encodeURIComponent(id)}/submit`,{method:'POST',body:'{}'});toast(result.status==='ACCEPTED'?'已确认并记录，等待外部系统执行':'已确认','success')}
+    else toast('已驳回，这次动作不会提交','success');
+    renderRoute(false);
+  }catch(e){toast(e.message,'error')}
+}
+
+function bindConfirmEvents(root){
+  $$('.d11v4-evidence-toggle',root).forEach(btn=>{btn.onclick=()=>{const item=btn.closest('.d11v4-confirm-item');const ev=item?.querySelector('.d11v4-confirm-evidence');if(ev){ev.classList.toggle('show');btn.textContent=ev.classList.contains('show')?'收起依据':'查看依据'}}});
+  $$('[data-review-open]',root).forEach(b=>b.onclick=()=>openReviewEditor(b.dataset.reviewOpen));$$('[data-review-confirm]',root).forEach(b=>b.onclick=()=>confirmReviewDirect(b.dataset.reviewConfirm));$$('[data-review-reject]',root).forEach(b=>b.onclick=()=>rejectReviewDirect(b.dataset.reviewReject));$$('[data-anomaly-approve]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyApprove,'CONFIRM'));$$('[data-anomaly-reject]',root).forEach(b=>b.onclick=()=>decideAnomaly(b.dataset.anomalyReject,'REJECT'));$$('[data-approval-approve]',root).forEach(b=>b.onclick=()=>decideApproval(b.dataset.approvalApprove,'APPROVE'));$$('[data-approval-reject]',root).forEach(b=>b.onclick=()=>decideApproval(b.dataset.approvalReject,'REJECT'));$$('[data-d12-approve]',root).forEach(b=>b.onclick=()=>decideD12Review(b.dataset.d12Approve,'APPROVE'));$$('[data-d12-reject]',root).forEach(b=>b.onclick=()=>decideD12Review(b.dataset.d12Reject,'REJECT'));
+}
+async function pageConfirm(root){
+  const role=currentUser()==='MANAGER-1'?'manager':'operator';const [reviews,agent,d12Reviews]=await Promise.all([api('/api/reviews'),api(`/api/agent/overview?current_user_id=${encodeURIComponent(currentUser())}&current_role=${role}`).catch(()=>({candidates:[],approvals:[],summary:{}})),api('/api/d12/reviews?status=PENDING').catch(()=>({items:[],count:0}))]);
+  const reviewItems=(reviews.items||[]).filter(x=>x.status==='PENDING').filter(x=>!search||[x.order_no,x.customer_name,x.raw_content].join(' ').toLowerCase().includes(search.toLowerCase()));const anomalies=(agent.candidates||[]).filter(x=>['PENDING_CONFIRMATION','ANOMALY_CANDIDATE','PENDING'].includes(x.status||'PENDING'));const approvals=(agent.approvals||[]).filter(x=>String(x.status||'PENDING').includes('PENDING'));const d12Items=(d12Reviews.items||[]).filter(x=>!search||[x.order_no,x.customer_name,x.reason,x.action_type].join(' ').toLowerCase().includes(search.toLowerCase()));
+  const allItems=[...d12Items.map(x=>({...x,_type:'d12'})),...reviewItems.map(x=>({...x,_type:'review'})),...anomalies.map(x=>({...x,_type:'anomaly'})),...approvals.map(x=>({...x,_type:'approval'}))];
+  const total=allItems.length;updateBadges(null,total);
+  const renderItem=x=>x._type==='d12'?d12ConfirmItem(x):d11v4ConfirmItem(x,x._type);
+  root.innerHTML=`<div class="page-stack"><section class="d11v4-section"><div class="d11v4-section-head"><h3>待确认</h3><span class="tag danger">${total} 项</span><div class="d11v4-filter"><button class="btn link d11v4-filter-btn active" data-filter="ALL">全部</button><button class="btn link d11v4-filter-btn" data-filter="TODAY">今天新增</button><button class="btn link d11v4-filter-btn" data-filter="HIGH_RISK">需主管审批</button></div></div><div class="d11v4-section-body"><div class="d11v4-confirm-list">${allItems.map(renderItem).join('')||'<p class="demo-note">当前没有需要你确认的事项。</p>'}</div></div></section></div>`;
+  const rerender=(filter)=>{let list=allItems;if(filter==='TODAY'){const today=new Date().toDateString();list=allItems.filter(x=>{const d=new Date(x.created_at||x.updated_at||Date.now());return d.toDateString()===today})}else if(filter==='HIGH_RISK'){list=allItems.filter(x=>x.required_review==='MANAGER_APPROVAL'||(()=>{const r=String(x.risk_level||x.severity||x.max_risk||'').toLowerCase();return r.includes('high')||r.includes('critical')||r.includes('高')||r.includes('严重')})())}$$('.d11v4-confirm-list',root).forEach(el=>{el.innerHTML=list.map(renderItem).join('')||'<p class="demo-note">当前没有需要你确认的事项。</p>'});bindConfirmEvents(root)};
+  $$('.d11v4-filter-btn',root).forEach(btn=>{btn.onclick=()=>{$$('.d11v4-filter-btn',root).forEach(b=>b.classList.remove('active'));btn.classList.add('active');rerender(btn.dataset.filter)}});
+  bindConfirmEvents(root);
+  if(route.query.review)setTimeout(()=>openReviewEditor(route.query.review),0);
+}
+
+function d11v2OrderSituation(w,o){if(w){if(d11v2IsOverdue(w))return'等待已超时，需要重新处理';if(w.workspace_state==='ACTIONABLE')return d11v2IssueTitle(w);if((w.waiting_tasks||[]).length)return `等待${w.waiting_tasks[0].active_waiting?.reason||'外部回复'}`;}return o?.current_node?`${o.current_node}，暂无需要主动处理的异常`:'正常推进'}
+function d11v2OrderNext(w){if(!w)return'按当前计划推进';return d11v2NextAction(w)}
+function d11v2OrderRow(o,w){const caseId=w?.action_case?.action_case_id||'',due=w?d11v2WaitingDue(w):null;return `<div class="d11v2-order-row" ${caseId?`data-case-detail="${esc(caseId)}"`:`data-order-flow="${esc(o.order_id)}"`}><div class="d11v2-order-main"><strong>${esc(o.order_no||'未编号')} · ${esc(o.customer_name||'未知客户')}</strong><small>${esc(o.product_name||'')}</small></div><div class="d11v2-order-cell"><small>当前阶段</small><b>${esc(d11v2HumanStage(o,w))}</b></div><div class="d11v2-order-cell hide-md"><small>关键时间</small><b>${esc(due?fdt(due):fdate(o.requested_delivery_date||o.customer_delivery_date))}</b></div><div class="d11v2-order-cell"><small>当前情况</small><b>${esc(d11v2OrderSituation(w,o))}</b><small>${esc(d11v2OrderNext(w))}</small></div><button class="btn link">查看</button></div>`}
+
+function d11v4OrderRow(o,w,group){
+  const caseId = w?.action_case?.action_case_id || '';
+  const currentStage = d11v2HumanStage(o,w);
+  const due = w ? d11v2WaitingDue(w) : null;
+  const situation = d11v2OrderSituation(w,o);
+  const nextAction = d11v2OrderNext(w);
+  const reason = w ? d11v2Reason(w) : '';
+  const risk = group === 'attention';
+  const btnAttr = caseId?`data-case-detail="${esc(caseId)}"`:`data-order-flow="${esc(o.order_id)}"`;
+  return `<div class="d11v4-order-row" ${btnAttr}>
+    <div class="d11v4-order-main">
+      <strong>${esc(o.order_no||'未编号')} · ${esc(o.customer_name||'未知客户')}</strong>
+      <small>${esc(o.product_name||'')}</small>
+    </div>
+    <div class="d11v4-order-cell">
+      <small>当前阶段</small>
+      <b>${esc(currentStage)}</b>
+    </div>
+    <div class="d11v4-order-cell">
+      <small>关键时间</small>
+      <b>${esc(due?fdt(due):fdate(o.requested_delivery_date||o.customer_delivery_date))}</b>
+    </div>
+    <div class="d11v4-order-cell">
+      <small>当前情况</small>
+      <b class="${risk?'risk':''}">${esc(situation)}</b>
+    </div>
+    <button class="btn link" ${btnAttr}>${esc(nextAction)}</button>
+    ${reason?`<div class="d11v4-order-row-reason"><b>为什么：</b>${esc(reason)}</div>`:''}
+  </div>`;
+}
+
+async function pageOrders(root){
+  const [d,wd]=await Promise.all([ordersData(),workspaceData()]);
+  const raw=(d.items||[]).filter(matchOrder);
+  const wmap=new Map((wd.items||[]).map(w=>[w.order?.order_id,w]));
+  const attention=[],waiting=[],normal=[];
+  raw.forEach(o=>{
+    const w=wmap.get(o.order_id);
+    if(w&&(w.workspace_state==='ACTIONABLE'||d11v2IsOverdue(w))) attention.push([o,w]);
+    else if(w&&(w.workspace_state==='WAITING_ONLY'||(w.waiting_tasks||[]).length)) waiting.push([o,w]);
+    else normal.push([o,w]);
+  });
+  attention.sort((a,b)=>d11v2CaseScore(b[1])-d11v2CaseScore(a[1]));
+  waiting.sort((a,b)=>String(d11v2WaitingDue(a[1])||'9999').localeCompare(String(d11v2WaitingDue(b[1])||'9999')));
+  root.innerHTML=`<div class="page-stack">
+    <div class="panel-head">
+      <h3>订单</h3>
+      <div class="row-actions">
+        <span class="count">共 ${raw.length} 个订单</span>
+        <input class="btn secondary" id="orderPageSearch" style="height:36px;width:170px;text-align:left" placeholder="搜索订单" value="${esc(search)}" />
+        <button class="btn secondary" id="orderFilterBtn">筛选</button>
+        <button class="btn secondary" id="orderRefreshBtn">更新数据</button>
+      </div>
+    </div>
+    <details class="d11v4-group" open>
+      <summary><span class="d11v4-group-label">需要关注</span><span class="d11v4-group-count">${attention.length} 个订单</span><span class="d11v4-group-chevron">${icon('chevron')}</span></summary>
+      <div class="d11v4-group-body">${attention.map(([o,w])=>d11v4OrderRow(o,w,'attention')).join('')||'<p class="demo-note" style="padding:14px 18px">当前没有需要主动处理的订单。</p>'}</div>
+    </details>
+    <details class="d11v4-group" open>
+      <summary><span class="d11v4-group-label">等待反馈</span><span class="d11v4-group-count">${waiting.length} 个订单</span><span class="d11v4-group-chevron">${icon('chevron')}</span></summary>
+      <div class="d11v4-group-body">${waiting.map(([o,w])=>d11v4OrderRow(o,w,'waiting')).join('')||'<p class="demo-note" style="padding:14px 18px">当前没有等待反馈的订单。</p>'}</div>
+    </details>
+    <details class="d11v4-group">
+      <summary><span class="d11v4-group-label">正常推进</span><span class="d11v4-group-count">${normal.length} 个订单</span><span class="d11v4-group-chevron">${icon('chevron')}</span></summary>
+      <div class="d11v4-group-body">${normal.map(([o,w])=>d11v4OrderRow(o,w,'normal')).join('')||'<p class="demo-note" style="padding:14px 18px">暂无正常推进订单。</p>'}</div>
+    </details>
+  </div>`;
+  $('#orderPageSearch',root).oninput=e=>{search=e.target.value;$('#globalSearch').value=search;clearTimeout(searchTimer);searchTimer=setTimeout(()=>renderRoute(false,true),160)};
+  $('#orderRefreshBtn',root).onclick=()=>{cache={operators:cache.operators};renderRoute(false);toast('已更新订单数据','success')};
+  $('#orderFilterBtn',root)?.addEventListener('click',()=>toast('筛选功能待实现','info'));
+  bindD11CaseButtons(root);
+  $$('[data-order-flow]',root).forEach(row=>row.onclick=e=>{e.stopPropagation();openOrderOnlyFlowDrawer(row.dataset.orderFlow)});
+}
+
+function d12TaskCanRequestDelivery(t){const text=`${t?.title||''} ${t?.recommended_action||''} ${t?.current_node||''}`;return /交期|交货|延期|delivery|delay/i.test(text)}
+function d11v2TaskActionButtons(t,o){if(t.status==='TODO')return `<button class="btn secondary" data-d11-draft="${esc(t.task_id)}">生成沟通草稿</button><button class="btn primary" data-d11-start="${esc(t.task_id)}">开始处理</button>`;if(t.status==='IN_PROGRESS'){const delivery=d12TaskCanRequestDelivery(t)?`<button class="btn secondary" data-d12-delivery="${esc(t.task_id)}">申请修改客户交期</button>`:'';return `<button class="btn secondary" data-d11-draft="${esc(t.task_id)}">生成沟通草稿</button><button class="btn secondary" data-d11-wait="${esc(t.task_id)}">已联系，等待回复</button>${delivery}<button class="btn primary" data-d11-complete="${esc(t.task_id)}">这件事已完成</button>`}return''}
+function d11v2TaskCard(t,o){return `<div class="d11v2-next"><small>${t.status==='IN_PROGRESS'?'正在处理':'可以继续推进'}</small><strong>${esc(t.title||t.recommended_action||'继续处理')}</strong><p>${esc(t.recommended_action||'')}</p><div class="review-actions" style="margin-top:10px">${d11v2TaskActionButtons(t,o)}</div></div>`}
+function d11v2ProgressItems(w){const rows=[];(w.history_tasks||[]).slice(-4).reverse().forEach(t=>rows.push({time:fdt(t.updated_at),title:t.title,body:'已完成'}));(w.waiting_tasks||[]).forEach(t=>{const wt=t.active_waiting;if(wt)rows.push({time:fdt(wt.created_at),title:t.title,body:`开始等待：${wt.reason||wt.waiting_type||'外部回复'}`})});return rows.slice(0,6)}
+
+function d11v4HistoryByStage(w,stageIdx){const nodes=[];(w.history_tasks||[]).forEach(t=>{const nt=String(t.current_node||'').toLowerCase();let matched=false;const stageMap={'接单':0,'接单确认':0,'开始生产':2,'生产中':2,'备货':1,'备货采购':1,'采购':1,'出货':3,'交付':4,'完成':4};for(const k in stageMap){if(nt.includes(String(k).toLowerCase())){nodes.push({stage:stageMap[k],time:fdt(t.updated_at),title:t.title,body:'已完成'});matched=true;break}}if(!matched&&t.status==='COMPLETED'){nodes.push({stage:stageIdx,time:fdt(t.updated_at),title:t.title,body:'已完成'})}});return nodes;}
+
+async function openCaseDrawer(caseId){
+  let w;try{w=(await api(`/api/action-workspace/${encodeURIComponent(caseId)}`)).item}catch(e){return toast(e.message,'error')}
+  const c=w.action_case||{},o=w.order||{},actionable=w.actionable_tasks||[],waiting=w.waiting_tasks||[];
+  const stageIdx=d11v2OrderStage(o,w);
+  const stageLabels=['接单确认','备货采购','生产','出货','交付'];
+  const issue=d11v2IssueTitle(w),reason=d11v2Reason(w);
+  const historyByStage=d11v4HistoryByStage(w,stageIdx);
+  const flowNodes=stageLabels.map((label,i)=>{
+    const items=historyByStage.filter(h=>h.stage===i);
+    if(i<stageIdx)return{label,state:'completed',items};
+    if(i===stageIdx)return{label,state:'current',items};
+    return{label,state:'upcoming',items};
+  });
+  const actionHtml=actionable.length===1?d11v2TaskCard(actionable[0],o):actionable.length>1?`<div class="boundary-note"><strong>现在有 ${actionable.length} 件事都可以推进</strong><br>它们属于同一个订单问题，但目前没有可靠依据替你强行排先后。</div>${actionable.map(t=>d11v2TaskCard(t,o)).join('')}`:'<p class="demo-note">当前没有需要你主动处理的事项。</p>';
+  const waitHtml=waiting.map(t=>{const wt=t.active_waiting;return `<div class="d11v4-waiting-box"><strong>正在等待：${esc(wt?.reason||t.title||'外部回复')}</strong><span>最晚 ${esc(fdt(wt?.due_at))} · 已收到 ${Number(wt?.reply_count||0)} 条回复</span>${wt?`<button class="btn primary" data-d11-reply="${esc(wt.waiting_id)}">收到新回复</button>`:''}</div>`}).join('');
+  const pendingExternal=[...actionable,...waiting].filter(t=>t.business_action&&String(t.business_action.status).toUpperCase()==='ACCEPTED');
+  const nodesHtml=flowNodes.map((node,i)=>{
+    const stateClass=`d11v4-flow-node ${node.state}${node.state==='current'?' expanded':''}`;
+    const toggle=node.state==='completed'?'<button class="d11v4-flow-toggle">展开历史</button>':'';
+    let body='';
+    if(node.state==='current'){
+      body=`<div class="d11v4-flow-content">
+          <div class="d11v4-section-label">当前状态</div>
+          <div class="d11v4-section-content"><p>${esc(d11v2HumanStage(o,w))} · ${esc(issue)}</p></div>
+          <div class="d11v4-section-label">已发生事项</div>
+          <div class="d11v4-history-list">${node.items.length?node.items.map(x=>`<div class="d11v4-history-item"><time>${esc(x.time)}</time><div><strong>${esc(x.title)}</strong><span>已完成</span></div></div>`).join(''):'<p class="demo-note">暂无记录</p>'}</div>
+          <div class="d11v4-section-label">为什么需要关注</div>
+          <div class="d11v4-section-content"><p>${esc(reason)}</p></div>
+          ${waiting.length?`<div class="d11v4-section-label">等待状态</div>${waitHtml}`:''}
+          <div class="d11v4-section-label">当前可执行动作</div>
+          <div class="d11v4-action-row">${actionHtml}</div>
+          ${pendingExternal.length?`<div class="boundary-note"><strong>${(()=>{const ex=pendingExternal.map(t=>t.outbox?.durable_execution).find(Boolean);if(ex?.state==='RESULT_UNCERTAIN')return'外部操作结果暂无法确认，系统已停止自动重试，请先核对。';if(ex?.state==='HUMAN_REQUIRED')return'外部操作需要人工处理，自动流程已暂停。';if(ex?.state==='RETRYABLE')return'外部服务暂时失败，已确认未产生副作用，可在有限预算内安全重试。';return'有一项业务修改已被系统记录，但还没有确认外部系统执行成功。'})()}</strong></div>`:''}
+        </div>`;
+    }else if(node.state==='completed'){
+      body=`<div class="d11v4-flow-content"><div class="d11v4-section-label">当时做过什么</div><div class="d11v4-history-list">${node.items.length?node.items.map(x=>`<div class="d11v4-history-item"><time>${esc(x.time)}</time><div><strong>${esc(x.title)}</strong><span>已完成</span></div></div>`).join(''):'<p class="demo-note">该阶段暂无详细记录</p>'}</div></div>`;
+    }else{
+      body=`<div class="d11v4-flow-content"><p class="demo-note">该阶段尚未开始</p></div>`;
+    }
+    return `<div class="${stateClass}">
+      <div class="d11v4-flow-dot">${node.state==='completed'?icon('check'):node.state==='current'?icon('factory'):icon('clock')}</div>
+      <div class="d11v4-flow-body">
+        <div class="d11v4-flow-header">
+          <span class="d11v4-flow-title">${esc(node.label)}</span>
+          <span class="d11v4-flow-meta">${node.state==='completed'?'已完成':node.state==='current'?'进行中':'未开始'}</span>
+          ${toggle}
+        </div>
+        ${body}
+      </div>
+    </div>`;
+  }).join('');
+  const summary=`<div class="summary-row"><span class="summary-label">客户交期</span><span class="summary-value ${o.requested_delivery_date&&new Date(o.requested_delivery_date)<=new Date(Date.now()+7*86400000)?'risk':''}">${esc(o.requested_delivery_date?fdate(o.requested_delivery_date):'—')}</span></div>
+    <div class="summary-row"><span class="summary-label">当前阶段</span><span class="summary-value">${esc(d11v2HumanStage(o,w))}</span></div>
+    <div class="summary-row"><span class="summary-label">当前关注</span><span class="summary-value ${actionable.length?'risk':''}">${esc(issue)}</span></div>`;
+  openDrawer(`<div class="drawer-head"><div><span>订单跟单进度</span><h2>${esc(o.order_no||'未编号')} · ${esc(o.customer_name||'未知客户')}</h2><p>${esc(o.product_name||'')}</p></div><button class="drawer-close" data-close-drawer>×</button></div><div class="drawer-body"><section class="d11v4-order-summary">${summary}</section><section class="d11v4-flow-section"><h4 class="section-title">流程时间轴</h4><div class="d11v4-flow">${nodesHtml}</div></section></div>`);
+  bindD11DrawerActions(caseId,w,actionable,waiting);
+}
+
+function openD12DeliveryReviewModal(caseId,task,order){
+  const current=(order?.requested_delivery_date||order?.customer_delivery_date||'').slice(0,10);
+  const m=openModal({eyebrow:'HUMAN REVIEW',title:'申请修改客户正式交期',subtitle:'这是公司对客户的正式承诺变更，因此需要主管审批。供应商最新承诺属于事实记录，请在订单事实中单独更新。',body:`<div class="form-grid"><label class="field"><span>当前客户正式交期</span><input type="date" disabled value="${esc(current)}"></label><label class="field"><span>拟调整为</span><input id="d12DeliveryDate" type="date" min="${esc(current||'')}" required></label><label class="field" style="grid-column:1/-1"><span>调整原因</span><textarea id="d12DeliveryReason" rows="4" placeholder="例如：供应商确认无法满足原交期，已与客户沟通候选方案"></textarea></label></div><div class="boundary-note"><strong>审批通过 ≠ ERP 已修改</strong><br>通过后只会把这项业务动作记录到受控待执行队列，外部系统是否执行仍由后续受控写链处理。</div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="submitD12Delivery">提交主管审批</button>'});
+  $('#submitD12Delivery',m).onclick=async()=>{const next=$('#d12DeliveryDate',m)?.value||'';const reason=($('#d12DeliveryReason',m)?.value||'').trim();if(!next)return toast('请选择新的客户正式交期','error');if(current&&next===current)return toast('新交期与当前正式交期相同，无需发起审批','info');const key=`D12:DELIVERY:${task.task_id}:${next}`;try{await api('/api/d12/reviews',{method:'POST',body:JSON.stringify({task_id:task.task_id,action_type:'UPDATE_EXPECTED_DELIVERY_DATE',target_type:'ORDER',target_id:order.order_id,payload:{expected_delivery_date:next},idempotency_key:key,reason:reason||`申请将客户正式交期调整为 ${next}`})});closeModal();toast('已提交主管审批；批准前不会改变客户正式交期','success');renderRoute(false)}catch(e){toast(e.message,'error')}};
+}
+
+function bindD11DrawerActions(caseId,w,actionable,waiting){
+  const drawer=document.getElementById('drawer');
+  if(!drawer)return;
+  $$('.d11v4-flow-toggle',drawer).forEach(el=>{
+    el.addEventListener('click',()=>{
+      const node=el.closest('.d11v4-flow-node');
+      if(node) node.classList.toggle('expanded');
+    });
+  });
+  $$('[data-d11-start]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>d11SimpleTaskAction(caseId,b.dataset.d11Start,'start'));
+  });
+  $$('[data-d11-complete]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>d11SimpleTaskAction(caseId,b.dataset.d11Complete,'complete'));
+  });
+  $$('[data-d11-wait]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>openD11WaitingModal(caseId,b.dataset.d11Wait));
+  });
+  $$('[data-d11-reply]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>openD11ReplyModal(caseId,b.dataset.d11Reply));
+  });
+  $$('[data-d11-draft]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>{
+      const taskId=b.dataset.d11Draft;
+      const task=actionable.find(x=>x.task_id===taskId);
+      const order=w.order||{};
+      openD11CommunicationDraft({task:task?{...task,order,target:'factory'}:{task_id:taskId,order,target:'factory'},order,draftType:'SUPPLIER_PROGRESS_FOLLOWUP'});
+    });
+  });
+  $$('[data-d12-delivery]',drawer).forEach(b=>{
+    b.addEventListener('click',()=>{
+      const task=actionable.find(x=>x.task_id===b.dataset.d12Delivery);
+      if(!task)return toast('未找到对应行动任务','error');
+      openD12DeliveryReviewModal(caseId,task,w.order||{});
+    });
+  });
+}
+
+
+
+async function openOrderOnlyFlowDrawer(orderId){
+  try{
+    const d=await api(`/api/orders/${encodeURIComponent(orderId)}?current_user_id=${encodeURIComponent(currentUser())}`);
+    const o=d.order;
+    const stageIdx=d11v2OrderStage(o,null);
+    const stageLabels=['接单确认','备货采购','生产','出货','交付'];
+    const flowNodes=stageLabels.map((label,i)=>{
+      if(i<stageIdx)return{label,state:'completed',items:[]};
+      if(i===stageIdx)return{label,state:'current',items:[]};
+      return{label,state:'upcoming',items:[]};
+    });
+    const nodesHtml=flowNodes.map((node)=>{
+      const stateClass=`d11v4-flow-node ${node.state}${node.state==='current'?' expanded':''}`;
+      const toggle=node.state==='completed'?'<button class="d11v4-flow-toggle">展开历史</button>':'';
+      let body='';
+      if(node.state==='current'){
+        body=`<div class="d11v4-flow-content"><div class="d11v4-section-label">当前业务进展</div><div class="d11v4-section-content"><p>${esc(d11v2HumanStage(o,null))}</p></div><div class="d11v4-section-label">最近更新</div><div class="d11v4-history-list">${(d.events||[]).slice(0,4).map(e=>`<div class="d11v4-history-item"><time>${esc(fdt(e.created_at))}</time><div><strong>${esc(e.event_type||'订单更新')}</strong><span>${esc(eventSummary(e.payload_json))}</span></div></div>`).join('')||'<p class="demo-note">暂无更多进展。</p>'}</div></div>`;
+      }else if(node.state==='completed'){
+        body=`<div class="d11v4-flow-content"><div class="d11v4-section-label">完成时间</div><div class="d11v4-section-content"><p>该阶段已完成</p></div></div>`;
+      }else{
+        body=`<div class="d11v4-flow-content"><p class="demo-note">该阶段尚未开始</p></div>`;
+      }
+      return `<div class="${stateClass}"><div class="d11v4-flow-dot">${node.state==='completed'?icon('check'):node.state==='current'?icon('factory'):icon('clock')}</div><div class="d11v4-flow-body"><div class="d11v4-flow-header"><span class="d11v4-flow-title">${esc(node.label)}</span><span class="d11v4-flow-meta">${node.state==='completed'?'已完成':node.state==='current'?'进行中':'未开始'}</span>${toggle}</div>${body}</div></div>`;
+    }).join('');
+    const summary=`<div class="summary-row"><span class="summary-label">客户交期</span><span class="summary-value">${esc(o.requested_delivery_date?fdate(o.requested_delivery_date):'—')}</span></div><div class="summary-row"><span class="summary-label">当前阶段</span><span class="summary-value">${esc(d11v2HumanStage(o,null))}</span></div><div class="summary-row"><span class="summary-label">订单状态</span><span class="summary-value">正常推进中</span></div>`;
+    openDrawer(`<div class="drawer-head"><div><span>订单跟单进度</span><h2>${esc(o.order_no)} · ${esc(o.customer_name||'未知客户')}</h2><p>${esc(o.product_name||'')}</p></div><button class="drawer-close" data-close-drawer>×</button></div><div class="drawer-body"><section class="d11v4-order-summary">${summary}</section><section class="d11v4-flow-section"><h4 class="section-title">流程时间轴</h4><div class="d11v4-flow">${nodesHtml}</div></section><div class="boundary-note" style="margin-top:14px"><strong>当前没有需要你主动处理的异常。</strong><br>保持正常推进即可；如果新消息或订单事实发生变化，这张订单会自动进入"需要关注"或"等待反馈"。</div></div>`);
+    const drawer=document.getElementById('drawer');
+    if(drawer){
+      $$('.d11v4-flow-toggle',drawer).forEach(el=>{
+        el.addEventListener('click',()=>{
+          const node=el.closest('.d11v4-flow-node');
+          if(node) node.classList.toggle('expanded');
+        });
+      });
+    }
+  }catch(e){toast(e.message,'error')}
+}
+function openD11WaitingModal(caseId,taskId){const m=openModal({eyebrow:'等待反馈',title:'记录这次已经联系过',subtitle:'进入等待后，这件事先不占用你的注意力；到期或收到有效回复时再回来。',body:`<div class="form-grid"><label class="field full"><span>现在在等什么 *</span><input name="reason" placeholder="例如：等待供应商确认最终交期"></label><label class="field"><span>在等谁</span><select name="waiting_type"><option value="SUPPLIER_REPLY">供应商</option><option value="CUSTOMER_CONFIRMATION">客户</option><option value="EXTERNAL_REPLY">其他外部反馈</option></select></label><label class="field"><span>最晚等到 *</span><input name="due_at" type="datetime-local"></label></div>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="d11ConfirmWait">开始等待</button>'});$('#d11ConfirmWait',m).onclick=async()=>{const reason=$('[name="reason"]',$('#modalBody')).value.trim(),raw=$('[name="due_at"]',$('#modalBody')).value,waiting_type=$('[name="waiting_type"]',$('#modalBody')).value;if(!raw)return toast('请填写最晚等待时间','error');try{await api(`/api/action-workspace/tasks/${encodeURIComponent(taskId)}/wait`,{method:'POST',body:JSON.stringify({waiting_type,reason,due_at:new Date(raw).toISOString()})});invalidateWorkspace();closeModal();toast('已记录等待，系统会替你盯住到期时间','success');await openCaseDrawer(caseId);renderRoute(false)}catch(e){toast(e.message,'error')}}}
+function openD11ReplyModal(caseId,waitingId){const m=openModal({eyebrow:'收到回复',title:'这条回复够不够继续往下处理？',subtitle:'收到消息不一定代表问题已经解决。只有信息足够时，当前事项才重新进入处理。',body:`<label class="field"><span>回复内容</span><textarea name="reply_payload" rows="5" placeholder="例如：供应商确认最早 8 月 23 日交货"></textarea></label><label class="override-choice"><input name="satisfies_completion" type="checkbox"> 这条回复已经回答了我在等的问题，可以继续处理下一步</label>`,actions:'<button class="btn" value="cancel">取消</button><button class="btn primary" type="button" id="d11ConfirmReply">记录回复</button>'});$('#d11ConfirmReply',m).onclick=async()=>{const reply_payload=$('[name="reply_payload"]',$('#modalBody')).value.trim(),satisfies_completion=$('[name="satisfies_completion"]',$('#modalBody')).checked;try{await api(`/api/action-workspace/waitings/${encodeURIComponent(waitingId)}/reply`,{method:'POST',body:JSON.stringify({reply_id:`UI-${Date.now()}`,reply_payload:{summary:reply_payload},satisfies_completion})});invalidateWorkspace();closeModal();toast(satisfies_completion?'回复已记录，这件事重新需要处理':'回复已记录，继续等待','success');await openCaseDrawer(caseId);renderRoute(false)}catch(e){toast(e.message,'error')}}}
+async function d11SimpleTaskAction(caseId,taskId,action){try{await api(`/api/action-workspace/tasks/${encodeURIComponent(taskId)}/${action}`,{method:'POST',body:'{}'});invalidateWorkspace();toast(action==='start'?'已开始处理':'已完成这件事','success');await openCaseDrawer(caseId);renderRoute(false)}catch(e){toast(e.message,'error')}}
+
+
+function openD11CommunicationDraft(ctx){
+  communicationContext=ctx;openDrawer(`<div class="drawer-head"><div><span>沟通草稿</span><h2>基于当前订单准备沟通</h2><p>系统会使用订单事实和当前要推进的事情生成草稿；你确认后再复制或发送。</p></div><button class="drawer-close" data-close-drawer>×</button></div><div class="drawer-body">${communicationContextHtml(ctx)}<div id="communicationPanel"></div></div>`);
+  renderFT06Panel($('#communicationPanel',$('#drawer')));
+}
+
+function d11v2TomorrowPlanKey(){return `floworderTomorrowPlan:${currentUser()}:${todayISO()}`}
+function d11v4RecapItem(title,body){return `<div class="d11v4-recap-item"><strong>${esc(title)}</strong><p>${esc(body)}</p></div>`}
+async function pageRecap(root){
+  const [wd,reviews]=await Promise.all([workspaceData(),api('/api/reviews').catch(()=>({items:[]}))]);const cases=(wd.items||[]).filter(matchWorkspace);const completed=[];cases.forEach(w=>(w.history_tasks||[]).filter(t=>String(t.updated_at||'').slice(0,10)===todayISO()).forEach(t=>completed.push({w,t})));const waiting=cases.filter(w=>(w.waiting_tasks||[]).length),unfinished=d11v2SortCases(cases.filter(w=>w.workspace_state==='ACTIONABLE'||d11v2IsOverdue(w)));const confirmedToday=(reviews.items||[]).filter(x=>x.status==='CONFIRMED'&&String(x.updated_at||x.created_at||'').slice(0,10)===todayISO());const suggested=unfinished.slice(0,5);let saved=safeJson(localGet(d11v2TomorrowPlanKey()),null);
+  root.innerHTML=`<div class="page-stack"><header class="d11v4-header"><h2>复盘</h2><span class="d11v4-date">${esc(todayISO())}</span></header><div class="d11v4-recap-grid"><section class="d11v4-section"><div class="d11v4-section-head"><h3>今天完成</h3><span class="d11v4-recap-count">${completed.length}</span></div><div class="d11v4-section-body">${completed.slice(0,8).map(({w,t})=>d11v4RecapItem(`${w.order?.order_no||'未编号'} · ${t.title}`,'已完成，订单继续按当前计划推进。')).join('')||d11v4RecapItem('今天还没有记录完成的事项。','')}</div></section><section class="d11v4-section"><div class="d11v4-section-head"><h3>还没收口</h3><span class="d11v4-recap-count">${unfinished.length+waiting.length}</span></div><div class="d11v4-section-body">${unfinished.slice(0,5).map(w=>d11v4RecapItem(`${w.order?.order_no||'未编号'} · ${d11v2NextAction(w)}`,d11v2Reason(w))).join('')}${waiting.slice(0,5).map(w=>d11v4RecapItem(`${w.order?.order_no||'未编号'} · 正在等待反馈`,`${w.waiting_tasks?.[0]?.active_waiting?.reason||'等待外部回复'} · 最晚 ${fdt(d11v2WaitingDue(w))}`)).join('')||d11v4RecapItem('当前没有未收口事项。','')}</div></section><section class="d11v4-section"><div class="d11v4-section-head"><h3>今天的关键变化</h3><span class="d11v4-recap-count">${confirmedToday.length}</span></div><div class="d11v4-section-body">${confirmedToday.slice(0,8).map(x=>d11v4RecapItem(`${x.order_no||'订单'} · 信息已确认`,(x.raw_content||'').slice(0,160))).join('')||d11v4RecapItem('今天暂无新的已确认外部变化。','')}</div></section><section class="d11v4-section"><div class="d11v4-section-head"><h3>明天计划</h3></div><div class="d11v4-section-body"><div class="d11v4-tomorrow" id="d11v4TomorrowList" style="padding:12px 0">${(saved||suggested.map((w,i)=>({case_id:w.action_case?.action_case_id,order_no:w.order?.order_no,title:d11v2NextAction(w)}))).map((x,i)=>`<div class="d11v4-tomorrow-row"><b>${i+1}</b><span>${esc(x.order_no||'订单')} · ${esc(x.title||'继续推进')}</span></div>`).join('')||d11v4RecapItem('当前没有需要带到明天的事项。','')}</div><div class="review-actions" style="padding-bottom:12px"><button class="btn primary" id="d11v4SaveTomorrow">保存明日计划</button></div></div></section></div></div>`;
+  $('#d11v4SaveTomorrow',root)?.addEventListener('click',()=>{const plan=suggested.map(w=>({case_id:w.action_case?.action_case_id,order_no:w.order?.order_no,title:d11v2NextAction(w)}));localSet(d11v2TomorrowPlanKey(),JSON.stringify(plan));toast('明日计划已保存；明早会以此为基础，再根据新信息调整','success')});
+}
+
+// D11 V0.4 bootstrap contract: the script is loaded at the end of <body>, so
+// shell elements already exist. Keep one explicit initialization call here;
+// without it the UI remains permanently in the loading state even though all
+// backend APIs are healthy.
+init();

@@ -1,0 +1,8 @@
+{
+  "name": "CANDIDATE_A",
+  "api_base": "https://YOUR_OPENAI_COMPATIBLE_ENDPOINT/v1",
+  "api_key_env": "D13_CANDIDATE_A_API_KEY",
+  "model": "YOUR_MODEL_ID",
+  "temperature": 0,
+  "timeout_seconds": 60
+}

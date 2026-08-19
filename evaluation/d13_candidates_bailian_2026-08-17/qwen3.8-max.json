@@ -1,0 +1,9 @@
+{
+  "name": "QWEN_3_8_MAX",
+  "provider": "AlibabaCloudModelStudio",
+  "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "model": "qwen3.8-max",
+  "temperature": 0,
+  "timeout_seconds": 120
+}

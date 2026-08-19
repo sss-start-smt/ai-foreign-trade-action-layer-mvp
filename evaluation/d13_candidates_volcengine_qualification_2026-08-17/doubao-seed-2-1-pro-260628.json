@@ -1,0 +1,13 @@
+{
+  "name": "DOUBAO_SEED_2_1_PRO_260628",
+  "provider": "VolcengineArk",
+  "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+  "api_key_env": "ARK_API_KEY",
+  "model": "doubao-seed-2-1-pro-260628",
+  "temperature": 0,
+  "timeout_seconds": 180,
+  "family": "Doubao",
+  "selection_role": "CROSS_PROVIDER_PRODUCTION_CHALLENGER",
+  "structured_output_supported": true,
+  "qualification_pool_source": "Volcengine Ark official model/API docs checked 2026-08-17"
+}

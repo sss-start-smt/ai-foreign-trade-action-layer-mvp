@@ -12,22 +12,21 @@ from main import app, db, init_db
 
 client = TestClient(app)
 HEADERS = {"X-FlowOrder-Agent-Key": "agent-test-key"}
+from conftest import auth_headers
 
 
 def setup_function():
     agent_api.AGENT_API_KEY = "agent-test-key"
     init_db()
-    assert client.post("/api/reset").status_code == 200
-    assert client.post("/api/demo/seed").status_code == 200
+    assert client.post("/api/reset", headers={"X-FlowOrder-Agent-Key": "agent-test-key"}).status_code == 200
+    assert client.post("/api/demo/seed", headers={"X-FlowOrder-Agent-Key": "agent-test-key"}).status_code == 200
 
 
 def test_parse_bulk_order_updates_returns_confirmation_candidates():
     response = client.post(
         "/api/agent/tools/bulk-updates/parse",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "text": "PO-1002工厂说现在做到82%，最新承诺8月6日完工。",
         },
@@ -44,9 +43,8 @@ def test_parse_bulk_order_updates_returns_confirmation_candidates():
 def test_confirm_bulk_update_writes_safe_field_and_tracks_event():
     parsed = client.post(
         "/api/agent/bulk-updates/parse",
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "text": "PO-1002目前已经完成88%，正在包装。",
         },
@@ -54,9 +52,8 @@ def test_confirm_bulk_update_writes_safe_field_and_tracks_event():
     updates = [u for u in parsed["orders"][0]["updates"] if u["field_name"] in {"current_progress", "current_node"}]
     confirmed = client.post(
         "/api/agent/bulk-updates/confirm",
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "batch_id": parsed["batch_id"],
             "decisions": [{"update_id": u["update_id"], "decision": "ACCEPT"} for u in updates],
@@ -77,9 +74,8 @@ def test_high_risk_delivery_date_update_creates_approval_not_direct_write():
         before = conn.execute("SELECT requested_delivery_date FROM orders WHERE order_no='PO-1002'").fetchone()[0]
     parsed = client.post(
         "/api/agent/bulk-updates/parse",
+        headers={**HEADERS, **auth_headers("MANAGER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "text": "PO-1002客户同意把正式交期改到8月25日。",
         },
@@ -87,9 +83,8 @@ def test_high_risk_delivery_date_update_creates_approval_not_direct_write():
     high = next(u for u in parsed["orders"][0]["updates"] if u["field_name"] == "requested_delivery_date")
     confirmed = client.post(
         "/api/agent/bulk-updates/confirm",
+        headers={**HEADERS, **auth_headers("MANAGER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "batch_id": parsed["batch_id"],
             "decisions": [{"update_id": high["update_id"], "decision": "ACCEPT"}],
@@ -108,17 +103,15 @@ def test_high_risk_delivery_date_update_creates_approval_not_direct_write():
 def test_diagnose_priority_orders_is_one_composite_tool_call():
     started = client.post(
         "/api/agent/tools/runs/start",
-        headers=HEADERS,
-        json={"current_user_id": "USER-1", "current_role": "operator", "goal": "组合诊断"},
+        headers={**HEADERS, **auth_headers("USER-1")},
+        json={"goal": "组合诊断"},
     )
     run_id = started.json()["run_id"]
     response = client.post(
         "/api/agent/tools/priority-orders/diagnose",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
             "run_id": run_id,
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "organization_id": "ORG-DEMO",
             "due_within_days": 60,
             "top_n": 7,
@@ -136,6 +129,7 @@ def test_diagnose_priority_orders_is_one_composite_tool_call():
 def test_analytics_summary_exposes_activation_ai_and_quality():
     client.post(
         "/api/analytics/events",
+        headers=auth_headers("USER-1"),
         json={
             "event_name": "anomaly_result_viewed",
             "organization_id": "ORG-DEMO",
@@ -143,7 +137,7 @@ def test_analytics_summary_exposes_activation_ai_and_quality():
             "properties": {"candidate_count": 1},
         },
     )
-    response = client.get("/api/analytics/summary?days=30&organization_id=ORG-DEMO")
+    response = client.get("/api/analytics/summary?days=30&organization_id=ORG-DEMO", headers=auth_headers("USER-1"))
     assert response.status_code == 200
     data = response.json()
     assert "activation_funnel" in data

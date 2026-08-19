@@ -1,0 +1,13 @@
+{
+  "name": "MINIMAX_M3",
+  "provider": "AlibabaCloudModelStudio",
+  "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "model": "MiniMax-M3",
+  "temperature": 0,
+  "timeout_seconds": 180,
+  "family": "MiniMax",
+  "selection_role": "CROSS_FAMILY_CHALLENGER",
+  "structured_output_supported": false,
+  "qualification_pool_source": "Alibaba Cloud Model Studio recommended general-purpose text models (checked 2026-08-17)"
+}

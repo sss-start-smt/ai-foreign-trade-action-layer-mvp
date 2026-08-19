@@ -71,8 +71,8 @@ def seed(db_path: Path, anchor: datetime, reset_agent_demo: bool = False) -> dic
         )
 
     def msg(order_no: str, role: str, content: str, hours_ago: int = 1, channel: str = "email"):
-        conn.execute("INSERT INTO source_messages(message_id,order_id,source_channel,sender_role,message_type,raw_content,source_time,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (uid("MSG"), order_ids[order_no], channel, role, "TEXT", content, iso(now-timedelta(hours=hours_ago)), iso(now)))
+        conn.execute("INSERT INTO source_messages(message_id,order_id,organization_id,source_channel,sender_role,message_type,raw_content,source_time,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (uid("MSG"), order_ids[order_no], "ORG-DEMO", channel, role, "TEXT", content, iso(now-timedelta(hours=hours_ago)), iso(now)))
 
     def task(order_no: str, title: str, owner: str, *, pending=False, waiting_on=None, reply_hours=None, urgent=False, risk="medium", target="internal"):
         promised = iso(now + timedelta(hours=reply_hours)) if reply_hours is not None else None

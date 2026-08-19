@@ -1,0 +1,9 @@
+{
+  "name": "GLM_5_2",
+  "provider": "AlibabaCloudModelStudio",
+  "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "model": "glm-5.2",
+  "temperature": 0,
+  "timeout_seconds": 120
+}

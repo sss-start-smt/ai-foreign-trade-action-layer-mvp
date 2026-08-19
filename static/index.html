@@ -1,235 +1,785 @@
-<!doctype html>
+<!DOCTYPE html>
+
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <meta name="theme-color" content="#ffffff" />
-  <meta name="color-scheme" content="light" />
-  <title>FlowOrder · AI外贸跟单行动系统</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=6.1.3.7-visual-fidelity" />
-  <style>
-    .proto-banner{position:sticky;top:0;z-index:300;display:flex;align-items:center;gap:10px;justify-content:center;
-      padding:9px 14px;background:var(--ink);color:#fff;font-size:12px;font-weight:600;letter-spacing:.01em;border-bottom:1px solid var(--line)}
-    .proto-banner b{color:var(--brand)}
-    .metric-grid{grid-template-columns:repeat(4,1fr)}
-    .page-stack{gap:24px}
-    .proto-2col{display:grid;grid-template-columns:1.55fr 1fr;gap:18px;align-items:start}
-    .proto-3col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;align-items:start}
-    @media(max-width:1080px){.proto-2col,.proto-3col{grid-template-columns:1fr}}
+<meta charset="utf-8"/>
+<meta content="width=device-width,initial-scale=1" name="viewport"/>
+<title>FlowOrder · 订单行动 Copilot</title>
 
-    /* —— 模块分组小标题：细横线 + 大写小字，明确模块边界 —— */
-    .section-title{
-      display:flex;align-items:center;gap:10px;
-      font-size:11px;font-weight:600;letter-spacing:.08em;
-      text-transform:uppercase;color:var(--muted);
-      margin:6px 2px -10px;
-    }
-    .section-title::after{content:"";flex:1;height:1px;background:var(--line)}
-
-    /* —— 面板/卡片边框微调,让模块轮廓更利落 —— */
-    .panel,.order-card,.info-card,.risk-item,.result-card,.review-card,
-    .candidate-row,.integration-item,.context-chip,.meta-item,.channel-option label,
-    .activation-order,.permission-card,.ai-result,.agent-candidate-card,.agent-connection-card,
-    .approval-list>article,.information-gap-list article,
-    .confirm-card,.quick-entry,.session-item{
-      border-color:var(--line-strong);
-    }
-    .mini-chart{width:100%;height:200px;display:block}
-    .row-actions{display:flex;gap:8px;flex-wrap:wrap}
-    .panel .panel-head{display:flex;align-items:center;justify-content:space-between}
-    .order-hero{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end;margin-top:6px}
-    .order-hero .stat{display:flex;flex-direction:column;gap:2px}
-    .order-hero .stat small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
-    .order-hero .stat strong{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
-    .timeline{list-style:none;margin:0;padding:0}
-    .timeline li{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
-    .timeline li:last-child{border-bottom:none}
-    .timeline .dot{width:9px;height:9px;border-radius:50%;margin-top:5px;background:var(--brand);flex:none}
-    .timeline .dot.muted{background:var(--muted-2)}
-    .demo-note{font-size:11px;color:var(--muted)}
-
-    /* —— 今日工作台：快捷入口 —— */
-    .quick-entries{display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 4px}
-    .quick-entry{display:flex;align-items:center;gap:8px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#fff;font-size:13px;font-weight:500;color:var(--ink);cursor:pointer;transition:border-color .15s var(--ease)}
-    .quick-entry:hover{border-color:var(--line-strong)}
-    .quick-entry .metric-icon{width:28px;height:28px;border-radius:8px;background:var(--surface-2);display:inline-flex;align-items:center;justify-content:center}
-
-    /* —— Agent 助手：三栏 —— */
-    .agent-3col{display:grid;grid-template-columns:230px 1fr 1fr;gap:18px;align-items:stretch;min-height:560px}
-    @media(max-width:1080px){.agent-3col{grid-template-columns:1fr}}
-    .session-list{display:flex;flex-direction:column;gap:8px}
-    .session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;text-align:left}
-    .session-item:hover{border-color:var(--line-strong)}
-    .session-item.active{border-color:var(--brand);background:var(--brand-soft)}
-    .session-item .s-when{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
-    .session-item .s-title{font-size:13px;font-weight:500;color:var(--ink);margin-top:3px}
-    .chat{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
-    .chat-bubble{max-width:86%;padding:10px 13px;border-radius:12px;font-size:13px;line-height:1.55}
-    .chat-bubble.user{align-self:flex-end;background:var(--brand);color:#fff;border-bottom-right-radius:4px}
-    .chat-bubble.agent{align-self:flex-start;background:var(--surface-2);color:var(--ink);border:1px solid var(--line);border-bottom-left-radius:4px}
-    .chat-bubble .c-time{display:block;font-size:10.5px;opacity:.6;margin-top:4px}
-    .chat-input{display:flex;gap:8px;margin-top:14px}
-    .chat-input input{flex:1;height:38px;border:1px solid var(--line);border-radius:10px;padding:0 12px;font-size:13px}
-    .chat-input input:focus{outline:none;border-color:var(--brand)}
-    .run-row{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
-    .run-row:last-child{border-bottom:none}
-    .run-row .r-label{width:84px;flex:none;color:var(--muted);font-weight:500}
-    .run-row .r-val{flex:1}
-    .trace{list-style:none;margin:0;padding:0;font-size:12.5px}
-    .trace li{display:flex;gap:8px;padding:6px 0;color:var(--ink-2)}
-    .trace li::before{content:"›";color:var(--brand);font-weight:700}
-
-    /* —— 标签/来源 —— */
-    .src-tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}
-    .src-tag.manual{background:var(--surface-3);color:var(--muted)}
-    .src-tag.msg{background:var(--accent-soft);color:var(--accent)}
-    .src-tag.agent{background:var(--brand-soft);color:var(--brand-700)}
-    .src-tag.wait{background:var(--amber-soft);color:var(--amber)}
-
-    /* —— 订单详情页签 —— */
-    .tabs{display:flex;gap:4px;padding:0 20px;border-bottom:1px solid var(--line);background:#fff}
-    .tab{padding:12px 14px;font-size:13px;font-weight:500;color:var(--muted);border-bottom:2px solid transparent;cursor:pointer;background:none;border-top:none;border-left:none;border-right:none}
-    .tab:hover{color:var(--ink)}
-    .tab.active{color:var(--brand-700);border-bottom-color:var(--brand);font-weight:600}
-    .tab-panel{display:none}
-    .tab-panel.active{display:block}
-
-    /* —— 确认中心卡片 —— */
-    .confirm-list{display:flex;flex-direction:column;gap:14px}
-    .confirm-card{border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;background:#fff}
-    .confirm-card .cc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-    .cc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px 20px;font-size:12.5px}
-    .cc-grid .cc-k{color:var(--muted);font-weight:500}
-    .cc-grid .cc-v{color:var(--ink)}
-    .cc-evidence{margin-top:10px;padding:10px 12px;background:var(--surface-2);border-radius:8px;font-size:12.5px;color:var(--ink-2);border-left:3px solid var(--line-strong)}
-
-    /* —— 消息中心流程 —— */
-    .flow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:10px 0 16px;font-size:12px;color:var(--muted)}
-    .flow .step{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px solid var(--line);border-radius:999px;background:#fff}
-    .flow .arrow{color:var(--muted-2)}
-    .src-pick{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px}
-
-    /* —— V3 借鉴：状态 / 运行摘要 / 技术详情 / 筛选 等功能性组件（沿用本稿视觉 token）—— */
-    .status-stack{display:flex;flex-direction:column;gap:6px;width:100%;font-size:11px}
-    .status-line{display:grid;grid-template-columns:8px 1fr auto;gap:7px;align-items:center;color:var(--muted)}
-    .status-line b{font-size:11px;color:var(--ink);font-weight:600}
-    .status-dot{width:7px;height:7px;border-radius:50%;background:var(--muted-2)}
-    .status-dot.ok{background:var(--green)}
-    .status-dot.warn{background:var(--amber)}
-
-    .session-item .s-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:10.5px;color:var(--muted)}
-    .session-item .s-meta span{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;background:var(--surface-2)}
-
-    .agent-run-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
-    .agent-run-summary .summary-cell{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2)}
-    .agent-run-summary small{display:block;color:var(--muted);font-size:10.5px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-    .agent-run-summary strong{font-size:18px;font-variant-numeric:tabular-nums;color:var(--ink)}
-
-    .tech-details{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
-    .tech-details summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;list-style:none}
-    .tech-details summary::-webkit-details-marker{display:none}
-    .tech-box{margin-top:8px;padding:10px 12px;border-radius:8px;background:var(--surface-2);font-size:11.5px;color:var(--ink-2);line-height:1.7;word-break:break-word}
-
-    .confirm-filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-    .confirm-filter{height:30px;padding:0 11px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);font-size:12px;cursor:pointer}
-    .confirm-filter.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand-700);font-weight:600}
-
-    .business-note{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--amber-soft);color:var(--ink-2);font-size:12px;line-height:1.6}
-
-    /* —— 导航项图标：data-icon 移到独立 .icon 容器，避免覆盖文字 —— */
-    .nav-item .icon{display:grid;place-items:center;flex:0 0 auto}
-    .nav-item .icon svg{width:100%;height:100%}
-  </style>
-</head>
+<link href="/static/d19.css?v=d19-shadow-v1" rel="stylesheet"/></head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar" id="sidebar">
-      <button class="brand" data-route="today" aria-label="返回今日工作台">
-        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span class="brand-copy"><strong>FlowOrder</strong><small>AI外贸跟单行动系统</small></span>
-      </button>
+<div class="login-screen" id="loginScreen">
+<div class="login-layout">
+<section class="login-brand-panel">
+<div class="login-brand-mark">F</div>
+<div class="login-brand-copy">
+<div class="login-brand-name">FlowOrder</div>
+<div class="login-brand-sub">订单行动 Copilot</div>
+</div>
+<div class="login-value">
+<div class="login-eyebrow">FOREIGN TRADE ORDER COPILOT</div>
+<h1>把每天最该处理的订单，<br/>放到你面前。</h1>
+<p>连接订单事实、风险排序、Agent 建议、人工确认与跟进状态，让一线跟单从“找问题”转向“解决问题”。</p>
+</div>
+<div class="login-feature-list">
+<div><span>01</span><strong>今日行动优先级</strong><small>先看谁、为什么、现在能做什么</small></div>
+<div><span>02</span><strong>受控 Agent 协助</strong><small>给建议、起草、分析，但不越过人工边界</small></div>
+<div><span>03</span><strong>业务状态可追踪</strong><small>任务、等待、确认和异常都有明确下一步</small></div>
+</div>
+<div class="login-brand-footer">FlowOrder · Order Action Workspace</div>
+</section>
+<section class="login-form-panel">
+<div class="login-form-wrap">
+<div class="login-form-header">
+<div class="mobile-login-brand"><span>F</span><strong>FlowOrder</strong></div>
+<div class="login-kicker">欢迎回来</div>
+<h2>登录 FlowOrder</h2>
+<p>使用你的工作账号进入订单行动工作台。</p>
+</div>
+<form class="login-form" id="loginForm" novalidate="">
+<label>
+<span>账号</span>
+<input autocomplete="username" id="loginUsername" placeholder="请输入账号" type="text" value="limin"/>
+</label>
+<label>
+<span>密码</span>
+<div class="password-field">
+<input autocomplete="current-password" id="loginPassword" placeholder="请输入密码" type="password" value="demo123"/>
+<button aria-label="显示密码" id="togglePassword" type="button">显示</button>
+</div>
+</label>
+<div class="login-error hidden" id="loginError"></div>
+<button class="login-submit" id="loginSubmit" type="submit">登录</button>
+</form>
+<div class="demo-accounts">
+<div class="demo-title">演示账号</div>
+<button class="demo-account" data-demo-user="limin" type="button">
+<div><strong>李敏</strong><span>跟单员</span></div><small>limin / demo123</small>
+</button>
+<button class="demo-account" data-demo-user="manager" type="button">
+<div><strong>王主管</strong><span>主管</span></div><small>manager / demo123</small>
+</button>
+<button class="demo-account" data-demo-user="admin" type="button">
+<div><strong>系统管理员</strong><span>管理员</span></div><small>admin / demo123</small>
+</button>
+</div>
+<div class="login-note">内部试用环境 · 登录身份将由服务端校验。</div>
+</div>
+</section>
+</div>
+</div>
+<div class="authenticated-app hidden" id="authenticatedApp">
+<div class="app-shell">
+<aside class="sidebar">
+<div class="brand">
+<div class="logo">F</div>
+<div>
+<div class="brand-name">FlowOrder</div>
+<div class="brand-sub">订单行动 Copilot</div>
+</div>
+</div>
+<div class="nav-section-title">工作台</div>
+<nav class="nav">
+<button class="nav-item active" data-view="today">
+<span class="nav-icon"></span><span>今日跟单</span>
+</button>
+<button class="nav-item" data-view="confirm">
+<span class="nav-icon"></span><span>待确认</span><span class="badge badge-red">3</span>
+</button>
+<button class="nav-item" data-view="orders">
+<span class="nav-icon"></span><span>订单</span>
+</button>
+<button class="nav-item" data-view="review">
+<span class="nav-icon"></span><span>复盘</span>
+</button>
+</nav>
+<div class="nav-section-title system-title">系统</div>
+<nav class="nav">
+<button class="nav-item role-manager-up" data-view="exceptions">
+<span class="nav-icon"></span><span>异常中心</span>
+</button>
+<button class="nav-item role-manager-up" data-view="agent">
+<span class="nav-icon"></span><span>Agent运行</span>
+</button>
+<button class="nav-item role-admin-only" data-view="settings">
+<span class="nav-icon"></span><span>管理设置</span>
+</button>
+</nav>
+<div class="sync-card">
+<div class="sync-row">
+<span class="sync-dot"></span>
+<div>
+<div class="sync-title">同步正常</div>
+<div class="sync-sub">ERPNext / Excel 已连接</div>
+</div>
+</div>
+</div>
+</aside>
+<main class="main">
+<header class="topbar">
+<div class="page-heading">
+<div class="eyebrow">FLOWORDER</div>
+<h1 id="pageTitle">今日跟单</h1>
+</div>
+<div class="topbar-right">
+<div class="search"><input aria-label="全局搜索" id="globalSearch" placeholder="搜索订单 / 客户" type="search"/></div>
+<button aria-expanded="false" class="account-button" id="accountButton" type="button">
+<div class="avatar" id="topAvatar">李</div>
+<div class="user-meta">
+<strong id="topUserName">李敏</strong>
+<span id="topUserRole">跟单员</span>
+</div>
+<span class="account-chevron">⌄</span>
+</button>
+<div class="account-menu hidden" id="accountMenu">
+<div class="account-menu-profile">
+<div class="menu-avatar" id="menuAvatar">李</div>
+<div>
+<strong id="menuUserName">李敏</strong>
+<span id="menuUserRole">跟单员</span>
+</div>
+</div>
+<button id="profileAction" type="button">个人信息</button>
+<button class="logout-action" id="logoutButton" type="button">退出登录</button>
+</div>
+</div>
+</header>
+<section class="view active" id="view-today">
+<div class="today-grid">
+<aside class="copilot-panel card">
+<div class="panel-title">跟单 Copilot</div>
+<div class="panel-divider"></div>
+<div class="copilot-section">
+<div class="section-label">最近影响计划的新变化</div>
+<div class="change-alert">
+<div class="change-title">供应商回复：SO-1048 原料晚到 1 天</div>
+<div class="change-desc">影响：生产节点可能推迟，交付风险上升</div>
+<div class="change-link">→ 订单从“今天做”提升到“现在做”</div>
+</div>
+</div>
+<div class="copilot-grow"></div>
+<div class="copilot-section common-actions">
+<div class="section-label">常用操作</div>
+<button class="quick-action" data-prompt="为什么这个订单排第一？">为什么这个订单排第一？</button>
+<button class="quick-action" data-prompt="帮我写一条催交通知。">帮我写一条催交通知</button>
+<button class="quick-action" data-prompt="我已经联系过谁？">我已经联系过谁？</button>
+</div>
+<div class="copilot-input-wrap">
+<div class="input-label">补充新信息</div>
+<div class="input-helper">粘贴客户 / 供应商消息，或直接说出最新进展…</div>
+<textarea id="copilotInput" placeholder="例如：供应商刚刚说 8 月 20 日应该可以做完，但是还没有完全确认。"></textarea>
+<button aria-label="语音输入" class="voice-btn" id="voiceBtn" title="语音输入">
+<svg aria-hidden="true" viewbox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a1 1 0 0 0-2 0 3 3 0 0 1-6 0 1 1 0 0 0-2 0 5 5 0 0 0 4 4.9V18H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.1A5 5 0 0 0 17 11Z"></path></svg>
+</button>
+<div class="voice-status hidden" id="voiceStatus"></div>
+<div class="uncertainty-hint hidden" id="uncertaintyHint"></div>
+<div class="copilot-footer">
+<div class="source-picker-wrap">
+<button class="btn btn-ghost" id="sourcePickerBtn">选择来源</button>
+<div class="source-picker hidden" id="sourcePicker">
+<button data-source="供应商消息">供应商消息</button>
+<button data-source="客户消息">客户消息</button>
+<button data-source="电话记录">电话记录</button>
+<button data-source="ERP">ERP</button>
+<button data-source="其他">其他</button>
+</div>
+</div>
+<button class="btn btn-primary" id="analyzeBtn">分析信息</button>
+</div>
+<div class="analysis-result hidden" id="copilotAnalysisResult">
+<div class="analysis-result-head">
+<strong>分析结果</strong>
+<span class="mini-badge" id="analysisSourceBadge">未选择来源</span>
+</div>
+<div class="analysis-block">
+<span>识别到的事实</span>
+<strong id="analysisFact">—</strong>
+</div>
+<div class="analysis-block">
+<span>事实确定性</span>
+<strong id="analysisCertainty">—</strong>
+</div>
+<div class="analysis-block">
+<span>对订单的影响</span>
+<strong id="analysisImpact">—</strong>
+</div>
+<div class="analysis-block">
+<span>建议下一步</span>
+<textarea class="analysis-suggestion" id="analysisSuggestion" readonly=""></textarea>
+</div>
+<div class="analysis-result-actions">
+<button class="btn btn-ghost small" id="rejectAnalysis">暂不采用</button>
+<button class="btn btn-ghost small" id="editAnalysis">修改后采用</button>
+<button class="btn btn-primary small" id="adoptAnalysis">采用建议</button>
+</div>
+</div>
+</div>
+</aside>
+<div class="today-content">
+<div class="section-head row-between">
+<div>
+<h2>现在先做</h2>
+<p>完整待办行动队列 12 项；首页先展示当前注意力窗口。</p>
+</div>
+<div class="pills">
+<span class="pill pill-blue">今日行动 12</span>
+<span class="pill pill-red">高优先 4</span>
+</div>
+</div>
+<div class="priority-list" id="priorityList">
+<button class="order-row draggable-order" data-order="SO-1048" draggable="true"><span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+<span class="rank">1</span>
+<span class="order-main">
+<strong>SO-1048 · Northwind</strong>
+<small>供应商原料晚到，可能影响 8/20 客户交期</small>
+</span>
+<span class="order-side">
+<span class="pill pill-red">现在做</span>
+<small>交期风险 · 25 分钟前</small>
+</span>
+</button>
+<button class="order-row draggable-order" data-order="SO-1061" draggable="true"><span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+<span class="rank">2</span>
+<span class="order-main">
+<strong>SO-1061 · Blue Harbor</strong>
+<small>明日需出货，但物流资料尚未确认</small>
+</span>
+<span class="order-side">
+<span class="pill pill-red">现在做</span>
+<small>物流异常 · 1 小时前</small>
+</span>
+</button>
+<button class="order-row draggable-order" data-order="SO-1032" draggable="true"><span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+<span class="rank">3</span>
+<span class="order-main">
+<strong>SO-1032 · Alpine</strong>
+<small>客户包装规格变化尚未确认，生产被阻塞 1 个节点</small>
+</span>
+<span class="order-side">
+<span class="pill pill-amber">需要确认</span>
+<small>客户确认阻塞</small>
+</span>
+</button>
+<button class="order-row draggable-order" data-order="SO-1027" draggable="true"><span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+<span class="rank">4</span>
+<span class="order-main">
+<strong>SO-1027 · Lumière</strong>
+<small>供应商承诺回复时间已过 40 分钟</small>
+</span>
+<span class="order-side">
+<span class="pill pill-blue">今天做</span>
+<small>承诺超期</small>
+</span>
+</button>
+<button class="order-row draggable-order" data-order="SO-1054" draggable="true"><span class="drag-handle" title="拖动调整顺序">⋮⋮</span>
+<span class="rank">5</span>
+<span class="order-main">
+<strong>SO-1054 · Meridian</strong>
+<small>订单负责人尚未明确，今日需要补齐责任人</small>
+</span>
+<span class="order-side">
+<span class="pill pill-blue">今天做</span>
+<small>负责人缺失</small>
+</span>
+</button>
+</div>
+<div class="list-footer">
+<span>还有 7 项今日行动</span>
+<button class="text-btn" id="openFullQueue">查看完整队列 →</button>
+</div>
+<div class="section-head waiting-head"><h2>正在等待</h2></div>
+<button class="waiting-card waiting-card-button" data-order="SO-1015">
+<span class="pill pill-green">等待外部</span>
+<div>
+<strong>SO-1015 · 已催供应商确认新完工时间</strong>
+<small>明天 15:00 前无回复，将自动恢复为今日行动</small>
+</div>
+</button>
+</div>
+</div>
+</section>
+<section class="view" id="view-confirm">
+<div class="content-narrow">
+<div class="confirm-topline">
+<div class="section-head">
+<h2>需要你确认</h2>
+<p><span id="confirmPendingCount">3</span> 项待处理 · <span id="approvalPendingCount">0</span> 项审批中。</p>
+</div>
+<div>
+<div class="bulk-actions">
+<label class="select-all"><input id="selectAllConfirm" type="checkbox"/> 全选</label>
+<span id="selectedConfirmCount">已选 0 项</span>
+<button class="btn btn-ghost" disabled="" id="bulkReject">批量暂不采用</button>
+<button class="btn btn-primary" disabled="" id="bulkConfirm">批量确认</button>
+</div>
+<div class="batch-risk-summary" id="batchRiskSummary">
+<span class="risk-count">普通 <strong id="normalSelected">0</strong></span>
+<span class="risk-count">重要 <strong id="importantSelected">0</strong></span>
+<span class="risk-count">高风险 <strong id="highSelected">0</strong></span>
+</div>
+</div>
+</div>
+<div id="confirmList">
+<div class="confirm-card selectable" data-confirm-id="C-1032" data-order-id="SO-1032" data-risk="important">
+<label class="confirm-select"><input aria-label="选择 SO-1032" class="confirm-checkbox" type="checkbox"/></label>
+<div class="confirm-content">
+<span class="pill pill-red-soft">待确认</span><span class="confirm-risk risk-important">重要</span>
+<h3>SO-1032 · Alpine</h3>
+<p>供应商给出的预计完工日期 8/19。是否确认这条变化？</p>
+<small>影响：若确认，交付风险将重新计算。</small>
+</div>
+<div class="confirm-actions">
+<button class="btn btn-ghost single-reject">暂不采用</button>
+<button class="btn btn-primary single-confirm">确认并继续</button>
+</div>
+</div>
+<div class="confirm-card selectable high-risk" data-confirm-id="C-1071" data-order-id="SO-1071" data-risk="high">
+<label class="confirm-select"><input aria-label="选择 SO-1071" class="confirm-checkbox" type="checkbox"/></label>
+<div class="confirm-content">
+<span class="pill pill-red-soft">待确认</span><span class="confirm-risk risk-high">高风险 · 需主管审批</span>
+<h3>SO-1071 · Delta</h3>
+<p>客户提出包装规格修改。该变化可能影响正式订单事实，需要主管确认后才能生效。</p>
+<small>来源：客户邮件 · 16:20</small>
+</div>
+<div class="confirm-actions">
+<button class="btn btn-ghost single-reject">暂不采用</button>
+<button class="btn btn-primary single-confirm">确认并继续</button>
+</div>
+</div>
+<div class="confirm-card selectable high-risk" data-confirm-id="C-1009" data-order-id="SO-1009" data-risk="high">
+<label class="confirm-select"><input aria-label="选择 SO-1009" class="confirm-checkbox" type="checkbox"/></label>
+<div class="confirm-content">
+<span class="pill pill-amber">来源冲突</span><span class="confirm-risk risk-high">高风险</span>
+<h3>SO-1009 · Vector</h3>
+<p>系统识别到两条交期来源冲突。交期属于关键业务事实，不能作为普通待确认项直接静默确认。</p>
+<small>ERP：8/22 · 邮件：8/20</small>
+</div>
+<div class="confirm-actions">
+<button class="btn btn-ghost single-reject">暂不采用</button>
+<button class="btn btn-primary single-confirm">确认并继续</button>
+</div>
+</div>
+</div>
+<div class="empty-state hidden" id="confirmEmpty">
+<strong>当前没有待确认事项</strong>
+<span>新的事实变化或来源冲突出现后会显示在这里。</span>
+</div>
+</div>
+</section>
+<section class="view" id="view-orders">
+<div class="content-narrow orders-page">
+<div class="orders-toolbar">
+<div>
+<h2>订单</h2><p>共 33 张进行中订单</p>
+</div>
+<div class="toolbar-actions">
+<div class="search compact"><input aria-label="订单页搜索" id="ordersSearch" placeholder="搜索订单 / 客户" type="search"/></div>
+<button class="btn btn-ghost" id="ordersFilterBtn">筛选</button>
+</div>
+</div>
+<div class="orders-filter-panel hidden" id="ordersFilterPanel">
+<label>阶段
+            <select id="filterStage">
+<option value="">全部</option>
+<option value="生产">生产</option>
+<option value="出货">出货</option>
+<option value="备货">备货</option>
+</select>
+</label>
+<label>状态
+            <select id="filterStatus">
+<option value="">全部</option>
+<option value="attention">需要关注</option>
+<option value="waiting">等待反馈</option>
+<option value="normal">正常推进</option>
+</select>
+</label>
+<label>负责人
+            <select id="filterOwner">
+<option value="">全部</option>
+<option value="李敏">李敏</option>
+<option value="王晨">王晨</option>
+</select>
+</label>
+<button class="btn btn-ghost small" id="resetFilters">重置</button>
+</div>
+<div class="search-empty hidden" id="ordersEmpty">没有找到匹配订单</div>
+<div class="order-group" data-group="attention" data-total="6">
+<button aria-expanded="true" class="group-head group-toggle">
+<span class="group-chevron">⌄</span><strong>需要关注</strong><span class="group-count">6 张</span>
+</button>
+<div class="group-body">
+<button class="group-order" data-order="SO-1048" data-search="SO-1048 Northwind 生产 原料晚到 客户交期 现在做">
+<span><strong>SO-1048</strong><small>Northwind</small></span><span>生产</span><span>原料晚到，客户交期可能受影响</span><span class="pill pill-red">现在做</span>
+</button>
+<button class="group-order" data-order="SO-1061" data-search="SO-1061 Blue Harbor 出货 明日发货 物流资料 现在做">
+<span><strong>SO-1061</strong><small>Blue Harbor</small></span><span>出货</span><span>明日需发货，物流资料未确认</span><span class="pill pill-red">现在做</span>
+</button>
+<button class="group-order" data-order="SO-1032" data-search="SO-1032 Alpine 生产 客户包装格式 待确认">
+<span><strong>SO-1032</strong><small>Alpine</small></span><span>生产</span><span>客户包装格式等待确认</span><span class="pill pill-amber">待确认</span>
+</button>
+</div>
+</div>
+<div class="order-group" data-group="waiting" data-total="4">
+<button aria-expanded="true" class="group-head group-toggle">
+<span class="group-chevron">⌄</span><strong>等待反馈</strong><span class="group-count">4 张</span>
+</button>
+<div class="group-body">
+<button class="group-order" data-order="SO-1015" data-search="SO-1015 Nexa 生产 等待供应商 新完工时间">
+<span><strong>SO-1015</strong><small>Nexa</small></span><span>生产</span><span>已催供应商，等待新完工时间</span><span class="pill pill-green">等待至明日 15:00</span>
+</button>
+<button class="group-order" data-order="SO-1090" data-search="SO-1090 Kite 备货 客户资料 等待外部">
+<span><strong>SO-1090</strong><small>Kite</small></span><span>备货</span><span>客户承诺今天下午补齐资料</span><span class="pill pill-green">等待外部</span>
+</button>
+</div>
+</div>
+<div class="order-group collapsed" data-group="normal" data-total="23">
+<button aria-expanded="false" class="group-head group-toggle">
+<span class="group-chevron">›</span><strong>正常推进</strong><span class="group-count">23 张</span>
+</button>
+<div class="group-body hidden">
+<button class="group-order" data-order="SO-1088" data-search="SO-1088 Atlas 生产 正常推进">
+<span><strong>SO-1088</strong><small>Atlas</small></span><span>生产</span><span>生产按计划推进，无新增异常</span><span class="pill pill-blue">正常</span>
+</button>
+<button class="group-order" data-order="SO-1112" data-search="SO-1112 Cedar 备货 正常推进">
+<span><strong>SO-1112</strong><small>Cedar</small></span><span>备货</span><span>备货完成度正常，暂无需人工介入</span><span class="pill pill-blue">正常</span>
+</button>
+<button class="group-order" data-order="SO-1120" data-search="SO-1120 Horizon 出货 正常推进">
+<span><strong>SO-1120</strong><small>Horizon</small></span><span>出货</span><span>物流资料完整，等待计划出货</span><span class="pill pill-blue">正常</span>
+</button>
+<div class="collapsed-note">当前仅展示部分正常推进订单。<span>23 张正常推进</span></div>
+</div>
+</div>
+</div>
+</section>
+<section class="view" id="view-review">
+<div class="content-narrow review-page review-page-v4">
+<div class="review-overview-grid">
+<div class="review-overview-main">
+<div class="section-head review-title-block">
+<h2>今日复盘</h2>
+<p>2026-08-18 · 明日计划会成为下一次“今日跟单”的初始参考。</p>
+</div>
+<div class="review-stats-row">
+<div class="stat-card compact-stat">
+<small>今天完成</small>
+<strong>8</strong>
+</div>
+<div class="stat-card compact-stat">
+<small>仍在等待</small>
+<strong>5</strong>
+</div>
+<div class="stat-card compact-stat">
+<small>还没收口</small>
+<strong>3</strong>
+</div>
+<div class="stat-card compact-stat">
+<small>关键变化</small>
+<strong>6</strong>
+</div>
+<div aria-label="近五天处理订单数量折线图" class="stat-card trend-card">
+<div class="trend-card-head">
+<small>近 5 天处理</small>
+<strong>35</strong>
+</div>
+<svg aria-label="8月14日至8月18日处理订单数量：6、7、5、9、8" class="trend-chart" role="img" viewbox="0 0 220 76">
+<line class="trend-grid-line" x1="14" x2="208" y1="58" y2="58"></line>
+<line class="trend-grid-line" x1="14" x2="208" y1="35" y2="35"></line>
+<polyline class="trend-line" points="18,45 65,38 112,52 159,20 205,29"></polyline>
+<circle class="trend-point" cx="18" cy="45" r="3.5"><title>08/14：6 单</title></circle>
+<circle class="trend-point" cx="65" cy="38" r="3.5"><title>08/15：7 单</title></circle>
+<circle class="trend-point" cx="112" cy="52" r="3.5"><title>08/16：5 单</title></circle>
+<circle class="trend-point" cx="159" cy="20" r="3.5"><title>08/17：9 单</title></circle>
+<circle class="trend-point" cx="205" cy="29" r="3.5"><title>08/18：8 单</title></circle>
+<text text-anchor="middle" x="18" y="72">14</text>
+<text text-anchor="middle" x="65" y="72">15</text>
+<text text-anchor="middle" x="112" y="72">16</text>
+<text text-anchor="middle" x="159" y="72">17</text>
+<text text-anchor="middle" x="205" y="72">18</text>
+</svg>
+</div>
+</div>
+<div class="review-unclosed-block">
+<h2>还没收口</h2>
+<p>这些事项不会因为今天结束而消失。</p>
+<div class="review-list review-list-v4">
+<button class="review-item review-order-item" data-order="SO-1048">
+<strong>SO-1048</strong>
+<span>供应商原料晚到，仍需确认新生产计划</span>
+<span class="pill pill-red">现在做</span>
+</button>
+<button class="review-item review-order-item" data-order="SO-1032">
+<strong>SO-1032</strong>
+<span>包装规格修改等待客户/内部确认</span>
+<span class="pill pill-amber">待确认</span>
+</button>
+<button class="review-item review-order-item" data-order="SO-1015">
+<strong>SO-1015</strong>
+<span>已催供应商，等待明日 15:00 回复</span>
+<span class="pill pill-green">等待中</span>
+</button>
+</div>
+</div>
+</div>
+<aside class="review-changes-column">
+<h2>今日关键变化</h2>
+<div class="changes-card changes-card-v4">
+<button class="review-change-row" data-order="SO-1048">• SO-1048：生产风险上升</button>
+<button class="review-change-row" data-order="SO-1061">• SO-1061：物流未确认</button>
+<button class="review-change-row" data-order="SO-1032">• SO-1032：新增客户变更</button>
+<button class="review-change-row" data-order="SO-1015">• SO-1015：进入等待状态</button>
+</div>
+</aside>
+</div>
+<div class="tomorrow-card">
+<div class="tomorrow-head">
+<div>
+<h2>明日计划</h2>
+<p>可以直接编辑、添加或删除。保存后只作为明日初始参考，新信息仍可动态重排。</p>
+</div>
+<button class="btn btn-ghost" id="addTomorrowPlan">＋ 添加一项</button>
+</div>
+<div class="plan-edit-list" id="tomorrowPlanList">
+<div class="plan-edit-row">
+<input type="checkbox"/>
+<input class="plan-text" type="text" value="上午优先确认 SO-1048 新生产计划"/>
+<button class="plan-delete" title="删除">×</button>
+</div>
+<div class="plan-edit-row">
+<input type="checkbox"/>
+<input class="plan-text" type="text" value="10:00 跟进 SO-1061 物流资料"/>
+<button class="plan-delete" title="删除">×</button>
+</div>
+<div class="plan-edit-row">
+<input type="checkbox"/>
+<input class="plan-text" type="text" value="15:00 检查 SO-1015 是否收到供应商回复"/>
+<button class="plan-delete" title="删除">×</button>
+</div>
+</div>
+<button class="btn btn-primary save-plan" id="saveTomorrowPlan">保存明日计划</button>
+</div>
+</div>
+</section>
+<section class="view system-view" id="view-exceptions">
+<div class="content-narrow">
+<div class="section-head"><h2>异常中心</h2><p>只展示需要行动的异常状态，不把所有技术错误都变成用户告警。</p></div>
+<div class="system-cards">
+<div class="system-card danger-card">
+<div><span class="state-dot state-red"></span><strong>RESULT_UNCERTAIN</strong></div>
+<h3>SO-1142 · 外部动作结果暂无法确认</h3>
+<p>自动重试已暂停。请先核对外部系统是否已经执行，避免重复产生业务副作用。</p>
+<div class="system-actions"><button class="btn btn-primary small">核对结果</button><button class="btn btn-ghost small">转人工处理</button></div>
+</div>
+<div class="system-card warning-card">
+<div><span class="state-dot state-amber"></span><strong>ERP 数据已过期</strong></div>
+<h3>最近一次成功同步：今天 14:32</h3>
+<p>页面仍可查看最近一次成功快照，但当前状态不代表实时 ERP 数据。</p>
+<div class="system-actions"><button class="btn btn-ghost small">重新同步</button></div>
+</div>
+<div class="system-card">
+<div><span class="state-dot state-purple"></span><strong>HUMAN_REQUIRED</strong></div>
+<h3>1 项流程需要人工接管</h3>
+<p>自动流程已停止，等待主管完成核对或授权后继续。</p>
+<div class="system-actions"><button class="btn btn-ghost small">查看待处理</button></div>
+</div>
+</div>
+</div>
+</section>
+<section class="view system-view" id="view-agent">
+<div class="content-narrow">
+<div class="section-head"><h2>Agent运行</h2><p>展示业务执行 Trace，不展示隐藏思维链。</p></div>
+<div class="trace-table">
+<div class="trace-row trace-head"><span>时间</span><span>订单</span><span>动作</span><span>结果</span><span>模型/工具</span></div>
+<div class="trace-row"><span>16:42</span><span>SO-1048</span><span>读取订单上下文 → 建议跟进供应商</span><span class="trace-ok">完成</span><span>GLM-5.2 / read</span></div>
+<div class="trace-row"><span>16:18</span><span>SO-1032</span><span>识别客户包装变更 → 请求确认</span><span class="trace-wait">待确认</span><span>GLM-5.2 / request_fact</span></div>
+<div class="trace-row"><span>15:50</span><span>SO-1015</span><span>记录已联系 → Waiting</span><span class="trace-ok">完成</span><span>Controlled Tool</span></div>
+</div>
+</div>
+</section>
+<section class="view system-view" id="view-settings">
+<div class="content-narrow">
+<div class="section-head"><h2>管理设置</h2><p>增量能力可以安全关闭；Human Review 等安全控制不可关闭。</p></div>
+<div class="settings-list">
+<label class="setting-row"><div><strong>Agent Assist</strong><span>关闭后人工工作台仍可使用</span></div><input checked="" type="checkbox"/></label>
+<label class="setting-row"><div><strong>Attention Dashboard</strong><span>关闭后回到普通订单/工作台，不回旧排序策略</span></div><input checked="" type="checkbox"/></label>
+<label class="setting-row"><div><strong>ERP Read-only Sync</strong><span>关闭后保留最近一次成功快照并显示数据新鲜度</span></div><input checked="" type="checkbox"/></label>
+<label class="setting-row locked-setting"><div><strong>External Action Dispatch</strong><span>当前外部执行能力未启用，保持关闭</span></div><input disabled="" type="checkbox"/></label>
+<label class="setting-row locked-setting"><div><strong>Human Review</strong><span>安全控制，不属于 Feature Flag</span></div><span class="locked-badge">始终开启</span></label>
+</div>
+</div>
+</section>
+</main>
+</div>
+</div>
+<div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+<aside class="drawer" id="orderDrawer">
+<button class="drawer-close" id="closeDrawer">×</button>
+<div class="drawer-inner">
+<div class="drawer-kicker">订单最新进度</div>
+<h2 id="drawerTitle">SO-1048 · Northwind</h2>
+<div class="drawer-status" id="drawerStatus">等待包</div>
+<div class="meta-grid">
+<span>客户交期</span><strong class="danger" id="drawerDueDate">2026/08/20</strong>
+<span>当前阶段</span><strong id="drawerStage">生产</strong>
+<span>当前关注</span><strong class="danger" id="drawerAttention">交期异常</strong>
+</div>
+<div class="drawer-divider"></div>
+<div class="drawer-process-progress hidden" id="drawerProcessProgress">
+<div class="process-progress-head">
+<div>
+<span>流程进度</span>
+<strong id="drawerProcessStageLabel">—</strong>
+</div>
+<span id="drawerProcessStepLabel">—</span>
+</div>
+<div class="process-progress-track">
+<div class="process-progress-fill" id="drawerProcessFill"></div>
+</div>
+<div class="process-progress-steps">
+<span data-step="1">接单</span>
+<span data-step="2">备货</span>
+<span data-step="3">生产</span>
+<span data-step="4">出货</span>
+<span data-step="5">交付</span>
+</div>
+</div>
+<div class="drawer-data-notice hidden" id="drawerDataNotice"></div>
+<div class="drawer-section-title" id="drawerTimelineTitle">流程时间轴</div>
+<div class="timeline" id="drawerTimeline">
+<div class="timeline-item done">
+<div class="dot"></div><div><strong>接单确认</strong><span>已完成</span></div><button>展开历史</button>
+</div>
+<div class="timeline-item done">
+<div class="dot"></div><div><strong>备货采购</strong><span>已完成</span></div><button>展开历史</button>
+</div>
+<div class="timeline-item current">
+<div class="dot"></div>
+<div class="timeline-body">
+<div class="timeline-title"><strong id="drawerTimelineStage">生产</strong><span>进行中</span></div>
+<p>当前状态</p>
+<strong id="drawerCurrentState">生产 · 交期异常</strong>
+<p>已发生事项</p>
+<strong id="drawerLatestEvent">供应商 16:42 回复：原料晚到 1 天</strong>
+<p>为什么需要关注</p>
+<span id="drawerWhyAttention">客户正式交期为 8 月 20 日；当前供应商尚未给出新的可靠完工承诺，若生产计划继续后移，交付窗口将继续压缩。</span>
+<div class="decision-card">
+<strong>现在有 2 件事可以推进</strong>
+<p>它们属于同一个订单问题，但目前没有可能委托再执行的外部动作。</p>
+<strong id="drawerSuggestedAction">联系供应商确认 8 月 20 日能否交货</strong>
+<div class="decision-actions">
+<button class="btn btn-primary small" id="generateDraftBtn">生成沟通草稿</button>
+<button class="btn btn-ghost small" id="recordContactBtn">记录已联系</button>
+</div>
+<div class="draft-editor hidden" id="draftEditor">
+<label>沟通草稿</label>
+<textarea id="draftText">您好，想跟您确认一下当前订单的最新进度和预计完成时间，烦请确认后回复，谢谢。</textarea>
+<div class="inline-actions">
+<button class="btn btn-ghost small" id="cancelDraft">收起</button>
+<button class="btn btn-primary small" id="saveDraft">保存草稿</button>
+</div>
+</div>
+<div class="waiting-config hidden" id="waitingConfig">
+<div class="waiting-config-grid">
+<label>等待对象
+                  <select id="waitingParty">
+<option value="供应商">供应商</option>
+<option value="客户">客户</option>
+<option value="内部同事">内部同事</option>
+</select>
+</label>
+<label>下一检查时间
+                  <input id="waitingUntil" type="datetime-local" value="2026-08-20T15:00"/>
+</label>
+</div>
+<div class="inline-actions">
+<button class="btn btn-ghost small" id="cancelWaiting">取消</button>
+<button class="btn btn-primary small" id="saveWaiting">保存等待</button>
+</div>
+</div>
+</div>
+<div class="context-note">
+<strong>等待状态</strong>
+<span id="drawerWaitingNote">当前未进入等待；记录已联系后，可设置等待对象与下一检查时间。</span>
+</div>
+<div class="drawer-copilot drawer-copilot-inline">
+<div class="drawer-copilot-head">
+<div>
+<strong>补充最新进展</strong>
+<span>当前订单上下文已锁定。语音会先转成文字，确认后再分析，不会自动执行。</span>
+</div>
+</div>
+<div class="drawer-input-row">
+<textarea id="drawerCopilotInput" placeholder="例如：供应商刚回电，说明天下午才能确认新的完工时间。"></textarea>
+<button aria-label="订单内语音输入" class="voice-btn drawer-voice-btn" id="drawerVoiceBtn" title="语音输入">
+<svg aria-hidden="true" viewbox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a1 1 0 0 0-2 0 3 3 0 0 1-6 0 1 1 0 0 0-2 0 5 5 0 0 0 4 4.9V18H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.1A5 5 0 0 0 17 11Z"></path></svg>
+</button>
+</div>
+<div class="voice-status hidden" id="drawerVoiceStatus"></div>
+<div class="uncertainty-hint hidden" id="drawerUncertaintyHint"></div>
+<div class="drawer-copilot-actions">
+<button class="btn btn-ghost small" id="clearDrawerInput">清空</button>
+<button class="btn btn-primary small" id="analyzeDrawerInfo">分析这条信息</button>
+</div>
+<div class="drawer-analysis-result hidden" id="drawerAnalysisResult">
+<div><span>识别</span><strong id="drawerAnalysisFact">—</strong></div>
+<div><span>影响</span><strong id="drawerAnalysisImpact">—</strong></div>
+<div><span>建议</span><strong id="drawerAnalysisAction">—</strong></div>
+</div>
+</div>
+</div>
+</div>
+<div class="timeline-item pending"><div class="dot"></div><div><strong>出货</strong><span>未开始</span></div></div>
+<div class="timeline-item pending"><div class="dot"></div><div><strong>交付</strong><span>未开始</span></div></div>
+</div>
+</div>
+</aside>
+<div class="modal-backdrop hidden" id="fullQueueBackdrop"></div>
+<div aria-labelledby="queueTitle" aria-modal="true" class="queue-modal hidden" id="fullQueueModal" role="dialog">
+<div class="queue-modal-head">
+<div>
+<div class="eyebrow">TODAY ACTION QUEUE</div>
+<h2 id="queueTitle">今日完整行动队列</h2>
+<p>共 12 项。系统顺序来自 Attention Ranking；个人可手动调整视图顺序。</p>
+</div>
+<button class="drawer-close" id="closeFullQueue">×</button>
+</div>
+<div class="full-queue-list" id="fullQueueList">
+<button class="queue-row draggable-queue-row" data-order="SO-1048" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>1</span><div><strong>SO-1048 · Northwind</strong><small>原料晚到，客户交期风险上升</small></div><span class="pill pill-red">现在做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1061" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>2</span><div><strong>SO-1061 · Blue Harbor</strong><small>明日发货，物流资料未确认</small></div><span class="pill pill-red">现在做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1032" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>3</span><div><strong>SO-1032 · Alpine</strong><small>客户包装变更等待确认</small></div><span class="pill pill-amber">待确认</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1027" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>4</span><div><strong>SO-1027 · Lumière</strong><small>供应商承诺回复时间已过</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1054" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>5</span><div><strong>SO-1054 · Meridian</strong><small>负责人缺失</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1084" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>6</span><div><strong>SO-1084 · Aurora</strong><small>质检报告仍未上传</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1076" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>7</span><div><strong>SO-1076 · Harbor</strong><small>客户确认窗口即将到期</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1102" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>8</span><div><strong>SO-1102 · Maple</strong><small>生产进度与交期缓冲偏紧</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1115" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>9</span><div><strong>SO-1115 · Pine</strong><small>内部资料待补齐</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1124" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>10</span><div><strong>SO-1124 · Solace</strong><small>等待仓库确认</small></div><span class="pill pill-green">等待中</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1130" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>11</span><div><strong>SO-1130 · Terra</strong><small>客户回函今日到期</small></div><span class="pill pill-blue">今天做</span></button>
+<button class="queue-row draggable-queue-row" data-order="SO-1138" draggable="true"><span class="queue-drag-handle" title="拖动调整顺序">⋮⋮</span><span>12</span><div><strong>SO-1138 · Vale</strong><small>低优先级跟进</small></div><span class="pill pill-blue">今天做</span></button>
+</div>
+</div>
+<div class="modal-backdrop hidden" id="riskModalBackdrop"></div>
+<div aria-labelledby="riskModalTitle" aria-modal="true" class="risk-modal hidden" id="riskConfirmModal" role="dialog">
+<h2 id="riskModalTitle">确认批量处理</h2>
+<p id="riskModalDesc">所选事项包含不同风险等级。普通项可以直接处理，重要项需要二次确认，高风险项不会在批量操作中直接生效。</p>
+<div class="risk-modal-list" id="riskModalList"></div>
+<div class="batch-warning hidden" id="riskModalWarning"></div>
+<div class="risk-modal-actions">
+<button class="btn btn-ghost" id="cancelRiskBatch">返回检查</button>
+<button class="btn btn-primary" id="confirmRiskBatch">确认处理可批量项</button>
+</div>
+</div>
+<div class="modal-backdrop hidden" id="singleRiskBackdrop"></div>
+<div aria-modal="true" class="risk-modal hidden" id="singleRiskModal" role="dialog">
+<h2 id="singleRiskTitle">高风险事项</h2>
+<p id="singleRiskDesc">请确认影响范围。该事项不会直接静默生效。</p>
+<div class="batch-warning high" id="singleRiskBody"></div>
+<div class="risk-modal-actions">
+<button class="btn btn-ghost" id="cancelSingleRisk">返回检查</button>
+<button class="btn btn-primary" id="submitSingleRisk">提交主管审批</button>
+</div>
+</div>
+<div class="toast hidden" id="toast"></div>
 
-      <div class="nav-section-label">工作空间</div>
-      <nav class="side-nav" aria-label="主导航">
-        <button class="nav-item" data-route="today"><span class="icon" data-icon="today"></span><span>今日工作台</span><b id="todayBadge" hidden>0</b></button>
-        <button class="nav-item" data-route="agent"><span class="icon" data-icon="agent"></span><span>Agent助手</span></button>
-        <button class="nav-item" data-route="tasks"><span class="icon" data-icon="tasks"></span><span>任务中心</span></button>
-        <button class="nav-item" data-route="orders"><span class="icon" data-icon="orders"></span><span>订单中心</span></button>
-        <button class="nav-item" data-route="intake"><span class="icon" data-icon="message"></span><span>消息中心</span></button>
-        <button class="nav-item" data-route="confirm"><span class="icon" data-icon="review"></span><span>确认中心</span><b id="reviewBadge" hidden>0</b></button>
-      </nav>
-
-      <div class="nav-section-label">管理 · 仅主管</div>
-      <nav class="side-nav" aria-label="管理导航">
-        <button class="nav-item" data-route="manage"><span class="icon" data-icon="chart"></span><span>管理看板</span></button>
-        <button class="nav-item" data-route="settings"><span class="icon" data-icon="settings"></span><span>设置与连接</span></button>
-      </nav>
-
-      <div class="sidebar-card" style="align-items:flex-start">
-        <div class="status-stack" aria-label="系统运行状态">
-          <div class="status-line"><span class="status-dot" id="systemStatusDot"></span><span>系统服务</span><b id="systemStatusValue">检查中</b></div>
-          <div class="status-line"><span class="status-dot" id="agentStatusDot"></span><span>Agent 服务</span><b id="agentStatusValue">检查中</b></div>
-          <div class="status-line"><span class="status-dot" id="scheduleStatusDot"></span><span>定时巡检</span><b id="scheduleStatusValue">检查中</b></div>
-        </div>
-      </div>
-    </aside>
-
-    <section class="app-main">
-      <header class="topbar">
-        <div class="topbar-left">
-          <button class="mobile-menu" id="mobileMenu" aria-label="打开导航" data-icon="menu"></button>
-          <div class="page-heading">
-            <span id="pageEyebrow">TODAY WORKBENCH</span>
-            <h1 id="pageTitle">今日工作台</h1>
-          </div>
-        </div>
-        <div class="topbar-actions">
-          <label class="global-search" id="searchWrap">
-            <span data-icon="search" aria-hidden="true"></span>
-            <input id="globalSearch" type="search" autocomplete="off" placeholder="搜索订单、任务、客户或会话" aria-label="全局搜索" />
-            <kbd>⌘ K</kbd>
-          </label>
-          <button class="icon-btn" id="refreshBtn" title="刷新页面" data-icon="refresh"></button>
-          <button class="profile" id="profileButton" type="button">
-            <span class="avatar" id="profileAvatar">李</span>
-            <span><strong id="profileName">李梅</strong><small id="profileRole">跟单专员 · 演示</small></span>
-            <span data-icon="chevron"></span>
-          </button>
-        </div>
-      </header>
-
-      <main class="workspace" id="pageRoot" tabindex="-1">
-        <div class="loading-state"><span></span><p>正在载入真实业务数据…</p></div>
-      </main>
-    </section>
-  </div>
-
-  <nav class="mobile-nav" aria-label="移动端导航">
-    <button data-route="today" data-icon="today"><small>工作台</small></button>
-    <button data-route="agent" data-icon="agent"><small>Agent</small></button>
-    <button data-route="tasks" data-icon="tasks"><small>任务</small></button>
-    <button data-route="orders" data-icon="orders"><small>订单</small></button>
-    <button data-route="confirm" data-icon="review"><small>确认</small></button>
-  </nav>
-
-  <div class="drawer-mask" id="drawerMask" hidden></div>
-  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="详情面板"><div id="drawerBody"></div></aside>
-
-  <dialog class="modal" id="modal">
-    <form method="dialog" id="modalForm">
-      <header class="modal-head">
-        <div><span id="modalEyebrow">操作</span><h2 id="modalTitle">操作</h2><p id="modalSubtitle"></p></div>
-        <button class="modal-close" type="button" data-close-modal aria-label="关闭">×</button>
-      </header>
-      <section class="modal-body" id="modalBody"></section>
-      <footer class="modal-actions" id="modalActions"></footer>
-    </form>
-  </dialog>
-
-  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
-  <script src="/static/app.js?v=6.1.4.1.7-agent-chat-focus"></script>
-</body>
+<script src="/static/d19_app.js?v=d19-shadow-v1"></script></body>
 </html>

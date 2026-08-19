@@ -1,0 +1,19 @@
+{
+  "name": "QWEN_3_8_MAX",
+  "provider": "AlibabaCloudModelStudio",
+  "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "model": "qwen3.8-max",
+  "temperature": 0,
+  "timeout_seconds": 180,
+  "family": "Qwen",
+  "selection_role": "CAPABILITY_ANCHOR",
+  "structured_output_supported": true,
+  "qualification_pool_source": "Alibaba Cloud Model Studio recommended general-purpose text models (checked 2026-08-17)",
+  "retry_max_attempts": 3,
+  "retry_json_format_max": 1,
+  "retry_policy": "SAME_MODEL_TRANSIENT_RETRY_V1",
+  "pricing_snapshot": "Alibaba Cloud Model Studio model pricing, China North 2 (Beijing), checked 2026-08-17",
+  "pricing_input_cny_per_million": 12.0,
+  "pricing_output_cny_per_million": 36.0
+}

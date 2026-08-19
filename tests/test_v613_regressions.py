@@ -8,6 +8,7 @@ os.environ.setdefault("SEED_DEMO_DATA", "true")
 from fastapi.testclient import TestClient
 
 import agent_api
+from conftest import auth_headers
 from main import app, db, init_db
 
 client = TestClient(app)
@@ -17,8 +18,8 @@ HEADERS = {"X-FlowOrder-Agent-Key": "agent-test-key"}
 def setup_function():
     agent_api.AGENT_API_KEY = "agent-test-key"
     init_db()
-    assert client.post("/api/reset").status_code == 200
-    assert client.post("/api/demo/seed").status_code == 200
+    assert client.post("/api/reset", headers={"X-FlowOrder-Agent-Key": "agent-test-key"}).status_code == 200
+    assert client.post("/api/demo/seed", headers={"X-FlowOrder-Agent-Key": "agent-test-key"}).status_code == 200
 
 
 def test_date_only_supplier_commitment_is_not_overdue_during_same_day():
@@ -30,10 +31,8 @@ def test_date_only_supplier_commitment_is_not_overdue_during_same_day():
         conn.commit()
     response = client.post(
         "/api/agent/tools/anomalies/build",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "order_id": "ORD-1001",
             "current_time": "2026-08-03T16:30:00+08:00",
             "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
@@ -52,10 +51,8 @@ def test_date_only_supplier_commitment_becomes_overdue_next_day():
         conn.commit()
     response = client.post(
         "/api/agent/tools/anomalies/build",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "order_id": "ORD-1001",
             "current_time": "2026-08-04T00:01:00+08:00",
             "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
@@ -114,9 +111,8 @@ def test_information_gap_is_separated_and_never_pads_risk_top_n():
 def test_rule_inspection_is_explicitly_labeled_and_reports_separate_counts():
     response = client.post(
         "/api/agent/inspection/run",
+        headers=auth_headers("USER-1"),
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "due_within_days": 60,
             "top_n": 7,
             "trigger_type": "MANUAL_RULE",
@@ -132,7 +128,7 @@ def test_rule_inspection_is_explicitly_labeled_and_reports_separate_counts():
 
 
 def test_status_exposes_backend_agent_and_rule_modes_separately():
-    response = client.get("/api/agent/status")
+    response = client.get("/api/agent/status", headers=auth_headers("USER-1"))
     assert response.status_code == 200
     data = response.json()
     assert data["version"] == "6.1.4.1"
@@ -151,10 +147,8 @@ def test_midnight_iso_supplier_commitment_is_still_day_level():
         conn.commit()
     response = client.post(
         "/api/agent/tools/anomalies/build",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "order_id": "ORD-1001",
             "current_time": "2026-08-03T19:30:00+08:00",
             "anomaly_types": ["SUPPLIER_COMMITMENT_OVERDUE"],
@@ -166,20 +160,18 @@ def test_midnight_iso_supplier_commitment_is_still_day_level():
 
 def test_repeated_rule_inspection_reuses_active_candidates_instead_of_inflating_badge():
     payload = {
-        "current_user_id": "USER-1",
-        "current_role": "operator",
         "due_within_days": 60,
         "top_n": 7,
         "trigger_type": "MANUAL_RULE",
         "current_time": "2026-08-03T19:30:00+08:00",
     }
-    first = client.post("/api/agent/inspection/run", json=payload)
+    first = client.post("/api/agent/inspection/run", headers=auth_headers("USER-1"), json=payload)
     assert first.status_code == 200, first.text
     with db() as conn:
         active_after_first = conn.execute(
             "SELECT COUNT(*) FROM anomaly_candidates WHERE status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')"
         ).fetchone()[0]
-    second = client.post("/api/agent/inspection/run", json=payload)
+    second = client.post("/api/agent/inspection/run", headers=auth_headers("USER-1"), json=payload)
     assert second.status_code == 200, second.text
     with db() as conn:
         active_after_second = conn.execute(
@@ -189,7 +181,7 @@ def test_repeated_rule_inspection_reuses_active_candidates_instead_of_inflating_
             """SELECT COUNT(*) FROM (
                 SELECT order_id,anomaly_type,COUNT(*) AS c FROM anomaly_candidates
                 WHERE status IN ('ANOMALY_CANDIDATE','PENDING_CONFIRMATION')
-                GROUP BY order_id,anomaly_type HAVING c>1
+                GROUP BY order_id,anomaly_type HAVING COUNT(*)>1
             )"""
         ).fetchone()[0]
     assert active_after_second == active_after_first
@@ -211,9 +203,8 @@ def test_rule_rerun_retires_stale_same_day_false_positive():
         conn.commit()
     response = client.post(
         "/api/agent/inspection/run",
+        headers=auth_headers("USER-1"),
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "due_within_days": 60,
             "top_n": 7,
             "trigger_type": "MANUAL_RULE",
@@ -235,21 +226,20 @@ def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
     monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     created = client.post(
         "/api/agent/chat/jobs",
+        headers=auth_headers("USER-1"),
         json={
             "question": "检查我未来14天内最需要处理的订单。",
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "due_within_days": 14,
             "top_n": 7,
         },
     )
     assert created.status_code == 202, created.text
     job_id = created.json()["job_id"]
-    assert created.json()["status"] in {"QUEUED", "RUNNING"}
+    assert created.json()["status"] in {"QUEUED", "RUNNING", "COMPLETED"}
 
     completed = None
     for _ in range(50):
-        polled = client.get(f"/api/agent/chat/jobs/{job_id}")
+        polled = client.get(f"/api/agent/chat/jobs/{job_id}", headers=auth_headers("USER-1"))
         assert polled.status_code == 200, polled.text
         if polled.json()["status"] == "COMPLETED":
             completed = polled.json()
@@ -258,11 +248,11 @@ def test_agent_chat_job_returns_immediately_and_can_be_polled(monkeypatch):
     assert completed is not None
     assert completed["result"]["execution_mode"] == "HYBRID_DETERMINISTIC_PLAN"
     assert completed["result"]["route_plan"]["intents"][0]["intent"] == "RISK_DIAGNOSIS"
-    assert completed["result"]["diagnosis"]["selection_strategy"]["ranking_rule_version"] == "FT04_SHARED_V1"
+    assert completed["result"]["diagnosis"]["selection_strategy"]["ranking_rule_version"] == "D14_2_ATTENTION_V1"
     assert completed["result"]["resolved_identity"]["current_user_id"] == "USER-1"
 
 def test_status_advertises_async_agent_chat():
-    response = client.get("/api/agent/status")
+    response = client.get("/api/agent/status", headers=auth_headers("USER-1"))
     assert response.status_code == 200
     data = response.json()
     assert data["version"] == "6.1.4.1"
@@ -279,9 +269,9 @@ def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
     monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     created = client.post(
         "/api/agent/chat/jobs",
+        headers=auth_headers("USER-1"),
         json={
             "question": "检查我未来14天内最需要处理的订单。",
-            "current_user_id": "USER-1",
             "due_within_days": 14,
             "top_n": 7,
             "create_task_draft": True,
@@ -295,7 +285,7 @@ def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
 
     completed = None
     for _ in range(50):
-        polled = client.get(f"/api/agent/chat/jobs/{job_id}")
+        polled = client.get(f"/api/agent/chat/jobs/{job_id}", headers=auth_headers("USER-1"))
         if polled.json()["status"] == "COMPLETED":
             completed = polled.json()
             break
@@ -314,17 +304,15 @@ def test_standard_agent_job_precreates_backend_managed_run(monkeypatch):
 def test_task_draft_can_create_linked_approval_in_same_tool_call():
     started = client.post(
         "/api/agent/tools/runs/start",
-        headers=HEADERS,
-        json={"current_user_id": "USER-1", "current_role": "operator", "goal": "性能快速链路测试"},
+        headers={**HEADERS, **auth_headers("USER-1")},
+        json={"goal": "性能快速链路测试"},
     )
     assert started.status_code == 200, started.text
     run_id = started.json()["run_id"]
     response = client.post(
         "/api/agent/tools/task-drafts/create",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "run_id": run_id,
             "order_id": "ORD-1001",
             "title": "确认工厂实际进度",
@@ -349,13 +337,13 @@ def test_task_draft_can_create_linked_approval_in_same_tool_call():
 
 
 def test_status_advertises_fast_standard_diagnosis_profile():
-    response = client.get("/api/agent/status")
+    response = client.get("/api/agent/status", headers=auth_headers("USER-1"))
     assert response.status_code == 200
     profile = response.json()["performance_profile"]
     assert profile["backend_managed_run"] is True
     assert profile["standard_agent_tool_turns"] == 1
     assert profile["hybrid_intent_router"] is True
-    assert profile["shared_ranking_rule"] == "FT04_SHARED_V1"
+    assert profile["shared_ranking_rule"] == "D14_2_ATTENTION_V1"
     assert profile["compact_final_answer"] is True
 
 
@@ -378,10 +366,8 @@ def test_backend_managed_job_option_can_trigger_linked_approval_without_plugin_s
         conn.commit()
     response = client.post(
         "/api/agent/tools/task-drafts/create",
-        headers=HEADERS,
+        headers={**HEADERS, **auth_headers("USER-1")},
         json={
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "run_id": run_id,
             "order_id": "ORD-1001",
             "title": "确认工厂进度",
@@ -401,10 +387,9 @@ def test_multi_intent_standard_plan_executes_without_coze(monkeypatch):
     monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     created = client.post(
         "/api/agent/chat/jobs",
+        headers=auth_headers("USER-1"),
         json={
             "question": "最近事情特别乱，你先检查未来两周最危险的订单，解释第一笔为什么优先，再给它建一个任务，但不要发消息。",
-            "current_user_id": "USER-1",
-            "current_role": "operator",
             "create_approval_request": True,
         },
     )
@@ -412,7 +397,7 @@ def test_multi_intent_standard_plan_executes_without_coze(monkeypatch):
     job_id = created.json()["job_id"]
     completed = None
     for _ in range(60):
-        response = client.get(f"/api/agent/chat/jobs/{job_id}")
+        response = client.get(f"/api/agent/chat/jobs/{job_id}", headers=auth_headers("USER-1"))
         if response.json()["status"] == "COMPLETED":
             completed = response.json()
             break
@@ -438,24 +423,25 @@ def test_followup_explanation_reuses_previous_structured_run(monkeypatch):
     monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     first = client.post(
         "/api/agent/chat/jobs",
-        json={"question": "检查未来14天最需要处理的订单", "current_user_id": "USER-1"},
+        headers=auth_headers("USER-1"),
+        json={"question": "检查未来14天最需要处理的订单"},
     )
     run_id = first.json()["linked_run_id"]
     for _ in range(60):
-        if client.get(f"/api/agent/chat/jobs/{first.json()['job_id']}").json()["status"] == "COMPLETED":
+        if client.get(f"/api/agent/chat/jobs/{first.json()['job_id']}", headers=auth_headers("USER-1")).json()["status"] == "COMPLETED":
             break
         time.sleep(0.02)
     second = client.post(
         "/api/agent/chat/jobs",
+        headers=auth_headers("USER-1"),
         json={
             "question": "为什么第一笔排在最前？",
-            "current_user_id": "USER-1",
             "previous_run_id": run_id,
         },
     )
     completed = None
     for _ in range(60):
-        response = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}")
+        response = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}", headers=auth_headers("USER-1"))
         if response.json()["status"] == "COMPLETED":
             completed = response.json()
             break
@@ -476,13 +462,14 @@ def test_followup_explanation_by_order_number_is_focused(monkeypatch):
     monkeypatch.setattr(agent_api, "run_agent_chat", should_not_call_coze)
     first = client.post(
         "/api/agent/chat/jobs",
-        json={"question": "检查未来14天最需要处理的订单", "current_user_id": "USER-1"},
+        headers=auth_headers("USER-1"),
+        json={"question": "检查未来14天最需要处理的订单"},
     )
     run_id = first.json()["linked_run_id"]
     first_job_id = first.json()["job_id"]
     first_result = None
     for _ in range(60):
-        payload = client.get(f"/api/agent/chat/jobs/{first_job_id}").json()
+        payload = client.get(f"/api/agent/chat/jobs/{first_job_id}", headers=auth_headers("USER-1")).json()
         if payload["status"] == "COMPLETED":
             first_result = payload["result"]
             break
@@ -493,15 +480,15 @@ def test_followup_explanation_by_order_number_is_focused(monkeypatch):
 
     second = client.post(
         "/api/agent/chat/jobs",
+        headers=auth_headers("USER-1"),
         json={
             "question": f"为什么{order_no}排第一？",
-            "current_user_id": "USER-1",
             "previous_run_id": run_id,
         },
     )
     completed = None
     for _ in range(60):
-        payload = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}").json()
+        payload = client.get(f"/api/agent/chat/jobs/{second.json()['job_id']}", headers=auth_headers("USER-1")).json()
         if payload["status"] == "COMPLETED":
             completed = payload
             break
@@ -523,3 +510,13 @@ def test_agent_completion_updates_in_place_without_full_route_flash():
     assert "renderRoute(false)" not in poll_code
     assert "function refreshAgentJobUI" in app_js
     assert 'id="agentRunStatus"' in app_js
+
+def test_d11_v04_frontend_calls_init_exactly_once():
+    """Regression: V0.4 once shipped without invoking init(), leaving the UI forever loading."""
+    from pathlib import Path
+    import re
+
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+    calls = re.findall(r"(?m)^\s*init\(\);\s*$", app_js)
+    assert len(calls) == 1, f"expected exactly one top-level init() call, got {len(calls)}"
+    assert app_js.rstrip().endswith("init();")

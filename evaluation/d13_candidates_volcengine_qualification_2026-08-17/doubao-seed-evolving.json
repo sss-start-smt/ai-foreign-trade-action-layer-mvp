@@ -1,0 +1,13 @@
+{
+  "name": "DOUBAO_SEED_EVOLVING",
+  "provider": "VolcengineArk",
+  "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+  "api_key_env": "ARK_API_KEY",
+  "model": "doubao-seed-evolving",
+  "temperature": 0,
+  "timeout_seconds": 240,
+  "family": "Doubao",
+  "selection_role": "AGENT_SPECIALIZED_CHALLENGER",
+  "structured_output_supported": true,
+  "qualification_pool_source": "Volcengine Ark official Agent/model docs checked 2026-08-17"
+}

@@ -1,0 +1,166 @@
+{
+  "status": "PASS",
+  "policy": {
+    "full_timeout_same_model_retry": false,
+    "quick_transient_same_model_retry": true,
+    "json_format_retry_max": 1,
+    "preferred_route_follows_last_success": true,
+    "preferred_route_cross_model_rescue": true,
+    "fallback_on_semantic_error": false
+  },
+  "cases": [
+    {
+      "case": "FULL_TIMEOUT_DIRECT_FALLBACK",
+      "pass": true,
+      "calls": [
+        "glm-5.2",
+        "qwen3.8-max"
+      ],
+      "route": "FALLBACK",
+      "attempts": [
+        {
+          "attempt": 1,
+          "route": "PRIMARY",
+          "provider": "TEST",
+          "model": "glm-5.2",
+          "success": false,
+          "error_kind": "PROVIDER_TIMEOUT",
+          "error": "full request timeout",
+          "latency_ms": 45000,
+          "usage": {},
+          "estimated_cost_cny": null
+        },
+        {
+          "success": true,
+          "error_kind": null,
+          "error": null,
+          "latency_ms": 12000,
+          "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 12,
+            "total_tokens": 132
+          },
+          "estimated_cost_cny": 0.001872,
+          "attempt": 1,
+          "route": "FALLBACK",
+          "provider": "TEST",
+          "model": "qwen3.8-max"
+        }
+      ],
+      "simulated_latency_ms": 57000
+    },
+    {
+      "case": "QUICK_TRANSIENT_RETRY_PRIMARY",
+      "pass": true,
+      "calls": [
+        "glm-5.2",
+        "glm-5.2"
+      ],
+      "route": "PRIMARY",
+      "attempts": [
+        {
+          "attempt": 1,
+          "route": "PRIMARY",
+          "provider": "TEST",
+          "model": "glm-5.2",
+          "success": false,
+          "error_kind": "PROVIDER_TRANSIENT",
+          "error": "connection reset",
+          "latency_ms": 100,
+          "usage": {},
+          "estimated_cost_cny": null
+        },
+        {
+          "success": true,
+          "error_kind": null,
+          "error": null,
+          "latency_ms": 8000,
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110
+          },
+          "estimated_cost_cny": 0.00108,
+          "attempt": 2,
+          "route": "PRIMARY",
+          "provider": "TEST",
+          "model": "glm-5.2"
+        }
+      ]
+    },
+    {
+      "case": "PREFERRED_FALLBACK_FIRST_WHEN_HEALTHY",
+      "pass": true,
+      "calls": [
+        "qwen3.8-max"
+      ],
+      "route": "FALLBACK",
+      "attempts": [
+        {
+          "success": true,
+          "error_kind": null,
+          "error": null,
+          "latency_ms": 10000,
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110
+          },
+          "estimated_cost_cny": 0.00156,
+          "attempt": 1,
+          "route": "FALLBACK",
+          "provider": "TEST",
+          "model": "qwen3.8-max"
+        }
+      ]
+    },
+    {
+      "case": "PREFERRED_FALLBACK_TIMEOUT_PRIMARY_RESCUE",
+      "pass": true,
+      "calls": [
+        "qwen3.8-max",
+        "glm-5.2"
+      ],
+      "route": "PRIMARY",
+      "attempts": [
+        {
+          "attempt": 1,
+          "route": "FALLBACK",
+          "provider": "TEST",
+          "model": "qwen3.8-max",
+          "success": false,
+          "error_kind": "PROVIDER_TIMEOUT",
+          "error": "fallback full timeout",
+          "latency_ms": 45000,
+          "usage": {},
+          "estimated_cost_cny": null
+        },
+        {
+          "success": true,
+          "error_kind": null,
+          "error": null,
+          "latency_ms": 7000,
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110
+          },
+          "estimated_cost_cny": 0.00108,
+          "attempt": 1,
+          "route": "PRIMARY",
+          "provider": "TEST",
+          "model": "glm-5.2"
+        }
+      ],
+      "simulated_latency_ms": 52000
+    },
+    {
+      "case": "SEMANTIC_ERROR_NEVER_RETRY_OR_FALLBACK",
+      "pass": true,
+      "calls": [
+        "glm-5.2"
+      ],
+      "error_kind": "MODEL_PLAN_INVALID"
+    }
+  ]
+}
