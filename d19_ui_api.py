@@ -11,6 +11,9 @@ from auth import CurrentIdentity, get_current_identity, require_manager
 from database import db
 
 
+D19_DEMO_EXPECTED_ORDERS = 17
+
+
 MANAGER_FIELDS = {
     "requested_delivery_date",
     "customer_delivery_date",
@@ -56,7 +59,12 @@ def register_d19_ui_api(app: Any) -> None:
                 "SELECT COUNT(*) FROM orders WHERE order_id LIKE 'ORD-D19-DEMO-%' AND organization_id=?",
                 (identity.organization_id,),
             ).fetchone()[0] or 0)
-        return {"enabled": enabled, "order_count": count, "organization_id": identity.organization_id}
+        return {
+            "enabled": enabled,
+            "order_count": count,
+            "expected_order_count": D19_DEMO_EXPECTED_ORDERS,
+            "organization_id": identity.organization_id,
+        }
 
     @router.post("/api/d19/demo/ensure")
     def ensure_demo_seed(identity: CurrentIdentity = Depends(get_current_identity)) -> dict[str, Any]:
@@ -147,10 +155,14 @@ def register_d19_ui_api(app: Any) -> None:
                     stamp = str(t.get("updated_at") or "")[:10]
                     if stamp == day:
                         count += 1
-                review_count = conn.execute(
-                    "SELECT COUNT(*) FROM candidate_reviews WHERE organization_id=? AND reviewed_at LIKE ?",
-                    (identity.organization_id, f"{day}%"),
-                ).fetchone()[0]
+                # Count in Python for SQLite/PostgreSQL portability. On PostgreSQL
+                # reviewed_at may be a TIMESTAMP, and `TIMESTAMP LIKE text` raises
+                # an operator error (the Railway 500 observed during D19 smoke).
+                review_rows = conn.execute(
+                    "SELECT reviewed_at FROM candidate_reviews WHERE organization_id=? AND reviewed_at IS NOT NULL",
+                    (identity.organization_id,),
+                ).fetchall()
+                review_count = sum(1 for r in review_rows if str(r["reviewed_at"] or "")[:10] == day)
                 count += int(review_count or 0)
                 daily.append({"date": day, "count": count})
 

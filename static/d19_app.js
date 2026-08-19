@@ -171,14 +171,20 @@
   }
 
   async function loadCoreData() {
-    let [settingsRes, dashboardRes, ordersRes] = await Promise.all([
-      request('/api/settings'), request('/api/dashboard'), request('/api/orders')
+    let [settingsRes, dashboardRes, ordersRes, demoStatus] = await Promise.all([
+      request('/api/settings'),
+      request('/api/dashboard'),
+      request('/api/orders'),
+      request('/api/d19/demo/status').catch(() => ({enabled:false, order_count:0, expected_order_count:0}))
     ]);
 
-    // Railway can serve the app before the background startup seed has finished
-    // (or after a seed warning). In demo mode, an empty order set gets one safe,
-    // idempotent ensure attempt against the SAME database used by this request.
-    if (!Array.isArray(ordersRes.items) || ordersRes.items.length === 0) {
+    // Demo presence must be checked by the D19-DEMO namespace, not by whether
+    // the database has *any* order. Railway may already contain imported ERP/
+    // Excel orders; those records must coexist with (and must not suppress)
+    // the isolated Shadow/UAT demo dataset.
+    const demoCount = Number(demoStatus?.order_count || 0);
+    const expectedDemoCount = Number(demoStatus?.expected_order_count || 17);
+    if (demoStatus?.enabled && demoCount < expectedDemoCount) {
       try {
         const ensured = await request('/api/d19/demo/ensure', {method:'POST', body:'{}'});
         if (ensured?.enabled && Number(ensured?.order_count || 0) > 0) {

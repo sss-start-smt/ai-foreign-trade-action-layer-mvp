@@ -1,0 +1,18 @@
+{
+  "version": "D19_DEMO_COEXIST_FIX_V3",
+  "files": [
+    "d19_ui_api.py",
+    "static/d19_app.js",
+    "static/index.html",
+    "tests/test_d19_demo_coexistence.py",
+    "D19_DEMO_COEXIST_FIX_V3_GUIDE.md"
+  ],
+  "expected_runtime_after_deploy": {
+    "existing_import_orders_preserved": true,
+    "d19_demo_orders": 17,
+    "d19_demo_open_tasks": 14,
+    "expected_total_orders_for_current_railway_state": 27,
+    "note": "27 assumes the currently observed 10 imported orders remain unchanged."
+  },
+  "railway_variable_required": "SEED_D19_DEMO_DATA=true"
+}
