@@ -2574,6 +2574,15 @@ def _initialize_database_worker() -> None:
             time.sleep(delay)
         try:
             init_db()
+            if os.getenv("SEED_D19_DEMO_DATA", "false").lower() == "true":
+                try:
+                    from d19_demo_seed import seed_d19_demo
+                    seed_result = seed_d19_demo()
+                    print(f"[d19-demo-seed] {seed_result.to_dict()}")
+                except Exception as seed_exc:
+                    # Demo data must never make the core service unavailable.
+                    # The seed is additive-only by default; surface failure in logs.
+                    print(f"[d19-demo-seed-warning] {type(seed_exc).__name__}: {seed_exc}")
             _mark_interrupted_intake_jobs()
             APP_STARTUP_STATE.update({
                 "database_ready": True,

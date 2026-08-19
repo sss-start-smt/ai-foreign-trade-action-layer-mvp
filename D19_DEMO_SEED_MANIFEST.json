@@ -1,0 +1,33 @@
+{
+  "purpose": "D19 demo data seed overlay for existing D19 GitHub repository",
+  "files": [
+    "main.py",
+    "d19_demo_seed.py",
+    "seed_d19_demo.py",
+    "tests/test_d19_demo_seed.py",
+    "D19_DEMO_SEED_GUIDE.md"
+  ],
+  "railway_variable": "SEED_D19_DEMO_DATA=true",
+  "expected_after_seed": {
+    "demo_orders": 17,
+    "open_demo_tasks": 14,
+    "pending_candidate_reviews": 4,
+    "actionable_queue_orders": 12,
+    "waiting_orders": 2,
+    "normal_orders": 3,
+    "review_daily_handled": [
+      4,
+      6,
+      5,
+      7,
+      8
+    ]
+  },
+  "safety": [
+    "Default seed only inserts missing D19-DEMO rows.",
+    "--reset only rebuilds data tied to D19 demo order IDs.",
+    "--clean removes D19 demo order scope without touching non-demo orders.",
+    "No ERP writeback and no external message dispatch are added."
+  ],
+  "tests": "2/2 new seed tests passed; existing D19 UI tests separately passed 6/6 on a fresh initialized DB."
+}
