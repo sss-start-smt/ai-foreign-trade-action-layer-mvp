@@ -35,7 +35,6 @@ jobs:
             -r cloudbase/requirements-runtime.txt
 
           find . -maxdepth 1 -type f -name '*.py' -print0 | xargs -0 -I{} cp "{}" cloudbase_runtime/
-
           cp schema.sql cloudbase_runtime/schema.sql
           cp scf_bootstrap cloudbase_runtime/scf_bootstrap
 
@@ -47,35 +46,99 @@ jobs:
 
           chmod +x cloudbase_runtime/scf_bootstrap
 
-          find cloudbase_runtime -type d -name '__pycache__' -prune -exec rm -rf {} +
-          find cloudbase_runtime -type f \( -name '*.pyc' -o -name '*.db' -o -name '*.sqlite*' \) -delete
-
-      - name: Verify dependency imports
+      - name: Verify dependency imports before optimization
         shell: bash
         run: |
           set -euxo pipefail
           export PYTHONPATH="$PWD/cloudbase_runtime/third_party:$PWD/cloudbase_runtime"
           python - <<'PY'
-          import fastapi, uvicorn, pydantic, httpx, sqlalchemy, psycopg2
-          import cozepy
-          print("CloudBase Python 3.11 dependency import check: PASS")
+          import fastapi, uvicorn, pydantic, httpx, sqlalchemy, psycopg2, cozepy
+          print("Pre-optimization dependency import check: PASS")
           PY
 
-      - name: Verify bootstrap and package
+      - name: Optimize native dependencies
         shell: bash
         run: |
           set -euxo pipefail
+          find cloudbase_runtime/third_party -type f \
+            \( -name '*.so' -o -name '*.so.*' \) \
+            -print0 | xargs -0 -r strip --strip-unneeded
+
+      - name: Verify dependency imports after optimization
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PYTHONPATH="$PWD/cloudbase_runtime/third_party:$PWD/cloudbase_runtime"
+          python - <<'PY'
+          import fastapi, uvicorn, pydantic, httpx, sqlalchemy, psycopg2, cozepy
+          from sqlalchemy import create_engine
+          print("Post-optimization dependency import check: PASS")
+          PY
+
+      - name: Final cleanup and package validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Import checks generate bytecode caches; remove them only AFTER verification.
+          find cloudbase_runtime -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find cloudbase_runtime -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '*.db' -o -name '*.sqlite*' \) -delete
+
+          # Dependency package test suites are not runtime assets.
+          rm -rf cloudbase_runtime/third_party/greenlet/tests
+          rm -rf cloudbase_runtime/third_party/certifi/tests
+
+          # Development/verification entry points are not imported by main.py runtime.
+          rm -f \
+            cloudbase_runtime/acceptance_d6_independent.py \
+            cloudbase_runtime/add_uat_data.py \
+            cloudbase_runtime/apply_migration.py \
+            cloudbase_runtime/bootstrap_app.py \
+            cloudbase_runtime/cleanup_legacy.py \
+            cloudbase_runtime/cleanup_legacy_v02.py \
+            cloudbase_runtime/d10_independent_attack.py \
+            cloudbase_runtime/d10_migration_check.py \
+            cloudbase_runtime/d11_comm_test.py \
+            cloudbase_runtime/d11_independent_attack.py \
+            cloudbase_runtime/d17_release_ops.py \
+            cloudbase_runtime/d18_rc_gate.py \
+            cloudbase_runtime/d9_trace_example.py \
+            cloudbase_runtime/extract_baseline.py \
+            cloudbase_runtime/extract_routes.py \
+            cloudbase_runtime/install_communication_workflows_patch.py \
+            cloudbase_runtime/install_excel_import_patch.py \
+            cloudbase_runtime/install_unified_action_experience_patch.py \
+            cloudbase_runtime/run_server.py \
+            cloudbase_runtime/run_uat_server.py \
+            cloudbase_runtime/seed_agent_evaluation.py \
+            cloudbase_runtime/seed_d19_demo.py \
+            cloudbase_runtime/unified_action_experience_patch.py \
+            cloudbase_runtime/wb_d8_independent_verification.py
+
           grep -q 'third_party' cloudbase_runtime/scf_bootstrap
           grep -q '/var/lang/python311/bin/python3.11' cloudbase_runtime/scf_bootstrap
+          test -x cloudbase_runtime/scf_bootstrap
           test -f cloudbase_runtime/main.py
+          test -f cloudbase_runtime/database.py
+          test -f cloudbase_runtime/agent_api.py
           test -f cloudbase_runtime/static/index.html
+          test -d cloudbase_runtime/third_party/psycopg2
+          test -d cloudbase_runtime/third_party/fastapi
 
-          SIZE_MB=$(du -sm cloudbase_runtime | cut -f1)
-          echo "Uncompressed runtime size: ${SIZE_MB} MB"
-          if [ "$SIZE_MB" -gt 240 ]; then
-            echo "Runtime exceeds safe 250MB folder-upload budget."
-            exit 1
-          fi
+          SIZE_BYTES=$(du -sb cloudbase_runtime | cut -f1)
+          SIZE_MB=$(python - <<PY
+          size=${SIZE_BYTES}
+          print(f"{size/1024/1024:.2f}")
+          PY
+          )
+          echo "Final uncompressed runtime size: ${SIZE_MB} MiB"
+
+          # Keep margin below CloudBase's documented 50 MB function code limit.
+          python - <<PY
+          size=${SIZE_BYTES}
+          limit=48*1024*1024
+          assert size < limit, f"Runtime still too large: {size/1024/1024:.2f} MiB"
+          PY
 
           (cd cloudbase_runtime && zip -qr ../floworder-cloudbase-runtime.zip .)
           ls -lh floworder-cloudbase-runtime.zip
