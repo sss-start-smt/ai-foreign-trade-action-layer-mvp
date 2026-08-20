@@ -39,6 +39,7 @@ ALLOW_INSECURE_TOOLS = os.getenv("ALLOW_INSECURE_AGENT_TOOLS", "false").lower() 
 AGENT_MAX_TOOL_CALLS = max(1, int(os.getenv("FLOWORDER_AGENT_MAX_TOOL_CALLS", "8")))
 AGENT_MAX_DURATION_SECONDS = max(30, int(os.getenv("FLOWORDER_AGENT_MAX_DURATION_SECONDS", "120")))
 COZE_AGENT_TIMEOUT_SECONDS = max(15, min(int(os.getenv("COZE_AGENT_TIMEOUT_SECONDS", "60")), 60))
+FLOWORDER_SERVERLESS_MODE = os.getenv("FLOWORDER_SERVERLESS_MODE", "false").lower() == "true"
 MANAGER_IDS = {"MANAGER-1"}
 OWNER_NAME_TO_ID = {"李梅": "USER-1", "王晓": "USER-2", "陈琳": "USER-3", "周主管": "MANAGER-1"}
 OWNER_ID_TO_NAME = {value: key for key, value in OWNER_NAME_TO_ID.items()}
@@ -2029,22 +2030,29 @@ def register_agent_api(app) -> None:
                 ),
             )
             conn.commit()
-        worker = threading.Thread(
-            target=_execute_agent_chat_job,
-            kwargs={
-                "job_id": job_id,
-                "user_id": user_id,
-                "body": body,
-                "identity": chat_identity,
-                "parameters": parameters,
-                "agent_question": agent_question,
-                "started_at": created_at,
-                "run_id": run_id,
-            },
-            daemon=True,
-            name=f"floworder-agent-{job_id}",
-        )
-        worker.start()
+        worker_kwargs = {
+            "job_id": job_id,
+            "user_id": user_id,
+            "body": body,
+            "identity": chat_identity,
+            "parameters": parameters,
+            "agent_question": agent_question,
+            "started_at": created_at,
+            "run_id": run_id,
+        }
+        if FLOWORDER_SERVERLESS_MODE:
+            # Do not let a CloudBase HTTP-function response outlive the in-process
+            # worker thread. Execute within the invocation; the existing polling
+            # endpoint still sees the persisted terminal job record afterwards.
+            _execute_agent_chat_job(**worker_kwargs)
+        else:
+            worker = threading.Thread(
+                target=_execute_agent_chat_job,
+                kwargs=worker_kwargs,
+                daemon=True,
+                name=f"floworder-agent-{job_id}",
+            )
+            worker.start()
         with db() as conn:
             row = conn.execute("SELECT * FROM agent_chat_jobs WHERE job_id=?", (job_id,)).fetchone()
         return _agent_chat_job_payload(row)

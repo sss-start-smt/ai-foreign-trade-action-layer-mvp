@@ -73,6 +73,23 @@ def is_postgres_mode(url: str | None = None) -> bool:
     return target.startswith("postgresql://") or target.startswith("postgres://")
 
 
+def get_database_schema() -> str:
+    """Return the PostgreSQL schema used by this application.
+
+    CloudBase can host multiple portfolio projects in one PostgreSQL environment.
+    DB_SCHEMA keeps FlowOrder isolated without changing every SQL statement.
+    SQLite ignores this setting.
+    """
+    schema = os.getenv("DB_SCHEMA", "public").strip() or "public"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+        raise ValueError("DB_SCHEMA must be a simple PostgreSQL identifier")
+    return schema
+
+
+def is_serverless_mode() -> bool:
+    return os.getenv("FLOWORDER_SERVERLESS_MODE", "false").lower() == "true"
+
+
 def _make_engine(database_url: str) -> Engine:
     if database_url.startswith("sqlite"):
         return create_engine(
@@ -84,12 +101,19 @@ def _make_engine(database_url: str) -> Engine:
             echo=False,
         )
     else:
+        # Keep serverless pools deliberately small. Each warm function instance has
+        # its own process-global SQLAlchemy pool, so large defaults multiply quickly.
+        default_pool = 2 if is_serverless_mode() else 5
+        default_overflow = 1 if is_serverless_mode() else 10
+        pool_size = max(1, int(os.getenv("DB_POOL_SIZE", str(default_pool))))
+        max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", str(default_overflow))))
         return create_engine(
             database_url,
             poolclass=QueuePool,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
             pool_pre_ping=True,
+            pool_recycle=max(60, int(os.getenv("DB_POOL_RECYCLE_SECONDS", "300"))),
             echo=False,
         )
 
@@ -363,6 +387,11 @@ def db(use_test: bool = False) -> Iterator[_ConnectionWrapper]:
     if pg_mode:
         engine = get_engine(use_test=use_test)
         with engine.connect() as raw_conn:
+            schema = get_database_schema()
+            if schema != "public":
+                # Identifier is validated by get_database_schema(); SET search_path
+                # lets existing unqualified SQL remain unchanged.
+                raw_conn.execute(text(f'SET search_path TO "{schema}", public'))
             wrapper = _ConnectionWrapper(raw_conn, is_sqlite=False)
             try:
                 yield wrapper
@@ -561,7 +590,12 @@ def table_exists(conn: Any, table_name: str) -> bool:
     """Check if a table exists in the current database (PG/SQLite compatible)."""
     if getattr(conn, 'is_pg', False):
         result = conn.execute(
-            text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = :name)"),
+            text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = :name
+                )
+            """),
             {"name": table_name},
         )
         return result.fetchone()[0]
@@ -636,7 +670,7 @@ def get_table_columns(conn: Any, table: str) -> list[dict[str, Any]]:
                     column_default AS dflt_value,
                     is_identity = 'YES' AS pk
                 FROM information_schema.columns
-                WHERE table_name = :table
+                WHERE table_schema = current_schema() AND table_name = :table
                 ORDER BY ordinal_position
             """),
             {"table": table},

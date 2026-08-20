@@ -1,0 +1,96 @@
+name: Build CloudBase Runtime
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-runtime:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Build runtime directory
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf cloudbase_runtime
+          mkdir -p cloudbase_runtime/third_party
+
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --no-compile \
+            --target cloudbase_runtime/third_party \
+            -r cloudbase/requirements-runtime.txt
+
+          # Runtime Python modules.
+          find . -maxdepth 1 -type f -name '*.py' -print0 | xargs -0 -I{} cp "{}" cloudbase_runtime/
+
+          cp schema.sql cloudbase_runtime/schema.sql
+          cp scf_bootstrap cloudbase_runtime/scf_bootstrap
+
+          for d in static demo_payloads demo_data coze; do
+            if [ -d "$d" ]; then
+              cp -R "$d" "cloudbase_runtime/$d"
+            fi
+          done
+
+          chmod +x cloudbase_runtime/scf_bootstrap
+
+          # Remove local/test artifacts if they ever exist.
+          find cloudbase_runtime -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find cloudbase_runtime -type f \( -name '*.pyc' -o -name '*.db' -o -name '*.sqlite*' \) -delete
+
+      - name: Verify dependency imports
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PYTHONPATH="$PWD/cloudbase_runtime/third_party:$PWD/cloudbase_runtime"
+          python - <<'PY'
+          import fastapi, uvicorn, pydantic, httpx, sqlalchemy, psycopg2
+          import cozepy
+          print("CloudBase Python 3.11 dependency import check: PASS")
+          PY
+
+      - name: Verify bootstrap and package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -q 'third_party' cloudbase_runtime/scf_bootstrap
+          grep -q '/var/lang/python311/bin/python3.11' cloudbase_runtime/scf_bootstrap
+          test -f cloudbase_runtime/main.py
+          test -f cloudbase_runtime/static/index.html
+
+          SIZE_MB=$(du -sm cloudbase_runtime | cut -f1)
+          echo "Uncompressed runtime size: ${SIZE_MB} MB"
+          if [ "$SIZE_MB" -gt 240 ]; then
+            echo "Runtime exceeds safe 250MB folder-upload budget."
+            exit 1
+          fi
+
+          (cd cloudbase_runtime && zip -qr ../floworder-cloudbase-runtime.zip .)
+          ls -lh floworder-cloudbase-runtime.zip
+
+      - name: Upload runtime folder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: floworder-cloudbase-runtime-folder
+          path: cloudbase_runtime/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload runtime zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: floworder-cloudbase-runtime-zip
+          path: floworder-cloudbase-runtime.zip
+          if-no-files-found: error
+          retention-days: 7

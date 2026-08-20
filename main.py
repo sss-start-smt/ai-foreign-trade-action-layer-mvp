@@ -84,6 +84,7 @@ API_KEY = os.getenv("APP_API_KEY", "").strip()
 CN_TZ = timezone(timedelta(hours=8))
 
 app = FastAPI(title="AI外贸跟单行动系统", version="6.1.4.1.3")
+FLOWORDER_SERVERLESS_MODE = os.getenv("FLOWORDER_SERVERLESS_MODE", "false").lower() == "true"
 APP_STARTUP_STATE: dict[str, Any] = {
     "database_ready": False,
     "database_initializing": False,
@@ -308,12 +309,20 @@ def _prepare_legacy_sqlite_before_schema(conn: Any) -> None:
 def init_db() -> None:
     with db() as conn:
         if getattr(conn, "is_pg", False):
-            # PostgreSQL schema is Alembic-owned. Runtime startup must never mask a
-            # missing migration by creating tables from SQLite-era schema.sql.
-            missing_tables = sorted(t for t in PG_REQUIRED_TABLES if not table_exists(conn, t))
+            # PostgreSQL schema is migration-owned. Check the whole current schema
+            # in one round trip; serverless cold starts should not issue ~50
+            # information_schema queries before the first request.
+            existing_tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() AND table_type='BASE TABLE'"
+                ).fetchall()
+            }
+            missing_tables = sorted(PG_REQUIRED_TABLES - existing_tables)
             if missing_tables:
                 raise RuntimeError(
-                    "PostgreSQL schema is not migrated; run `alembic upgrade head`. "
+                    "PostgreSQL schema is not migrated; apply the CloudBase/PG baseline migration. "
                     f"Missing tables: {missing_tables}"
                 )
         else:
@@ -2118,10 +2127,20 @@ def create_intake_job(payload: AnyPayload, background_tasks: BackgroundTasks, id
              f"已进入后台队列，即将调用{workflow_key.upper()}", timestamp, timestamp),
         )
         conn.commit()
-    background_tasks.add_task(process_intake_job, job_id)
+    if FLOWORDER_SERVERLESS_MODE:
+        # HTTP function instances may freeze/recycle immediately after the response.
+        # Keep the user-visible job contract, but finish the work inside this request
+        # so no business job depends on an in-process background task surviving.
+        process_intake_job(job_id)
+    else:
+        background_tasks.add_task(process_intake_job, job_id)
     return {
         "status": "queued", "job_id": job_id, "workflow_key": workflow_key,
-        "message": "消息已进入后台识别，可继续浏览其他页面。",
+        "message": (
+            "消息已完成后台识别，可查看结果。"
+            if FLOWORDER_SERVERLESS_MODE
+            else "消息已进入后台识别，可继续浏览其他页面。"
+        ),
     }
 
 
@@ -2596,7 +2615,9 @@ def _initialize_database_worker() -> None:
         if APP_STARTUP_STATE["database_ready"] or APP_STARTUP_STATE["database_initializing"]:
             return
         APP_STARTUP_STATE["database_initializing"] = True
-    delays = (0, 1, 2, 4, 8, 16)
+    # Serverless startup must fail fast rather than consume a whole invocation on
+    # retry sleeps. Persistent Railway keeps the existing bounded retry behavior.
+    delays = (0,) if FLOWORDER_SERVERLESS_MODE else (0, 1, 2, 4, 8, 16)
     last_error: Exception | None = None
     for attempt, delay in enumerate(delays, start=1):
         if delay:
@@ -2637,7 +2658,12 @@ def _initialize_database_worker() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    threading.Thread(target=_initialize_database_worker, name="floworder-db-init", daemon=True).start()
+    if FLOWORDER_SERVERLESS_MODE:
+        # CloudBase may recycle an HTTP-function instance after any response; a
+        # daemon startup thread is therefore not a safe readiness dependency.
+        _initialize_database_worker()
+    else:
+        threading.Thread(target=_initialize_database_worker, name="floworder-db-init", daemon=True).start()
 
 
 @app.get("/")

@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+
+export PORT=9000
+export FLOWORDER_SERVERLESS_MODE=${FLOWORDER_SERVERLESS_MODE:-true}
+export PYTHONPATH="$PWD/third_party:$PWD:${PYTHONPATH:-}"
+
+exec /var/lang/python311/bin/python3.11 -m uvicorn main:app \
+  --host 0.0.0.0 \
+  --port 9000
