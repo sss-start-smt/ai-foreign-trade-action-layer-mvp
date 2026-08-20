@@ -1,6 +1,9 @@
 name: Build CloudBase Runtime
 
 on:
+  push:
+    branches:
+      - cloudbase-p0
   workflow_dispatch:
 
 jobs:
@@ -31,7 +34,6 @@ jobs:
             --target cloudbase_runtime/third_party \
             -r cloudbase/requirements-runtime.txt
 
-          # Runtime Python modules.
           find . -maxdepth 1 -type f -name '*.py' -print0 | xargs -0 -I{} cp "{}" cloudbase_runtime/
 
           cp schema.sql cloudbase_runtime/schema.sql
@@ -45,7 +47,6 @@ jobs:
 
           chmod +x cloudbase_runtime/scf_bootstrap
 
-          # Remove local/test artifacts if they ever exist.
           find cloudbase_runtime -type d -name '__pycache__' -prune -exec rm -rf {} +
           find cloudbase_runtime -type f \( -name '*.pyc' -o -name '*.db' -o -name '*.sqlite*' \) -delete
 
